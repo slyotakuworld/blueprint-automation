@@ -1,0 +1,9 @@
+PySide6
+opencv-python
+numpy
+pillow
+pyautogui
+pydirectinput
+pynput
+pywin32
+psutil

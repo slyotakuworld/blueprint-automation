@@ -1,0 +1,234 @@
+import os
+import shutil
+import sys
+from typing import Callable, Optional
+
+
+# ============================================================
+# 工程路径 Provider 注入（由 ProjectManager 在 open_project 时赋值）
+# 函数签名: provider(key: str) -> Optional[str]
+#   key ∈ {"screenshot", "template", "cache", "debug"}
+#   返回工程目录对应子路径；未开工程 / 不识别 key 时返回 None，
+#   这时下方 screenshot_dir() 等会回退到旧行为：APP_DIR 下的全局目录。
+# ============================================================
+_project_path_provider: Optional[Callable[[str], Optional[str]]] = None
+
+
+def set_project_path_provider(provider: Optional[Callable[[str], Optional[str]]]) -> None:
+    """供 ProjectManager 调用：打开/关闭工程时注入或卸载路径解析器。"""
+    global _project_path_provider
+    _project_path_provider = provider
+
+
+def _project_sub(key: str) -> Optional[str]:
+    if not _project_path_provider:
+        return None
+    try:
+        p = _project_path_provider(key)
+        return p if (p and os.path.isdir(p)) else None
+    except Exception:
+        return None
+
+
+def get_app_dir():
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    # 开发模式：app_paths.py 在 src/config/ 下 -> 项目根
+    return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def get_internal_dir():
+    if hasattr(sys, "_MEIPASS"):
+        return sys._MEIPASS
+    return get_app_dir()
+
+
+APP_DIR = get_app_dir()
+INTERNAL_DIR = get_internal_dir()
+CONFIG_DIR = os.path.join(APP_DIR, "config")
+USER_CONFIG_FILE = os.path.join(APP_DIR, "config.json")
+LOG_FILE = os.path.join(APP_DIR, "bot_log.txt")
+# CACHE_DIR / TEMPLATE_CACHE_FILE / TEMPLATE_META_FILE：
+#   有工程时用工程目录的 cache/（通过 cache_dir()）
+#   未开工程时回退到全局 APP_DIR/cache/
+DEFAULT_IMAGES_DIRNAME = "1080p"
+
+
+def cache_dir() -> str:
+    """
+    有工程时：<project>/cache/
+    未开工程：<APP_DIR>/cache/
+    """
+    p = _project_sub("cache")
+    if p:
+        return p
+    p = os.path.join(APP_DIR, "cache")
+    os.makedirs(p, exist_ok=True)
+    return p
+
+
+def template_cache_file() -> str:
+    return os.path.join(cache_dir(), "template_cache.pkl")
+
+
+def template_meta_file() -> str:
+    return os.path.join(cache_dir(), "template_meta.json")
+
+
+CURRENT_VERSION = "4.1"
+
+
+def template_dir() -> str:
+    """
+    有工程时：<project>/templates/  （FindAnyImage/WaitAnyImage 的模板小图）
+    未开工程：<APP_DIR>/templates/
+    """
+    p = _project_sub("template")
+    if p:
+        return p
+    p = os.path.join(APP_DIR, "templates")
+    os.makedirs(p, exist_ok=True)
+    return p
+
+
+def screenshot_dir() -> str:
+    """
+    有工程时：<project>/screenshots/  （热键截图/源截图所在）
+    未开工程：<APP_DIR>/screenshots/
+    """
+    p = _project_sub("screenshot")
+    if p:
+        return p
+    p = os.path.join(APP_DIR, "screenshots")
+    os.makedirs(p, exist_ok=True)
+    return p
+
+
+def debug_dir() -> str:
+    """
+    有工程时：<project>/debug/
+    未开工程：<APP_DIR>/debug/
+    """
+    p = _project_sub("debug")
+    if p:
+        return p
+    p = os.path.join(APP_DIR, "debug")
+    os.makedirs(p, exist_ok=True)
+    return p
+
+
+def get_images_dir(base_dir):
+    profiled_dir = os.path.join(base_dir, "images", DEFAULT_IMAGES_DIRNAME)
+    if os.path.isdir(profiled_dir):
+        return profiled_dir
+
+    legacy_dir = os.path.join(base_dir, "images")
+    if os.path.isdir(legacy_dir):
+        return legacy_dir
+
+    return None
+
+
+def auto_extract_configs():
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    old_configs = [
+        os.path.join(APP_DIR, "bot_config.json"),
+        os.path.join(APP_DIR, "bot-config.json"),
+        os.path.join(CONFIG_DIR, "bot-config.json"),
+        os.path.join(CONFIG_DIR, "bot_config.json"),
+        os.path.join(CONFIG_DIR, "config.json"),
+    ]
+    for old_path in old_configs:
+        if os.path.exists(old_path):
+            try:
+                if not os.path.exists(USER_CONFIG_FILE):
+                    shutil.move(old_path, USER_CONFIG_FILE)
+                else:
+                    os.remove(old_path)
+            except Exception:
+                pass
+
+
+def auto_extract_images(folder_name="images"):
+    internal_dir = os.path.join(INTERNAL_DIR, folder_name)
+    external_dir = os.path.join(APP_DIR, folder_name)
+
+    if not os.path.isdir(internal_dir):
+        print(f"[auto_extract_images] missing internal directory: {internal_dir}")
+        return
+
+    try:
+        os.makedirs(external_dir, exist_ok=True)
+        target_base = os.path.join(external_dir, DEFAULT_IMAGES_DIRNAME)
+        os.makedirs(target_base, exist_ok=True)
+
+        for root, _, files in os.walk(internal_dir):
+            rel_path = os.path.relpath(root, internal_dir)
+            if rel_path == ".":
+                rel_path = ""
+            if rel_path.startswith(f"{DEFAULT_IMAGES_DIRNAME}{os.sep}") or rel_path == DEFAULT_IMAGES_DIRNAME:
+                rel_child = rel_path[len(DEFAULT_IMAGES_DIRNAME):].lstrip("\\/")
+            else:
+                rel_child = rel_path
+
+            target_root = target_base if not rel_child else os.path.join(target_base, rel_child)
+            os.makedirs(target_root, exist_ok=True)
+
+            for file in files:
+                src_file = os.path.join(root, file)
+                dst_file = os.path.join(target_root, file)
+                if not os.path.exists(dst_file):
+                    shutil.copy2(src_file, dst_file)
+    except Exception as e:
+        print(f"[auto_extract_images] extract failed: {e}")
+
+
+def get_img_path(filename):
+    rel_name = os.path.normpath(str(filename))
+    basename = os.path.basename(rel_name)
+    cache = getattr(get_img_path, "_cache", None)
+    if cache is None:
+        cache = {}
+        setattr(get_img_path, "_cache", cache)
+    if rel_name in cache:
+        return cache[rel_name]
+
+    if os.path.isabs(rel_name) and os.path.exists(rel_name):
+        cache[rel_name] = rel_name
+        return rel_name
+
+    for candidate_name in (rel_name, basename):
+        ext_path = os.path.join(APP_DIR, "images", DEFAULT_IMAGES_DIRNAME, candidate_name)
+        if os.path.exists(ext_path):
+            cache[rel_name] = ext_path
+            return ext_path
+
+        int_path = os.path.join(INTERNAL_DIR, "images", DEFAULT_IMAGES_DIRNAME, candidate_name)
+        if os.path.exists(int_path):
+            cache[rel_name] = int_path
+            return int_path
+
+        ext_legacy = os.path.join(APP_DIR, "images", candidate_name)
+        if os.path.exists(ext_legacy):
+            cache[rel_name] = ext_legacy
+            return ext_legacy
+
+        int_legacy = os.path.join(INTERNAL_DIR, "images", candidate_name)
+        if os.path.exists(int_legacy):
+            cache[rel_name] = int_legacy
+            return int_legacy
+
+    cache[rel_name] = filename
+    return filename
+
+
+def get_asset_path(*parts):
+    asset_path = os.path.join(INTERNAL_DIR, "assets", *parts)
+    if os.path.exists(asset_path):
+        return asset_path
+
+    dev_asset_path = os.path.join(get_app_dir(), "assets", *parts)
+    if os.path.exists(dev_asset_path):
+        return dev_asset_path
+
+    return None
