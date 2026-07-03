@@ -232,3 +232,22 @@ def get_asset_path(*parts):
         return dev_asset_path
 
     return None
+
+
+def clear_all_project_caches() -> None:
+    """
+    工程切换后必须调用的统一清理入口。
+    所有工程无关的模块级缓存（首次加载后会残留旧工程路径/内容的）
+    都必须在本函数里显式清空，避免「串工程」。
+    """
+    # 1) get_img_path：函数属性的相对路径→绝对路径映射缓存
+    #    旧工程和新工程若有同名的 templates/a.png / screenshots/b.jpg
+    #    不清缓存的话，命中后返回的永远是第一次加载时的旧工程绝对路径
+    try:
+        img_cache = getattr(get_img_path, "_cache", None)
+        if isinstance(img_cache, dict):
+            img_cache.clear()
+    except Exception:
+        pass
+    # 2) 未来新增任何模块级缓存，都在此处统一清理（TemplateMatcher的内存缓存是实例级的，
+    #    且 BlueprintRunner 每次运行都会重建，无需在这里清）

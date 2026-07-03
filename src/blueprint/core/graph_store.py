@@ -79,6 +79,29 @@ class BlueprintStore:
         try:
             with open(file_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
+            # ---------------- 格式前置校验 ----------------
+            # 蓝图 JSON 必须包含 nodes/edges 字段；像 project_meta.json 这种只有
+            # project_name/version 字段的工程配置、或 config.json 等非蓝图直接拒绝
+            if not isinstance(data, dict):
+                return None
+            has_blueprint_signature = (
+                "nodes" in data
+                and "edges" in data
+                and isinstance(data["nodes"], dict)
+                and isinstance(data["edges"], dict)
+            )
+            if not has_blueprint_signature:
+                # 识别常见的错误文件类型，方便后续排查
+                signature_hint = ""
+                if "project_name" in data and "created_at" in data:
+                    signature_hint = "（看起来是工程配置文件 project_meta.json，不是蓝图）"
+                elif "hotkeys" in data and "recent_projects" in data:
+                    signature_hint = "（看起来是用户配置 config.json，不是蓝图）"
+                print(
+                    f"[WARN] BlueprintStore.load: 跳过非蓝图文件 {file_path} "
+                    f"缺少 nodes/edges 蓝图结构 {signature_hint}"
+                )
+                return None
             return BlueprintGraph.from_dict(data)
         except Exception:
             return None

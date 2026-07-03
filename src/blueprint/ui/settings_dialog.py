@@ -56,12 +56,10 @@ class ShortcutRecorder(QPushButton):
         self._recording = False
         self._current_pynput: str = ""
         self._current_qt: str = "(无)"
-        self._modifiers_pressed = set()
         self.setMinimumHeight(30)
         self.setCursor(Qt.PointingHandCursor)
         self._update_text()
         self.clicked.connect(self._on_clicked)
-        self.installEventFilter(self)
 
     # =========== 公共API ==========
     def setCurrentHotkey(self, pynput_hotkey: str):
@@ -120,37 +118,65 @@ class ShortcutRecorder(QPushButton):
         self.clearFocus()
 
     # ---------- 事件：录制时的按键捕获 ----------
-    def eventFilter(self, obj, event):
+    # 纯修饰键集合（getattr 兼容 PySide6/不同平台，部分左右修饰键不存在就跳过）
+    _MODIFIER_KEYS = None
+
+    @classmethod
+    def _modifier_keys(cls):
+        if cls._MODIFIER_KEYS is None:
+            names = [
+                "Key_Control", "Key_Shift", "Key_Alt", "Key_Meta",
+                "Key_Shift_L", "Key_Shift_R", "Key_Control_L", "Key_Control_R",
+                "Key_Alt_L", "Key_Alt_R",
+                "Key_Meta_L", "Key_Meta_R", "Key_Super_L", "Key_Super_R", "Key_AltGr",
+            ]
+            s = set()
+            for nm in names:
+                v = getattr(Qt, nm, None)
+                if v is not None:
+                    s.add(v)
+            cls._MODIFIER_KEYS = s
+        return cls._MODIFIER_KEYS
+
+    def keyPressEvent(self, ev: QKeyEvent):
         if not self._recording:
-            return super().eventFilter(obj, event)
-        et = event.type()
-        if et == QEvent.KeyPress:
-            ev = QKeyEvent(event)
-            k = ev.key()
-            if k in (Qt.Key_Escape,):
-                self._end_recording(cancel=True)
-                return True
-            # 忽略纯修饰键按下（让用户能先按修饰再按主键）
-            if k in (Qt.Key_Control, Qt.Key_Shift, Qt.Key_Alt, Qt.Key_Meta, Qt.Key_Super_L, Qt.Key_Super_R,
-                     Qt.Key_AltGr, Qt.Key_Shift_R, Qt.Key_Shift_L, Qt.Key_Control_R, Qt.Key_Control_L,
-                     Qt.Key_Meta_L, Qt.Key_Meta_R):
-                return True
-            # 最终键：组合 QKeySequence
-            mods = ev.modifiers()
-            # 使用 int(key | mods) 构造 QKeySequence
-            ks_val = int(k) | int(mods)
-            qks = QKeySequence(ks_val)
-            qt_str = qks.toString(QKeySequence.PortableText)  # "Ctrl+F8"
-            # 过滤：只接受包含至少一个键（不是纯修饰键）
-            if not qt_str:
-                return True
-            # 转成 pynput 格式
-            pyn = qkeysequence_to_pynput(qt_str)
-            if pyn is None:
-                return True
-            self._end_recording(cancel=False, new_pynput=pyn, new_qt=qt_str)
-            return True
-        return super().eventFilter(obj, event)
+            super().keyPressEvent(ev)
+            return
+        k = ev.key()
+        if k == Qt.Key_Escape:
+            self._end_recording(cancel=True)
+            ev.accept()
+            return
+        # 忽略纯修饰键按下（让用户能先按修饰再按主键）
+        if k in self._modifier_keys():
+            ev.accept()
+            return
+        # 组合 QKeySequence（PySide6 里 mods 是 Qt.KeyboardModifiers flag 对象，不是 int）
+        mods = ev.modifiers()
+        mods_int = getattr(mods, "value", mods)
+        try:
+            mods_int = int(mods_int)
+        except (TypeError, ValueError):
+            mods_int = 0
+        ks_val = int(k) | mods_int
+        qks = QKeySequence(ks_val)
+        qt_str = qks.toString(QKeySequence.PortableText)  # e.g. "Ctrl+F8"
+        if not qt_str:
+            ev.accept()
+            return
+        # 转 pynput 格式
+        pyn = qkeysequence_to_pynput(qt_str)
+        if pyn is None:
+            ev.accept()
+            return
+        self._end_recording(cancel=False, new_pynput=pyn, new_qt=qt_str)
+        ev.accept()
+
+    def keyReleaseEvent(self, ev: QKeyEvent):
+        if self._recording:
+            ev.accept()
+            return
+        super().keyReleaseEvent(ev)
 
 
 class SettingsDialog(QDialog):
@@ -193,7 +219,7 @@ class SettingsDialog(QDialog):
         tip = QLabel(
             "💡 下方「🌍 全局热键」在游戏前台也能按到（跨窗口生效，pynput 系统级注册）；<br>"
             "💡 以下【标准快捷键】已硬编码绑定，<b>无需在此配置，也不允许修改</b>："
-            "<span style='color:#58A6FF;'> Ctrl+S 保存 / Ctrl+Z 撤销 / Ctrl+C 复制 / Ctrl+V 粘贴 </span>"
+            "<span style='color:#58A6FF;'> Ctrl+S 保存 / Ctrl+Z 撤销 / Ctrl+Y 重做 / Ctrl+C 复制 / Ctrl+V 粘贴 </span>"
         )
         tip.setStyleSheet("padding:10px 12px; background:#161B22; border:1px solid #30363D; border-radius:6px; color:#8B949E;")
         tip.setWordWrap(True)

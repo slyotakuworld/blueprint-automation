@@ -40,6 +40,7 @@ from PySide6.QtWidgets import (
     QDockWidget,
     QFileDialog,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QMainWindow,
     QMenu,
@@ -61,9 +62,11 @@ _PROJECT_ROOT = os.path.dirname(_CURRENT_DIR)
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
+import uuid
+
 from src.blueprint.core.graph_store import BlueprintStore
-from src.blueprint.core.models import BlueprintGraph, Node
-from src.blueprint.core.node_library import NODE_LIBRARY
+from src.blueprint.core.models import BlueprintGraph, Node, Edge, Port
+from src.blueprint.core.node_library import NODE_LIBRARY, create_node
 from src.blueprint.project_manager import ProjectManager
 from src.blueprint.runtime.executor import BlueprintRunner
 from src.blueprint.runtime.validator import (
@@ -136,10 +139,13 @@ class BlueprintMainWindow(QMainWindow):
         self._hotkey_mgr = GlobalHotkeyManager(qt_parent=self)
         self._split_dialog_ref: Optional[ElementSplitDialog] = None
         self._last_capture_png: Optional[str] = None
-        # 剪贴板 + 撤销/重做栈（硬编码标准快捷键：Ctrl+C/V/Z，不在设置界面暴露）
+        # 剪贴板 + 撤销/重做栈（硬编码标准快捷键：Ctrl+C/V/Z/Y，不在设置界面暴露）
         self._clipboard_nodes: list = []
         self._undo_stack: list = []
         self._redo_stack: list = []
+        self._applying_undo_redo: bool = False
+        self._paste_batch_collecting: bool = False
+        self._paste_batch_node_ids: list = []
 
         self._build_central()
         self._build_toolbar()
@@ -188,12 +194,61 @@ class BlueprintMainWindow(QMainWindow):
         if self._pm.is_open():
             return True
         QMessageBox.warning(
-            self, "请先选择工程",
-            f"要执行「{action_desc}」必须先有工程。\n"
-            f"不同工程的截图/模板/缓存/运行日志 100% 独立保存，互不干扰。\n\n"
-            f"请点左上角 『工程 ▾』 下拉菜单，选择「新建工程…」或「打开工程…」再继续。",
-        )
+                self, "请先选择工程",
+                f"要执行「{action_desc}」必须先有工程。\n"
+                f"不同工程的截图/模板/缓存/运行日志 100% 独立保存，互不干扰。\n\n"
+                f"请点左上角 『工程 ▾』 下拉菜单，选择「新建工程…」或「打开工程…」再继续。",
+            )
         return False
+
+    def _finalize_project_switch(self) -> None:
+        """工程切换成功后的统一收尾：清全局缓存、停旧蓝图、日志提示、刷新菜单。
+
+        必须在「所有切工程路径（_open_project_startup / _on_open_recent_project /
+        _on_open_project 等）成功调用 _load_or_new_graph_for_current_project
+        之后调用，避免新工程沿用旧工程的模块级缓存/运行状态，造成「串工程」。
+        """
+        # 1) 清 app_paths 里所有模块级缓存（最关键：get_img_path 的路径缓存）
+        try:
+            from src.config.app_paths import clear_all_project_caches
+            clear_all_project_caches()
+        except Exception as e:
+            try:
+                self._log.append_log(f"[Project] 清理工程缓存失败: {e}", "WARN")
+            except Exception:
+                pass
+        # 2) 如果旧工程的蓝图还在跑 → 请求它停止（否则新工程截图/运行时，旧蓝图还在后台操作）
+        try:
+            r = getattr(self, "_runner", None)
+            if r is not None and r.isRunning():
+                self._log.append_log("[Project] 切换工程：已请求停止前工程正在运行的蓝图", "INFO")
+                try:
+                    r.request_stop()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # 3) 刷新最近工程菜单 + 标题/状态栏
+        try:
+            self._refresh_recent_projects_menu()
+        except Exception:
+            pass
+        try:
+            # 确保标题刷新（显示新工程名+蓝图名）
+            self._update_title()
+        except Exception:
+            pass
+        # 4) 明确的日志提示，用户确认真的切换到了哪个工程
+        try:
+            if self._pm and self._pm.is_open():
+                name = self._pm.project_name or "未命名工程"
+                root = self._pm.project_root or ""
+                self._log.append_log(
+                    f"[Project] 已切换到工程：【{name}】  @  {root}",
+                    "SUCCESS",
+                )
+        except Exception:
+            pass
 
     def _load_or_new_graph_for_current_project(self):
         """当前已经有开工程：按三级优先级加载蓝图，绝不自动创建落盘的 .bp.json 文件（首次create_project除外）
@@ -208,9 +263,20 @@ class BlueprintMainWindow(QMainWindow):
                 try:
                     g = BlueprintStore.load(last_bp)
                     if g is not None:
+                        # 兼容历史遗留：JSON.name 是默认 Untitled 但文件名是中文/可读 → 回填
+                        _, stem, _ = BlueprintStore._split_bp_path(last_bp)
+                        if stem and (not g.name or g.name == "Untitled") and stem != "Untitled":
+                            g.name = stem
                         self._current_path = last_bp
-                        self._mark_graph_clean()  # 刚加载的文件，视为干净状态（在 bind 之前先写 hash 以免后续误判）
-                        self._bind_new_graph(g, zoom_fit=True)  # 统一绑定 + 清空Inspector残留
+                        # ★ 必须先 bind（里面赋值 self._graph = g），再 mark_clean 并显式传 g！
+                        #   否则在 bind 之前用 self._graph 还是旧对象，hash 算错→刚加载就dirty
+                        self._bind_new_graph(g, zoom_fit=True)
+                        self._mark_graph_clean(g)  # 刚加载的文件，视为干净状态（显式传g，不依赖 self._graph 此时赋值）
+                        # 顺便把这张默认蓝图记为 last（下次就会走优先级 1 了）
+                        try:
+                            self._pm.set_last_opened_blueprint(last_bp)
+                        except Exception:
+                            pass
                         self._log.append_log(f"已加载最近使用的蓝图：{last_bp}", "SUCCESS")
                         self._update_title()
                         return
@@ -227,14 +293,19 @@ class BlueprintMainWindow(QMainWindow):
                 try:
                     g = BlueprintStore.load(default_bp)
                     if g is not None:
+                        # 同样：兼容历史遗留，把文件名回填到 JSON 默认的 Untitled
+                        _, stem, _ = BlueprintStore._split_bp_path(default_bp)
+                        if stem and (not g.name or g.name == "Untitled") and stem != "Untitled":
+                            g.name = stem
                         self._current_path = default_bp
-                        self._mark_graph_clean()  # 刚加载的文件，视为干净状态
+                        # ★ 同样：先 bind 再 mark_clean(g)
+                        self._bind_new_graph(g, zoom_fit=True)
+                        self._mark_graph_clean(g)  # 刚加载的文件，视为干净状态（显式传g）
                         # 顺便把这张默认蓝图记为 last（下次就会走优先级 1 了）
                         try:
                             self._pm.set_last_opened_blueprint(default_bp)
                         except Exception:
                             pass
-                        self._bind_new_graph(g, zoom_fit=True)  # 统一绑定
                         self._log.append_log(f"已加载默认蓝图：{default_bp}", "SUCCESS")
                         self._update_title()
                         return
@@ -288,11 +359,8 @@ class BlueprintMainWindow(QMainWindow):
         # ProjectManager.open_project 已经在 ProjectStartupDialog 里执行过，
         # 会自动卸载旧provider、注册新provider、发信号。
         self._load_or_new_graph_for_current_project()
-        # 新工程/开工程成功后刷新「最近工程」菜单（把本次置顶到第一位）
-        try:
-            self._refresh_recent_projects_menu()
-        except Exception:
-            pass
+        # 收尾：清全局缓存、停旧运行、刷新菜单+日志提示
+        self._finalize_project_switch()
 
     # ==================== UI 构建 ====================
     def _build_central(self):
@@ -305,6 +373,13 @@ class BlueprintMainWindow(QMainWindow):
         # ========== 4面板QDockWidget布局（Qflow风格 + Qt增强可停靠可浮动） ==========
         # 中央只有【画布】NodeView（和Qflow FlowEditor对等）
         self._scene = NodeScene(self)
+        # ========== 撤销栈信号监听 ==========
+        self._scene.node_created.connect(self._on_scene_node_created)
+        self._scene.node_will_remove.connect(self._on_scene_node_will_remove)
+        self._scene.edge_created.connect(self._on_scene_edge_created)
+        self._scene.edge_will_remove.connect(self._on_scene_edge_will_remove)
+        self._scene.nodes_dragged.connect(self._on_scene_nodes_dragged)
+
         self._view = NodeView(self._scene)
         center_wrap = QWidget()
         cl = QVBoxLayout(center_wrap)
@@ -332,11 +407,8 @@ class BlueprintMainWindow(QMainWindow):
         dock_left.setObjectName("dockPalette")
         dock_left.setWidget(self._palette)
         dock_left.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
-        dock_left.setFeatures(
-            QDockWidget.DockWidgetMovable
-            | QDockWidget.DockWidgetFloatable
-            | QDockWidget.DockWidgetClosable
-        )
+        # 只允许移动停靠位置，禁止关闭&禁止单独浮窗（防止用户误关后显示不出来）
+        dock_left.setFeatures(QDockWidget.DockWidgetMovable)
         dock_left.setMinimumWidth(180)
         self.addDockWidget(Qt.LeftDockWidgetArea, dock_left)
         try:
@@ -344,6 +416,7 @@ class BlueprintMainWindow(QMainWindow):
         except Exception:
             pass
         dock_left.setStyleSheet(_dock_stylesheet)
+        dock_left.show()
         self._dock_palette = dock_left
 
         # 右：🎛 属性面板（和Qflow PropertyPanel对等，340宽+最小280）
@@ -352,11 +425,8 @@ class BlueprintMainWindow(QMainWindow):
         dock_right.setObjectName("dockInspector")
         dock_right.setWidget(self._inspector)
         dock_right.setAllowedAreas(Qt.RightDockWidgetArea | Qt.LeftDockWidgetArea)
-        dock_right.setFeatures(
-            QDockWidget.DockWidgetMovable
-            | QDockWidget.DockWidgetFloatable
-            | QDockWidget.DockWidgetClosable
-        )
+        # 只允许移动停靠位置，禁止关闭&禁止单独浮窗
+        dock_right.setFeatures(QDockWidget.DockWidgetMovable)
         dock_right.setMinimumWidth(300)
         self.addDockWidget(Qt.RightDockWidgetArea, dock_right)
         try:
@@ -364,6 +434,7 @@ class BlueprintMainWindow(QMainWindow):
         except Exception:
             pass
         dock_right.setStyleSheet(_dock_stylesheet)
+        dock_right.show()
         self._dock_inspector = dock_right
 
         # 底：📜执行日志（和Qflow LogPanel对等，最小80高初始160）
@@ -372,11 +443,8 @@ class BlueprintMainWindow(QMainWindow):
         dock_bottom.setObjectName("dockLog")
         dock_bottom.setWidget(self._log)
         dock_bottom.setAllowedAreas(Qt.BottomDockWidgetArea | Qt.TopDockWidgetArea)
-        dock_bottom.setFeatures(
-            QDockWidget.DockWidgetMovable
-            | QDockWidget.DockWidgetFloatable
-            | QDockWidget.DockWidgetClosable
-        )
+        # 只允许移动停靠位置，禁止关闭&禁止单独浮窗
+        dock_bottom.setFeatures(QDockWidget.DockWidgetMovable)
         dock_bottom.setMinimumHeight(80)
         self.addDockWidget(Qt.BottomDockWidgetArea, dock_bottom)
         try:
@@ -384,6 +452,7 @@ class BlueprintMainWindow(QMainWindow):
         except Exception:
             pass
         dock_bottom.setStyleSheet(_dock_stylesheet)
+        dock_bottom.show()
         self._dock_log = dock_bottom
 
     def _build_toolbar(self):
@@ -454,7 +523,14 @@ class BlueprintMainWindow(QMainWindow):
         self._menu_proj_saveas.addAction(self._act_new)
         self._menu_proj_saveas.addAction(self._act_save)
         self._menu_proj_saveas.addAction(self._act_save_as)
-        self._menu_proj_saveas.addAction(self._act_open)
+        # 🗂  加载蓝图：直接作为顶层子菜单挂在工程▾下，与「新建/保存/另存/删除」同级（类似最近工程的下拉结构）
+        # 第 1 项永远是『从文件浏览打开…』（保留原入口），后续是当前工程所有 .bp.json 按修改时间倒序，方便快速切换
+        self._menu_load_blueprint = QMenu("加载蓝图", self)
+        self._menu_load_blueprint.setToolTipsVisible(True)
+        # 【关键】aboutToShow：每次展开子菜单时重新扫描工程目录，保证蓝图列表/修改时间 100% 实时
+        # （不是启动时扫一次，避免外部创建蓝图、修改文件时间后列表不刷新）
+        self._menu_load_blueprint.aboutToShow.connect(self._refresh_load_blueprint_menu)
+        self._menu_proj_saveas.addMenu(self._menu_load_blueprint)
         self._menu_proj_saveas.addAction(self._act_delete)
 
         # === 把构建好的菜单挂到 ToolButton ===
@@ -499,12 +575,15 @@ class BlueprintMainWindow(QMainWindow):
         # 3 个新增：撤销 / 复制 / 粘贴（只有快捷键，不加工具栏按钮）——保留
         self._act_undo = mk_act("#8B949E", "撤销", self._on_undo)
         self._act_undo.setShortcut(QKeySequence("Ctrl+Z"))
+        self._act_redo = mk_act("#8B949E", "重做", self._on_redo)
+        self._act_redo.setShortcut(QKeySequence("Ctrl+Y"))
         self._act_copy = mk_act("#8B949E", "复制", self._on_copy_nodes)
         self._act_copy.setShortcut(QKeySequence("Ctrl+C"))
         self._act_paste = mk_act("#8B949E", "粘贴", self._on_paste_nodes)
         self._act_paste.setShortcut(QKeySequence("Ctrl+V"))
         # 加到主窗口 action 列表（快捷键才会生效），但不 add_toolbtn → 顶栏上看不到按钮
         self.addAction(self._act_undo)
+        self.addAction(self._act_redo)
         self.addAction(self._act_copy)
         self.addAction(self._act_paste)
         # Ctrl+S 全局保存：保留（这是用户专门指定要保留的 4 个标准快捷键之一）
@@ -563,18 +642,6 @@ class BlueprintMainWindow(QMainWindow):
         btn_refresh.clicked.connect(self._reload_target_windows)
         tb.addWidget(btn_refresh)
 
-        btn_launch = QPushButton("🚀 选EXE启动")
-        btn_launch.setStyleSheet("QPushButton { background:#21262D; color:#C9D1D9; border:1px solid #30363D; border-radius:4px; padding:3px 10px; } QPushButton:hover { background:#30363D; }")
-        btn_launch.clicked.connect(self._on_target_launch_exe)
-        tb.addWidget(btn_launch)
-
-        # --------------- 右侧最后：全屏快捷开关（按你截图还原，之前重构工具栏弄丢了） ---------------
-        self._chk_fullscreen = QCheckBox("全屏(所有屏幕)")
-        self._chk_fullscreen.setStyleSheet("QCheckBox { color:#C9D1D9; padding: 2px 12px 2px 6px; spacing: 6px; }")
-        self._chk_fullscreen.setToolTip("勾选 = 强制目标为全屏（所有屏幕），忽略下拉框选择；取消 = 按下方下拉框选择目标窗口")
-        self._chk_fullscreen.toggled.connect(self._on_toggle_fullscreen_shortcut)
-        tb.addWidget(self._chk_fullscreen)
-
         # 【构建完菜单后】先填一次"最近工程"子菜单内容
         self._refresh_recent_projects_menu()
 
@@ -618,52 +685,6 @@ class BlueprintMainWindow(QMainWindow):
         else:
             self._active_hwnd_title_key = None
             self._status_lbl.setText("目标未指定：截图/找图将使用全屏")
-
-    def _on_target_launch_exe(self):
-        fp, _ = QFileDialog.getOpenFileName(self, "选择要启动的EXE（自动化目标程序）", "", "应用程序 (*.exe);;所有文件 (*)")
-        if not fp:
-            return
-        ok, pid, msg = start_exe(fp, wait_sec_after_launch=1.5, log_fn=lambda m, l="INFO": self._log.append_log(f"[Target] {m}", l))
-        if not ok:
-            QMessageBox.warning(self, "启动失败", msg)
-            return
-        QMessageBox.information(self, "已启动", f"{os.path.basename(fp)}\nPID={pid}\n\n将在刷新后自动加入目标窗口列表")
-        QTimer.singleShot(600, self._reload_target_windows)
-
-    # ---------------- 目标程序：全屏快捷开关 ----------------
-    def _on_toggle_fullscreen_shortcut(self, checked: bool):
-        """勾选 = 目标强制全屏（所有屏幕），并禁用下拉框避免误选；取消则恢复可选择状态。"""
-        try:
-            if not hasattr(self, "_target_combo"):
-                return
-            c = self._target_combo
-            if checked:
-                self._last_non_fullscreen_idx = c.currentIndex() if c.currentData() is not None else None
-                c.blockSignals(True)
-                try:
-                    c.setCurrentIndex(0)
-                finally:
-                    c.blockSignals(False)
-                c.setEnabled(False)
-                self._active_hwnd = None
-                self._active_hwnd_title_key = None
-                self._status_lbl.setText("目标已切换：全屏（所有屏幕）[快捷开关已锁定]")
-            else:
-                c.setEnabled(True)
-                if getattr(self, "_last_non_fullscreen_idx", None) is not None:
-                    c.blockSignals(True)
-                    try:
-                        c.setCurrentIndex(max(0, int(self._last_non_fullscreen_idx)))
-                    finally:
-                        c.blockSignals(False)
-                self._active_hwnd = c.currentData()
-                self._active_hwnd_title_key = None
-                if self._active_hwnd:
-                    self._status_lbl.setText(f"目标已恢复选择：HWND={self._active_hwnd:08X}")
-                else:
-                    self._status_lbl.setText("目标已恢复选择：全屏（所有屏幕）")
-        except Exception as e:
-            self._log.append_log(f"[Target] 全屏开关异常：{e}", "WARN")
 
     # ---------------- 工程 ▾：最近工程菜单 ----------------
     def _refresh_recent_projects_menu(self):
@@ -719,9 +740,136 @@ class BlueprintMainWindow(QMainWindow):
                 QMessageBox.warning(self, "打开失败", f"不是合法的 Blueprint 工程目录：\n{project_root}")
                 return
             self._load_or_new_graph_for_current_project()
-            self._refresh_recent_projects_menu()
+            # 收尾：清全局缓存、停旧运行、刷新菜单+日志提示
+            self._finalize_project_switch()
         except Exception as e:
             QMessageBox.critical(self, "打开失败", f"打开最近工程时出错：\n{e}")
+
+    # ---------------- 工程 ▾：加载蓝图子菜单（所有工程蓝图按修改时间倒序） ----------------
+    def _list_project_blueprints(self, proj_root: str):
+        """【扫描辅助】递归工程根目录下所有真正的蓝图文件（.bp.json），并过滤掉备份/临时文件。
+        返回 list[(abs_path, rel_to_project, mtime_secs)]，已排除备份。"""
+        if not proj_root or not os.path.isdir(proj_root):
+            return []
+        result = []
+        for dirpath, dirnames, filenames in os.walk(proj_root):
+            # 跳过隐藏目录（.bp、.git 等），避免把工程元数据当蓝图列出来
+            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+            for fn in filenames:
+                # 必须是蓝图扩展名
+                if not fn.lower().endswith(BlueprintStore.EXT.lower()):
+                    continue
+                # 过滤备份：name.bp.backup_xxx.json → stem 里含 .backup_ → 跳过
+                # BlueprintStore.save 生成的备份形如：<stem>.bp.backup_YYYYMMDD_HHMMSS.json
+                if ".backup_" in fn:
+                    continue
+                # 过滤临时文件（~xxx.bp.json、xxx.bp.json.tmp 这种）
+                if fn.startswith("~") or fn.lower().endswith(".tmp"):
+                    continue
+                abs_path = os.path.join(dirpath, fn)
+                try:
+                    st = os.stat(abs_path)
+                    mtime = int(st.st_mtime)
+                except OSError:
+                    continue
+                # 相对于工程根目录显示，方便知道蓝图在哪个子目录
+                rel = os.path.relpath(abs_path, proj_root)
+                # Windows 上 os.walk 返回反斜杠，统一成正斜杠（显示更清爽）
+                rel = rel.replace("\\", "/")
+                result.append((abs_path, rel, mtime))
+        # 按 mtime 倒序（最近修改的排最前面）
+        result.sort(key=lambda t: t[2], reverse=True)
+        return result
+
+    def _refresh_load_blueprint_menu(self):
+        """『加载蓝图』子菜单 aboutToShow 时调用：
+        每次展开都重新扫描一次，100% 实时（外部创建/删除/改了修改时间都会变）。
+        结构：
+          第1项. 📁 从文件浏览打开…（永远保留，用户要求）
+          -------
+          没工程：    （请先打开工程，才能列出工程下所有蓝图）
+          有工程无蓝图：（工程目录下暂无蓝图，点上方「新建蓝图」创建）
+          有工程有蓝图：按修改时间新→旧，当前已打开的蓝图前加 📌 视觉标记"""
+        try:
+            menu = getattr(self, "_menu_load_blueprint", None)
+            if menu is None:
+                return
+            menu.clear()
+            # ============== 第 1 项（永远在）：从文件浏览打开… ==============
+            act_browse = QAction("📁 从文件浏览打开…", menu)
+            act_browse.setToolTip("使用系统文件浏览器选择任意位置的蓝图文件（原入口）")
+            # 点这个直接走原 _on_open，会弹 QFileDialog
+            act_browse.triggered.connect(lambda _checked=False: self._on_open())
+            menu.addAction(act_browse)
+            # ============== 分隔符 ==============
+            menu.addSeparator()
+            # ============== 后续：工程下所有蓝图 ==============
+            pm = self._pm
+            proj_root = pm.project_root if pm and pm.is_open() else None
+            if not proj_root:
+                # 没工程 → 给禁用的提示项（用户选「从文件浏览打开」仍可跨工程打开任意蓝图）
+                act_hint = QAction("（请先打开工程，才能列出工程下所有蓝图）", menu)
+                act_hint.setEnabled(False)
+                menu.addAction(act_hint)
+                return
+            all_bps = self._list_project_blueprints(proj_root)
+            if not all_bps:
+                act_empty = QAction("（工程目录下暂无蓝图，点「新建蓝图」创建）", menu)
+                act_empty.setEnabled(False)
+                menu.addAction(act_empty)
+                return
+            # 当前正在打开的蓝图路径 → 如果在列表里，加一个 📌 标记（用户一眼识别"当前在哪"）
+            current_path_norm = None
+            if self._current_path:
+                try:
+                    current_path_norm = os.path.normcase(os.path.abspath(self._current_path))
+                except Exception:
+                    current_path_norm = None
+            # 格式化时间：YYYY-MM-DD HH:MM（本地时区，用户看着习惯）
+            from datetime import datetime
+            shown = 0
+            for (abs_path, rel_display, mtime_secs) in all_bps:
+                try:
+                    dt_str = datetime.fromtimestamp(mtime_secs).strftime("%Y-%m-%d %H:%M")
+                except Exception:
+                    dt_str = ""
+                # 显示：(📌) 相对路径（子目录/蓝图A.bp.json） + 右侧小字是修改时间
+                # （PySide6 QAction 不支持富文本/两列，所以统一拼到 text 里，用 8 个空格隔开时间列，视觉上有间隔感）
+                time_suffix = f"        [{dt_str}]" if dt_str else ""
+                is_current = False
+                if current_path_norm:
+                    try:
+                        is_current = current_path_norm == os.path.normcase(os.path.abspath(abs_path))
+                    except Exception:
+                        is_current = False
+                prefix = "📌 " if is_current else "     "
+                # &1. 这种数字前缀给用户可以按 1/2/3 快速选择（和最近工程一样）
+                idx_prefix = f"&{shown+1}. " if shown < 9 else "    "
+                text = f"{idx_prefix}{prefix}{rel_display}{time_suffix}"
+                act = QAction(text, menu)
+                act.setToolTip(f"完整路径: {abs_path}\n最近修改: {dt_str}")
+                act.setData(abs_path)
+                # 点菜单项 → 先 confirm_discard → 是 → 直接加载（用抽出来的公共函数）
+                act.triggered.connect(lambda _checked=False, p=abs_path: self._on_open_blueprint_from_menu(p))
+                menu.addAction(act)
+                shown += 1
+        except Exception as e:
+            try:
+                self._log.append_log(f"[Blueprint] 加载蓝图菜单刷新失败：{e}", "WARN")
+            except Exception:
+                pass
+
+    def _on_open_blueprint_from_menu(self, path: str):
+        """点加载蓝图子菜单里的具体蓝图项 → 切换过去。"""
+        if not path:
+            return
+        if not os.path.isfile(path):
+            QMessageBox.warning(self, "打开失败", f"蓝图文件已不存在（可能被外部删除）：\n{path}")
+            return
+        # 先问是否丢弃当前未保存的修改（和 _on_open / _on_new 保持一致）
+        if not self._confirm_discard():
+            return
+        self._open_blueprint_path(path)
 
     def _build_statusbar(self):
         self._status = QStatusBar(self)
@@ -769,6 +917,9 @@ class BlueprintMainWindow(QMainWindow):
         # 2) 绑定到 scene（会清空旧节点/边，重新渲染）
         self._scene.set_graph(graph)
         self._graph = graph
+        # 蓝图切换时：清空撤销/重做栈（跨蓝图撤销没有意义）
+        self._undo_stack.clear()
+        self._redo_stack.clear()
         # 3) 按要求缩放视图
         if zoom_fit and self._view is not None:
             try:
@@ -781,15 +932,104 @@ class BlueprintMainWindow(QMainWindow):
         self._current_path = None
         self._last_saved_graph_hash = None  # 新建=从未保存过，hash置空
         self._bind_new_graph(g, zoom_fit=False)  # 新空图不用缩放
-        self._log.append_log("新建空白蓝图。", "SUCCESS")
+        self._log.append_log("新建空白蓝图（未保存）。", "SUCCESS")
         self._update_title()
 
     def _on_new(self):
+        """『工程 ▾ → 新建蓝图』回调：
+        先弹对话框让用户输入蓝图名称（默认建议名自动防重），点确定才在工程目录下创建 .bp.json；
+        点取消就什么都不做（也不会生成任何文件）。"""
+        # 1) 先确认要不要保存当前未保存的修改（任何情况下都要问）
         if not self._confirm_discard():
             return
-        self._new_graph()
+        # 2) 没有工程 → 退回旧行为：内存空画布（没地方落盘）
+        if not self._ensure_project_open("新建蓝图"):
+            self._new_graph()
+            return
+        # 3) 有工程 → 先计算不重名的默认建议名："新蓝图 / 新蓝图 1 / 新蓝图 2..."
+        proj_root = self._pm.project_root
+        base_suggest = "新蓝图"
+        i = 0
+        while True:
+            suggest_stem = base_suggest if i == 0 else f"{base_suggest} {i}"
+            candidate = os.path.join(proj_root, suggest_stem + BlueprintStore.EXT)
+            if not os.path.exists(candidate):
+                default_stem = suggest_stem
+                break
+            i += 1
+        # 4) 循环问用户蓝图名，直到：用户输入合法且不冲突（或点取消→直接放弃）
+        chosen_stem: Optional[str] = None
+        while True:
+            user_stem, ok = QInputDialog.getText(
+                self,
+                "新建蓝图",                         # 标题
+                "请输入新蓝图的名称（无需写 .bp.json 后缀）：",  # 提示
+                text=default_stem,                 # 默认值=自动防重的建议名
+            )
+            if not ok:
+                # 用户点取消：什么都不创建，直接返回
+                return
+            # 4.1 清洗用户输入：去掉首尾空白
+            user_stem = (user_stem or "").strip()
+            if not user_stem:
+                QMessageBox.warning(self, "名称不能为空", "蓝图名称不能为空，请重新输入。")
+                continue
+            # 4.2 去掉用户不小心输入的 .bp.json 后缀（避免生成 "xxx.bp.json.bp.json"）
+            if user_stem.lower().endswith(BlueprintStore.EXT.lower()):
+                user_stem = user_stem[: -len(BlueprintStore.EXT)]
+            # 4.3 Windows 文件系统非法字符替换成下划线（防止创建失败）
+            invalid = '<>:"/\\|?*'
+            safe_stem = "".join("_" if ch in invalid else ch for ch in user_stem).strip()
+            if not safe_stem:
+                QMessageBox.warning(self, "名称非法", "请输入不含特殊字符的蓝图名称。")
+                continue
+            # 4.4 重名检查：如果已有同名 .bp.json，问用户是否覆盖
+            final_path = os.path.join(proj_root, safe_stem + BlueprintStore.EXT)
+            if os.path.exists(final_path):
+                r = QMessageBox.question(
+                    self,
+                    "蓝图名称已存在",
+                    f"工程目录下已经存在同名蓝图文件：\n{final_path}\n\n是否覆盖？（覆盖后原文件会进备份，不会永久丢失。）",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+                if r != QMessageBox.Yes:
+                    # 不覆盖：回到输入循环（下一次默认值仍取用户这次输入的 safe_stem，用户能继续改）
+                    default_stem = safe_stem
+                    continue
+                # 用户明确要覆盖 → 继续往下走，BlueprintStore.save 会自动做 .backup
+            chosen_stem = safe_stem
+            break
+        if chosen_stem is None:
+            return
+        # 5) 用户选好名称了 → 创建 graph 对象，同步 graph.name = chosen_stem（中文写进 JSON.name，下次加载标题栏正确）
+        g = BlueprintStore.new_graph(chosen_stem)
+        g.name = chosen_stem
+        ok = BlueprintStore.save(g, final_path)  # 重名时用户已选 Yes，make_backup 默认 True
+        if not ok:
+            QMessageBox.warning(
+                self, "创建蓝图失败",
+                f"无法在工程目录创建新蓝图文件，请检查目录权限：\n{final_path}"
+            )
+            # 即使落盘失败，也把 graph 绑到画布让用户不至于白等
+            self._current_path = None
+            self._last_saved_graph_hash = None
+            self._bind_new_graph(g, zoom_fit=False)
+            self._update_title()
+            return
+        # 6) 落盘成功 → 先 bind 再 mark_clean(g)，保证不显示未保存星号
+        self._current_path = final_path
+        self._bind_new_graph(g, zoom_fit=False)
+        self._mark_graph_clean(g)
+        try:
+            self._pm.set_last_opened_blueprint(final_path)
+        except Exception:
+            pass
+        self._log.append_log(f"✅ 已创建新蓝图：{final_path}", "SUCCESS")
+        self._update_title()
 
     def _on_open(self):
+        """原『加载蓝图』入口：弹文件浏览器选文件。"""
         if not self._confirm_discard():
             return
         # 默认路径优先级：
@@ -802,23 +1042,36 @@ class BlueprintMainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(
             self, "打开蓝图",
             default_open_dir,
-            "蓝图文件 (*.bp.json *.json)",
+            "蓝图文件 (*.bp.json)",  # 收紧：只允许 .bp.json 蓝图文件，不让 project_meta/config 这种混进来
         )
         if not path:
             return
+        self._open_blueprint_path(path)
+
+    def _open_blueprint_path(self, path: str):
+        """【公共入口】从一个绝对路径加载蓝图（文件对话框选的 / 菜单项点的，都走这里）。
+        已做：confirm_discard 已在调用方（_on_open / 菜单项）处理，这里不重复问。"""
         g = BlueprintStore.load(path)
         if g is None:
             QMessageBox.warning(self, "打开失败", "无法读取蓝图文件，格式可能已损坏。")
             return
+        # 兼容历史遗留：如果 JSON.name 还是默认 Untitled，但文件名是中文/非 Untitled 的可读名称
+        # → 用文件名 stem 覆盖 graph.name，让标题栏显示中文而不是 "Untitled"
+        _, stem, _ = BlueprintStore._split_bp_path(path)
+        if stem and (not g.name or g.name == "Untitled") and stem != "Untitled":
+            g.name = stem
         self._current_path = path
-        self._mark_graph_clean()  # 刚加载，视为干净状态（在 bind 前设置 hash）
+        # ★ 必须先 bind（里面才给 self._graph=g 赋值），再 mark_clean(g) 传新对象；
+        #   否则 bind 之前 self._graph 还是旧的，hash 算错→刚加载就dirty
         self._bind_new_graph(g, zoom_fit=True)  # 统一绑定 + 清空Inspector残留 + 缩放
+        self._mark_graph_clean(g)  # 刚加载，干净状态（显式传 g = 新对象）
         try:
             self._pm.set_last_opened_blueprint(path)
         except Exception:
             pass
         self._log.append_log(f"已加载蓝图: {path}", "SUCCESS")
         self._update_title()
+        # 工程下的蓝图列表可能因为"最近修改时间"重排，下次打开工程下拉时自动刷新（aboutToShow 已经连了刷新）
 
     def _on_save(self):
         if self._graph is None:
@@ -851,6 +1104,15 @@ class BlueprintMainWindow(QMainWindow):
             return
         if not path.lower().endswith(".bp.json"):
             path = path + ".bp.json"
+        # ----------------------------------------------------------
+        # ★ 关键：把用户选的文件名（去掉 .bp.json 后缀）同步为蓝图名称
+        #   否则另存为中文文件名后，graph.name 还是默认的 Untitled，
+        #   保存进 JSON 的 "name" 字段仍是 Untitled → 下次重新加载
+        #   后标题栏就显示 Untitled，用户就感觉『加载中文蓝图名没生效』
+        # ----------------------------------------------------------
+        _, stem, _ = BlueprintStore._split_bp_path(path)
+        if stem and stem != getattr(self._graph, "name", None):
+            self._graph.name = stem
         ok = BlueprintStore.save(self._graph, path)
         if ok:
             self._current_path = path
@@ -970,9 +1232,21 @@ class BlueprintMainWindow(QMainWindow):
         except Exception:
             return None
 
-    def _mark_graph_clean(self):
-        """把当前图标记为『干净状态』（未改动）——在加载成功/保存成功后调用。"""
-        self._last_saved_graph_hash = self._hash_graph(self._graph)
+    def _mark_graph_clean(self, graph=None):
+        """把当前图标记为『干净状态』（未改动）——在加载成功/保存成功后调用。
+
+        参数 graph：
+          - 若显式传入（推荐在"绑定新 graph 之前"直接用新加载的 g），
+            直接用传入对象算 hash，**不依赖 `self._graph` 此时的赋值状态**。
+          - 若不传（保存场景：保存的就是当前 self._graph），用 self._graph。
+
+        为什么要支持显式传参？
+          因为 `_bind_new_graph(g)` 里才做 `self._graph = g`（第 777 行），
+          如果在 bind 之前就调 `_mark_graph_clean()` 而不传参，算 hash 用的是
+          旧的 self._graph（或 None），就会出现「刚加载完永远是未保存状态」的 bug。
+        """
+        target = graph if graph is not None else self._graph
+        self._last_saved_graph_hash = self._hash_graph(target)
 
     def _need_save(self) -> bool:
         """当前蓝图是否需要保存。
@@ -1287,8 +1561,6 @@ class BlueprintMainWindow(QMainWindow):
         return {
             "create_region_node": self._hook_create_region_node,
             "create_find_image_node": self._hook_create_find_image_node,
-            "get_current_context_node_type": self._hook_current_node_type,
-            "patch_current_node": self._hook_patch_current_node,
             "get_active_hwnd": self.get_active_hwnd,
         }
 
@@ -1337,25 +1609,31 @@ class BlueprintMainWindow(QMainWindow):
             return
         if not self._ensure_project_open("粘贴节点（会修改蓝图）"):
             return
+        # 进入"批量粘贴"收集模式：期间的 node_created 不会单独记 undo，结束时再整体 push 一条
+        self._paste_batch_collecting = True
+        self._paste_batch_node_ids = []
         new_ids: List[str] = []
-        for item in snap:
-            ntype = item.get("type")
-            if not ntype or ntype not in NODE_LIBRARY:
-                continue
-            x = int(item.get("x", 200)) + 20
-            y = int(item.get("y", 200)) + 20
-            node = self._scene.add_node_by_type(ntype, QPointF(x, y))
-            if node is None:
-                continue
-            params = copy.deepcopy(item.get("params") or {})
-            if params:
-                node.params.update(params)
-                # 强制刷新属性面板（如果当前有节点被选中 / Inspector 绑着）
-                try:
-                    self._scene.node_param_changed.emit(node.id, "", None)
-                except Exception:
-                    pass
-            new_ids.append(node.id)
+        try:
+            for item in snap:
+                ntype = item.get("type")
+                if not ntype or ntype not in NODE_LIBRARY:
+                    continue
+                x = int(item.get("x", 200)) + 20
+                y = int(item.get("y", 200)) + 20
+                node = self._scene.add_node_by_type(ntype, QPointF(x, y))
+                if node is None:
+                    continue
+                params = copy.deepcopy(item.get("params") or {})
+                if params:
+                    node.params.update(params)
+                    try:
+                        self._scene.node_param_changed.emit(node.id, "", None)
+                    except Exception:
+                        pass
+                new_ids.append(node.id)
+        finally:
+            self._paste_batch_collecting = False
+            self._paste_batch_node_ids = []
         if not new_ids:
             return
         # 清空选中 -> 选中全部粘贴出来的节点 -> 如果有 Inspector 绑到第一个
@@ -1373,13 +1651,169 @@ class BlueprintMainWindow(QMainWindow):
             first = self._scene.graph.nodes.get(new_ids[0])
             if first is not None:
                 self._inspector.set_node(first)
-        # Push undo
-        self._undo_stack.append({"kind": "add_nodes", "node_ids": new_ids})
-        # 任何写入操作清空 redo
-        self._redo_stack.clear()
+        # Push undo（带节点完整快照，用于重做时重新创建）
+        node_entries = []
+        for nid in new_ids:
+            s = self._scene.snapshot_node(nid)
+            if s is not None:
+                node_entries.append(s)
+        self._push_undo({"kind": "add_nodes", "nodes": node_entries})
         self._scene.graph_changed.emit()
         self._log.append_log(f"[粘贴] 已粘贴 {len(new_ids)} 个节点（Ctrl+Z 可撤销本次粘贴）", "INFO")
 
+    # ============================================================
+    # 撤销/重做：公共辅助
+    # ============================================================
+    def _push_undo(self, action: dict):
+        """任何"写操作"都通过这里 push 撤销项 → 自动清空 redo 栈"""
+        if self._applying_undo_redo:
+            return  # 正在执行撤销/重做本身：不要再产生新的撤销记录
+        self._undo_stack.append(action)
+        self._redo_stack.clear()
+
+    def _restore_node_from_snapshot(self, snap: dict):
+        """从快照恢复节点（不发撤销信号）——用于 undo/redo 重放阶段"""
+        if self._scene is None or self._scene.graph is None:
+            return None
+        ntype = snap.get("type")
+        if not ntype or ntype not in NODE_LIBRARY:
+            return None
+        pos = snap.get("pos") or (200, 200)
+        node = create_node(ntype, pos=pos)
+        # 强制使用原来的 id（否则重做出来会是新 id，连线恢复对不上）
+        new_id = snap.get("id") or node.id
+        node.id = new_id
+        params = snap.get("params") or {}
+        if params:
+            node.params.update(dict(params))
+        # 恢复 inputs/outputs 完整结构（端口定义 + 标签等）
+        inputs_list = snap.get("inputs") or []
+        outputs_list = snap.get("outputs") or []
+        if inputs_list and isinstance(inputs_list, list):
+            try:
+                node.inputs = [Port.from_dict(pd) for pd in inputs_list]
+            except Exception:
+                pass
+        if outputs_list and isinstance(outputs_list, list):
+            try:
+                node.outputs = [Port.from_dict(pd) for pd in outputs_list]
+            except Exception:
+                pass
+        self._scene.graph.nodes[node.id] = node
+        # _add_node_item(emit=False) 保持撤销期静默
+        self._scene._add_node_item(node, emit=False)
+        return node
+
+    def _restore_edge_from_snapshot(self, snap: dict):
+        if self._scene is None or self._scene.graph is None:
+            return None
+        edge = Edge(
+            id=snap.get("id") or uuid.uuid4().hex[:12],
+            from_node=snap.get("from_node"),
+            from_port=snap.get("from_port"),
+            to_node=snap.get("to_node"),
+            to_port=snap.get("to_port"),
+        )
+        if edge.from_node not in self._scene.graph.nodes or edge.to_node not in self._scene.graph.nodes:
+            return None
+        self._scene.graph.edges[edge.id] = edge
+        self._scene._add_edge_item(edge, emit=False)
+        return edge
+
+    def _set_node_position(self, node_id: str, pos_tuple):
+        if self._scene is None:
+            return
+        ni = self._scene._node_items.get(node_id)
+        if ni is None:
+            return
+        x, y = pos_tuple
+        ni.setPos(x, y)  # 会触发 itemChange，node.pos 会自动同步
+        ni.node_position_changed.emit(node_id, ni.pos())
+
+    # ============================================================
+    # Scene 写操作监听 → 把操作压入撤销栈
+    # ============================================================
+    def _on_scene_node_created(self, node_id: str):
+        if self._applying_undo_redo:
+            return
+        if self._paste_batch_collecting:
+            self._paste_batch_node_ids.append(node_id)
+            return
+        # 单节点新增（如：从节点库拖进来）
+        snap = self._scene.snapshot_node(node_id)
+        if snap is None:
+            return
+        self._push_undo({"kind": "add_nodes", "nodes": [snap]})
+
+    def _on_scene_edge_created(self, edge_id: str):
+        if self._applying_undo_redo:
+            return
+        snap = self._scene.snapshot_edge(edge_id)
+        if snap is None:
+            return
+        self._push_undo({"kind": "add_edges", "edges": [snap]})
+
+    # ---- 删除操作的"合并"：Delete 键一次可能删多个节点/边，用 0ms Timer 合并成 1 条撤销项 ----
+    def _on_scene_node_will_remove(self, node_id: str, node_snap: dict, related_edge_snaps: list):
+        if self._applying_undo_redo:
+            return
+        if not hasattr(self, "_pending_remove_nodes"):
+            self._pending_remove_nodes = []
+            self._pending_remove_edges = []
+            QTimer.singleShot(0, self._flush_pending_removes)
+        self._pending_remove_nodes.append((node_snap, related_edge_snaps or []))
+
+    def _on_scene_edge_will_remove(self, edge_id: str, edge_snap: dict):
+        if self._applying_undo_redo:
+            return
+        # 只有"用户单独选中边→删除"的情况走到这里；删节点连带的边在 node_will_remove 里已记录
+        if not hasattr(self, "_pending_remove_nodes"):
+            self._pending_remove_nodes = []
+            self._pending_remove_edges = []
+            QTimer.singleShot(0, self._flush_pending_removes)
+        self._pending_remove_edges.append(edge_snap)
+
+    def _flush_pending_removes(self):
+        """将同一轮事件循环里的"删节点/删边"合并成一条撤销项"""
+        node_list = getattr(self, "_pending_remove_nodes", None) or []
+        edge_list = getattr(self, "_pending_remove_edges", None) or []
+        self._pending_remove_nodes = []
+        self._pending_remove_edges = []
+        if not node_list and not edge_list:
+            return
+        # 构造 remove_nodes 项：节点快照 + 节点关联边 + 独立删除的边 放在一起
+        all_node_entries = []
+        all_edge_entries = list(edge_list)
+        for n_snap, rel_edges in node_list:
+            all_node_entries.append(n_snap)
+            all_edge_entries.extend(rel_edges)
+        # 去重：关联边可能和独立删除重复（按 edge id 唯一）
+        seen_edge_ids = set()
+        uniq_edges = []
+        for e in all_edge_entries:
+            eid = e.get("id")
+            if eid in seen_edge_ids:
+                continue
+            seen_edge_ids.add(eid)
+            uniq_edges.append(e)
+        action = {"kind": "remove_nodes", "nodes": all_node_entries, "edges": uniq_edges}
+        self._push_undo(action)
+
+    def _on_scene_nodes_dragged(self, changed: list):
+        """changed: list of (node_id, old_xy, new_xy)"""
+        if self._applying_undo_redo:
+            return
+        if not changed:
+            return
+        entries = [
+            {"node_id": nid, "old_pos": (ox, oy), "new_pos": (nx, ny)}
+            for (nid, (ox, oy), (nx, ny)) in changed
+        ]
+        self._push_undo({"kind": "move_nodes", "nodes": entries})
+
+    # ============================================================
+    # 撤销 / 重做 主入口
+    # ============================================================
     def _on_undo(self):
         if self._scene is None or self._scene.graph is None:
             return
@@ -1388,17 +1822,122 @@ class BlueprintMainWindow(QMainWindow):
             return
         action = self._undo_stack.pop()
         kind = action.get("kind")
-        if kind == "add_nodes":
-            # 撤销粘贴：把刚粘贴的节点全删掉
-            nids = action.get("node_ids") or []
-            for nid in nids:
-                self._scene.remove_node(nid)
-            self._redo_stack.append(action)
-            self._log.append_log(f"[撤销] 撤销粘贴，删除 {len(nids)} 个节点（如需恢复可用右键菜单「重做」，后续会绑 Ctrl+Y）", "INFO")
-        else:
-            # 其它操作暂未实现（P0.2 统一补齐），把 action 塞回撤销栈避免丢记录
-            self._undo_stack.append(action)
-            self._log.append_log(f"[撤销] 暂不支持撤销「{kind}」，后续版本会补齐。", "WARN")
+        self._applying_undo_redo = True
+        try:
+            if kind == "add_nodes":
+                # 撤销"新增节点"：删除这些节点
+                node_entries = action.get("nodes") or []
+                removed_ids = []
+                for s in node_entries:
+                    nid = s.get("id")
+                    if nid and nid in self._scene.graph.nodes:
+                        self._scene.remove_node(nid)
+                        removed_ids.append(nid)
+                self._redo_stack.append(action)
+                self._log.append_log(f"[撤销] 撤销新增节点：删除 {len(removed_ids)} 个节点（Ctrl+Y 重做）", "INFO")
+            elif kind == "remove_nodes":
+                # 撤销"删除节点"：恢复节点 + 边
+                node_entries = action.get("nodes") or []
+                edge_entries = action.get("edges") or []
+                restored_nodes = 0
+                for s in node_entries:
+                    if self._restore_node_from_snapshot(s) is not None:
+                        restored_nodes += 1
+                restored_edges = 0
+                for es in edge_entries:
+                    if self._restore_edge_from_snapshot(es) is not None:
+                        restored_edges += 1
+                self._redo_stack.append(action)
+                self._log.append_log(f"[撤销] 撤销删除：恢复 {restored_nodes} 个节点、{restored_edges} 条连线（Ctrl+Y 重做）", "INFO")
+            elif kind == "move_nodes":
+                # 撤销"移动节点"：回到旧位置
+                entries = action.get("nodes") or []
+                for e in entries:
+                    self._set_node_position(e["node_id"], e["old_pos"])
+                self._redo_stack.append(action)
+                self._log.append_log(f"[撤销] 撤销位置移动：{len(entries)} 个节点回到原位置（Ctrl+Y 重做）", "INFO")
+            elif kind == "add_edges":
+                # 撤销"新增连线"：删除这些连线
+                edge_entries = action.get("edges") or []
+                removed = 0
+                for es in edge_entries:
+                    eid = es.get("id")
+                    if eid and eid in self._scene.graph.edges:
+                        self._scene.remove_edge(eid, _emit_will=False)
+                        removed += 1
+                self._redo_stack.append(action)
+                self._log.append_log(f"[撤销] 撤销新增连线：删除 {removed} 条（Ctrl+Y 重做）", "INFO")
+            else:
+                # 不认识的操作：把 action 塞回栈
+                self._undo_stack.append(action)
+                self._log.append_log(f"[撤销] 暂不支持撤销「{kind}」，后续版本会补齐。", "WARN")
+                return
+        finally:
+            self._applying_undo_redo = False
+        self._scene.graph_changed.emit()
+
+    def _on_redo(self):
+        if self._scene is None or self._scene.graph is None:
+            return
+        if not self._redo_stack:
+            self._log.append_log("[重做] 重做栈为空（没有可重做的撤销）", "WARN")
+            return
+        action = self._redo_stack.pop()
+        kind = action.get("kind")
+        self._applying_undo_redo = True
+        try:
+            if kind == "add_nodes":
+                # 重做"新增节点"：恢复这些节点
+                node_entries = action.get("nodes") or []
+                restored = 0
+                for s in node_entries:
+                    if self._restore_node_from_snapshot(s) is not None:
+                        restored += 1
+                self._undo_stack.append(action)
+                self._log.append_log(f"[重做] 重新新增 {restored} 个节点", "INFO")
+            elif kind == "remove_nodes":
+                # 重做"删除节点/边"：先删独立边（避免节点删除后关联边自动删重复处理），再删节点
+                edge_entries = action.get("edges") or []
+                removed_edges = 0
+                for es in edge_entries:
+                    eid = es.get("id")
+                    if eid and eid in self._scene.graph.edges:
+                        self._scene.remove_edge(eid, _emit_will=False)
+                        removed_edges += 1
+                node_entries = action.get("nodes") or []
+                removed_nodes = 0
+                for s in node_entries:
+                    nid = s.get("id")
+                    if nid and nid in self._scene.graph.nodes:
+                        self._scene.remove_node(nid)
+                        removed_nodes += 1
+                self._undo_stack.append(action)
+                self._log.append_log(
+                    f"[重做] 重新删除 {removed_nodes} 个节点、{removed_edges} 条连线",
+                    "INFO",
+                )
+            elif kind == "move_nodes":
+                # 重做"移动节点"：移到新位置
+                entries = action.get("nodes") or []
+                for e in entries:
+                    self._set_node_position(e["node_id"], e["new_pos"])
+                self._undo_stack.append(action)
+                self._log.append_log(f"[重做] 重新移动 {len(entries)} 个节点到目标位置", "INFO")
+            elif kind == "add_edges":
+                # 重做"新增连线"：恢复连线
+                edge_entries = action.get("edges") or []
+                restored = 0
+                for es in edge_entries:
+                    if self._restore_edge_from_snapshot(es) is not None:
+                        restored += 1
+                self._undo_stack.append(action)
+                self._log.append_log(f"[重做] 重新新增 {restored} 条连线", "INFO")
+            else:
+                self._redo_stack.append(action)
+                self._log.append_log(f"[重做] 暂不支持重做「{kind}」，后续版本会补齐。", "WARN")
+                return
+        finally:
+            self._applying_undo_redo = False
         self._scene.graph_changed.emit()
 
     # ---------- Hooks implementation ----------
@@ -1416,11 +1955,8 @@ class BlueprintMainWindow(QMainWindow):
                 node.params.update({"x": x, "y": y, "w": w, "h": h})
                 self._scene.select_node_id(node.id)
                 self._inspector.set_node(node)
-                self._scene._on_node_moved(node.id)
-                try:
-                    self._scene.node_created.emit(node.id)
-                except Exception:
-                    pass
+                # 注意：scene.add_node_by_type 内部已经 emit 了 node_created / graph_changed，
+                # 此处不能再重复 emit，否则撤销栈会对同一节点重复 push add_nodes
                 self._scene.graph_changed.emit()
             return node.id if node else None
         except Exception as e:
@@ -1445,33 +1981,12 @@ class BlueprintMainWindow(QMainWindow):
                 node.params["region"] = (int(rx), int(ry), int(rw), int(rh))
             self._scene.select_node_id(node.id)
             self._inspector.set_node(node)
-            self._scene._on_node_moved(node.id)
-            try:
-                self._scene.node_created.emit(node.id)
-            except Exception:
-                pass
+            # 同样：撤销栈不能重复 push node_created
             self._scene.graph_changed.emit()
             return node.id
         except Exception as e:
             self._log.append_log(f"[Hook] create_find_image_node 失败: {e}", "ERROR")
             return None
-
-    def _hook_current_node_type(self) -> Optional[str]:
-        _nid, ntype = self._inspector.get_current_node_info()
-        return ntype
-
-    def _hook_patch_current_node(self, params_to_merge: dict):
-        ok = self._inspector.apply_params_merge(params_to_merge)
-        # 同步刷新 scene 里 NodeItem 的显示（如果有根据 param 的显示）
-        try:
-            nid, _ntype = self._inspector.get_current_node_info()
-            if nid:
-                ni = self._scene.node_item(nid)
-                if ni:
-                    ni.update()
-        except Exception:
-            pass
-        return ok
 
     # ==================== 全局热键 & 游戏内无弹窗截图 ====================
     def closeEvent(self, event):
@@ -1635,11 +2150,31 @@ class BlueprintMainWindow(QMainWindow):
         self._refresh_hotkey_status_hint()
 
     def _on_open_settings(self):
-        """打开设置窗口（现在支持修改全部11个快捷键）。"""
+        """打开设置窗口（支持修改全部快捷键）。
+
+        关键点：在设置界面打开期间，临时暂停 GlobalHotkeyManager 的 pynput 监听，
+        防止用户录制新快捷键时，按键刚好触发已经注册的全局热键（比如用户把暂停/运行
+        热键绑定到了 F5，录制时按 F5 就把蓝图停了）。设置窗口关闭后（无论点确定还是取消）
+        再恢复监听。
+        """
         # 用当前内存里的 user_settings 初始化（SettingsDialog会自己read_user_settings，但保持capture_target兼容行为）
         dlg = SettingsDialog(parent=self)
-        if dlg.exec() != QDialog.Accepted:
-            return
+        # 临时屏蔽所有 pynput 全局热键（listener 停止，但 _hotkeys map 完整保留，resume 时直接用）
+        try:
+            self._hotkey_mgr.pause_all()
+        except Exception as e:
+            print(f"[GlobalHotkeyManager] pause_all before SettingsDialog failed: {e}")
+
+        try:
+            if dlg.exec() != QDialog.Accepted:
+                return
+        finally:
+            # 不管点「确定」还是「取消」，最后都一定要恢复全局热键监听
+            try:
+                self._hotkey_mgr.resume_all()
+            except Exception as e:
+                print(f"[GlobalHotkeyManager] resume_all after SettingsDialog failed: {e}")
+
         new_settings = dlg.result_settings
         if not new_settings:
             return

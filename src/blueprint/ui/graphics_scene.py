@@ -15,6 +15,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QGraphicsScene,
+    QGraphicsSceneMouseEvent,
     QGraphicsView,
     QGraphicsItem,
     QWidget,
@@ -37,6 +38,9 @@ class NodeScene(QGraphicsScene):
     edge_removed = Signal(str)
     node_created = Signal(str)
     node_removed = Signal(str)
+    node_will_remove = Signal(str, dict, list)  # node_id, node_snapshot, related_edge_snapshots
+    edge_will_remove = Signal(str, dict)  # edge_id, edge_snapshot
+    nodes_dragged = Signal(list)  # list of (node_id, old_pos_tuple, new_pos_tuple)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -47,6 +51,7 @@ class NodeScene(QGraphicsScene):
         self._connecting_edge: Optional[EdgeItem] = None
         self._connecting_from: Optional[PortItem] = None
         self._wire_invalid = False
+        self._drag_start_positions: Optional[Dict[str, tuple]] = None
 
         self.setBackgroundBrush(QBrush(QColor("#1C2128")))
         self.selectionChanged.connect(self._on_selection_changed)
@@ -102,6 +107,32 @@ class NodeScene(QGraphicsScene):
             if isinstance(n, NodeItem) and n.node.id in self._node_items
         ]
 
+    # ---------------- 快照辅助 ----------------
+    def snapshot_node(self, node_id: str) -> Optional[dict]:
+        if self.graph is None or node_id not in self.graph.nodes:
+            return None
+        n = self.graph.nodes[node_id]
+        return {
+            "id": n.id,
+            "type": n.type,
+            "pos": tuple(n.pos),
+            "params": dict(n.params),
+            "inputs": [p.to_dict() for p in n.inputs],
+            "outputs": [p.to_dict() for p in n.outputs],
+        }
+
+    def snapshot_edge(self, edge_id: str) -> Optional[dict]:
+        if self.graph is None or edge_id not in self.graph.edges:
+            return None
+        e = self.graph.edges[edge_id]
+        return {
+            "id": e.id,
+            "from_node": e.from_node,
+            "from_port": e.from_port,
+            "to_node": e.to_node,
+            "to_port": e.to_port,
+        }
+
     # ---------------- 节点增删 ----------------
     def add_node_by_type(self, node_type: str, scene_pos: QPointF) -> Optional[Node]:
         if node_type not in NODE_LIBRARY:
@@ -130,12 +161,18 @@ class NodeScene(QGraphicsScene):
     def remove_node(self, node_id: str):
         if self.graph is None or node_id not in self.graph.nodes:
             return
-        edges_to_remove = [
+        # 删除前：先给外部一个 will_remove 信号（带节点快照+关联边快照），方便撤销栈记录
+        node_snap = self.snapshot_node(node_id)
+        related_edges = [
             eid for eid, e in self.graph.edges.items()
             if e.from_node == node_id or e.to_node == node_id
         ]
-        for eid in edges_to_remove:
-            self.remove_edge(eid)
+        edge_snaps = [self.snapshot_edge(eid) for eid in related_edges if self.snapshot_edge(eid) is not None]
+        if node_snap is not None:
+            self.node_will_remove.emit(node_id, node_snap, edge_snaps)
+        # 然后才是真正删除关联边+节点
+        for eid in related_edges:
+            self.remove_edge(eid, _emit_will=False)
         ni = self._node_items.pop(node_id, None)
         if ni:
             self.removeItem(ni)
@@ -192,9 +229,13 @@ class NodeScene(QGraphicsScene):
             self.edge_created.emit(edge.id)
             self.graph_changed.emit()
 
-    def remove_edge(self, edge_id: str):
+    def remove_edge(self, edge_id: str, _emit_will: bool = True):
         if self.graph is None or edge_id not in self.graph.edges:
             return
+        if _emit_will:
+            snap = self.snapshot_edge(edge_id)
+            if snap is not None:
+                self.edge_will_remove.emit(edge_id, snap)
         ei = self._edge_items.pop(edge_id, None)
         if ei:
             self.removeItem(ei)
@@ -235,6 +276,20 @@ class NodeScene(QGraphicsScene):
             return
         self.connect_ports(from_p, pi)
 
+    def mousePressEvent(self, event: QGraphicsSceneMouseEvent):
+        if event.button() == Qt.LeftButton:
+            items_under = self.items(event.scenePos())
+            has_node = any(isinstance(it, NodeItem) for it in items_under)
+            if has_node:
+                snap = {}
+                for ni in self._node_items.values():
+                    if ni.isSelected() or (any(it is ni for it in items_under)):
+                        p = ni.pos()
+                        snap[ni.node.id] = (p.x(), p.y())
+                if snap:
+                    self._drag_start_positions = snap
+        super().mousePressEvent(event)
+
     def mouseMoveEvent(self, event):
         if self._connecting_edge is not None and self._connecting_from is not None:
             pos = event.scenePos()
@@ -261,20 +316,33 @@ class NodeScene(QGraphicsScene):
                 self._connecting_edge.set_temp_to(pos)
             else:
                 self._connecting_edge._from_pos = pos
-                self._connecting_edge._rebuild_bezier()
+            self._connecting_edge._rebuild_bezier()
             event.accept()
             return
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
+        # 先让 Qt 完成默认的节点移动等行为
+        super().mouseReleaseEvent(event)
+
+        # 拖拽结束：对比快照里每个节点的 old/new pos
+        if event.button() == Qt.LeftButton and self._drag_start_positions:
+            changed = []
+            for nid, old_xy in self._drag_start_positions.items():
+                ni = self._node_items.get(nid)
+                if ni is None:
+                    continue
+                p = ni.pos()
+                new_xy = (p.x(), p.y())
+                if new_xy[0] != old_xy[0] or new_xy[1] != old_xy[1]:
+                    changed.append((nid, old_xy, new_xy))
+            self._drag_start_positions = None
+            if changed:
+                self.nodes_dragged.emit(changed)
+            event.accept()
+            return
+
         if self._connecting_edge:
-            # 关键：先判断鼠标释放点底下有没有 PortItem。
-            #   - 如果有：直接 super() 让 Qt 把事件派发给底下的 PortItem →
-            #             PortItem.mouseReleaseEvent 会 emit port_released → _on_port_released
-            #             然后 _on_port_released 内部自己会清理 temp 连线 + 建立正式连线。
-            #             这里**绝对不能提前清空 _connecting_edge / _connecting_from**，
-            #             否则 _on_port_released 里 from_p=None，连线永远连不上！
-            #   - 如果没有（在画布空白处松手）：才在这里清掉临时拖拽线。
             pos = event.scenePos()
             has_port_under_cursor = any(
                 isinstance(it, PortItem) for it in self.items(pos)
@@ -282,7 +350,6 @@ class NodeScene(QGraphicsScene):
             if has_port_under_cursor:
                 super().mouseReleaseEvent(event)
                 return
-            # 空白释放：清连线
             temp = self._connecting_edge
             self._connecting_edge = None
             self._connecting_from = None
@@ -291,7 +358,6 @@ class NodeScene(QGraphicsScene):
                 self.removeItem(temp)
             event.accept()
             return
-        super().mouseReleaseEvent(event)
 
     # ---------------- 选择/键盘 ----------------
     def _on_selection_changed(self):

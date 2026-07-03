@@ -4,7 +4,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
-from PySide6.QtCore import Qt, QPointF, QRectF, QSize, Signal, QEvent, QStandardPaths
+from PySide6.QtCore import Qt, QPoint, QPointF, QRect, QRectF, QSize, Signal, QEvent, QStandardPaths
 from PySide6.QtGui import (
     QBrush,
     QColor,
@@ -17,7 +17,9 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QAbstractButton,
+    QAbstractItemView,
     QCheckBox,
+    QComboBox,
     QDialog,
     QFileDialog,
     QGraphicsItem,
@@ -179,6 +181,7 @@ class ElementSplitDialog(QDialog):
         self._src_bgr: Optional[np.ndarray] = None
         self._split_result: Dict[str, Any] = {}
         self._elements: List[Dict[str, Any]] = []
+        self._filter_mode: str = "all"  # 筛选模式：all/checked/unchecked/custom，默认=全部
         self._current_idx = -1
         self._last_path: str = ""
         self._rect_items: List[ElementRectItem] = []
@@ -277,14 +280,15 @@ class ElementSplitDialog(QDialog):
         self._list.setViewMode(QListWidget.IconMode)
         self._list.setResizeMode(QListWidget.Fixed)
         self._list.setMovement(QListWidget.Static)
-        self._list.setIconSize(QSize(180, 180))
-        self._list.setGridSize(QSize(220, 270))
+        self._list.setIconSize(QSize(110, 110))
+        self._list.setGridSize(QSize(150, 180))
         self._list.setSpacing(8)
         self._list.setSelectionMode(QListWidget.SingleSelection)
         self._list.setUniformItemSizes(True)
         self._list.setContextMenuPolicy(Qt.CustomContextMenu)
         self._list.setMinimumWidth(480)
         self._list.itemClicked.connect(self._on_right_item_clicked)
+        self._list.itemDoubleClicked.connect(self._on_right_item_double_clicked)
         self._list.customContextMenuRequested.connect(self._on_right_item_context_menu)
         right_l.addWidget(self._list, 1)
 
@@ -309,22 +313,36 @@ class ElementSplitDialog(QDialog):
         row1.addWidget(self._btn_as_find)
         right_l.addLayout(row1)
 
-        self._btn_patch = QPushButton("🔗 应用到画布选中节点（写入模板+坐标）")
-        self._btn_patch.setToolTip(
-            "使用说明（两步）：\n"
-            "① 先切回【蓝图画布】，点选中一个 FindImage / TemplatePicker 节点；\n"
-            "② 回到本窗口右侧点这张碎图（左键选中 → 再点本按钮，\n"
-            "   → 自动把这张图保存为模板PNG → 把模板路径+坐标写入画布选中的节点。\n"
-            "   （对 FindImage 会同时填 template + region，对 TemplatePicker 填 template_path）"
-        )
-        self._btn_patch.clicked.connect(self._on_patch_current)
-        right_l.addWidget(self._btn_patch)
-
-        # 右侧底部：批量操作（全选 / 全不选 / 导出选中）
+        # 右侧底部：批量操作（筛选 + 全选 / 全不选 / 导出选中）
         right_l.addSpacing(10)
+        # 第 1 行：🧰 批量操作 标题（左）+ 🔍 筛选下拉框（右）—— 与标题同一行
+        batch_header_row = QHBoxLayout()
         batch_lbl = QLabel("<b>🧰 批量操作</b>")
         batch_lbl.setStyleSheet("padding:2px;")
-        right_l.addWidget(batch_lbl)
+        batch_header_row.addWidget(batch_lbl)
+        batch_header_row.addStretch(1)  # 把筛选挤到最右边
+        filter_lbl = QLabel("🔍 筛选:")
+        filter_lbl.setStyleSheet("color:#C9D1D9; padding:0 4px 0 8px;")
+        self._cmb_filter = QComboBox()
+        self._cmb_filter.addItem("� 全部", "all")
+        self._cmb_filter.addItem("✅ 仅勾选（保留）", "checked")
+        self._cmb_filter.addItem("🚫 仅不勾选（取消）", "unchecked")
+        self._cmb_filter.addItem("✎ 仅自定义切图", "custom")
+        self._cmb_filter.setToolTip(
+            "仅影响右侧🧩碎图卡片的显示（不改变元素本身的保留/取消状态，也不影响全选/全不选）：\n"
+            "  · 全部 → 显示所有自动切出来的 + 手动拖出来的\n"
+            "  · 仅勾选 → 只看左侧有蓝色矩形=开的那些\n"
+            "  · 仅不勾选 → 只看左侧没蓝色矩形=关的那些\n"
+            "  · 仅自定义切图 → 只看你在左侧手动拖拽画出来的（右下角显示 ✎ 标记）"
+        )
+        self._cmb_filter.setCurrentIndex(0)  # 默认选「全部」
+        self._cmb_filter.currentIndexChanged.connect(self._on_filter_changed)
+        filter_wrapper = QHBoxLayout()
+        filter_wrapper.setContentsMargins(0, 0, 0, 0)
+        filter_wrapper.addWidget(filter_lbl)
+        filter_wrapper.addWidget(self._cmb_filter)
+        batch_header_row.addLayout(filter_wrapper)
+        right_l.addLayout(batch_header_row)
 
         batch_row1 = QHBoxLayout()
         btn_sel_all = QPushButton("✅ 全选（保留全部）")
@@ -1014,41 +1032,213 @@ class ElementSplitDialog(QDialog):
     # 右：碎图列表
     # ============================================================
     def _render_right_list(self):
-        self._list.clear()
-        for e in self._elements:
-            crop = e.get("crop")
-            if crop is None and e.get("path"):
-                crop = _read_bgr_file(e["path"])
-            if crop is None:
-                crop = self._crop_from_src(
-                    int(e.get("x", 0)), int(e.get("y", 0)),
-                    int(e.get("w", 0)), int(e.get("h", 0)),
+        # ============================================================
+        # 滚动位置还原：两种策略，优先级从高到低：
+        #
+        #   策略 1（主用）【锚定视口顶部第一张卡片 + Y 偏移像素】✅
+        #     刷新前：itemAt(viewport 左上角) 取当前视口最顶部的可见卡片
+        #             记 eid = anchor_eid，以及这张卡片距离 viewport 顶部偏移
+        #             top_offset_pixel（一般是负数，表示这张卡片被滚动条裁掉了多少像素）
+        #     刷新后：在新列表里找 anchor_eid
+        #             ① 找得到 → 把这张卡片滚到 viewport 顶部 + 同样 top_offset_pixel 裁掉多少
+        #             ② 找不到（比如用户右键取消的就是这张 → 被过滤了）
+        #                → 找 anchor_eid 在 self._elements 原始顺序里【下一张仍然符合筛选的】
+        #                  也就是"自然顶上来补位那张"，滚到顶部同样的偏移
+        #     效果：用户取消的那张卡片消失后，它下面一张顶上来补位，
+        #           用户的视口整体位置不变，视觉上就是"卡片往上靠了"
+        #
+        #   策略 2（兜底）比例法 ratio = value/maximum
+        #     极端情况：锚定的卡片后面全都被过滤了（找不到任何能显示的），
+        #     或者用户本来就在顶部（还没出现滚动条），此时用比例法兜底。
+        #
+        # 另外 3 个之前的修复依然保留：
+        #   A. setUpdatesEnabled(False) 包 clear → addItem 全过程，防闪空白
+        #   B. selectionModel + QItemSelectionModel.NoUpdate，不让 setCurrent 自动 scroll
+        #   C. itemDoubleClicked 在 _build_ui 初始化只连 1 次，不重复挂槽
+        # ============================================================
+
+        vp = self._list.viewport()
+        vp_rect = vp.rect() if vp is not None else QRect()
+
+        # ---------- ① 刷新前：取锚点（anchor_eid + top_offset_pixel） + 比例兜底 ----------
+        anchor_eid: int = -1
+        top_offset_px: int = 0
+        anchor_li_before = None
+        if vp is not None and not vp_rect.isEmpty():
+            # 左上角取一张，往里缩 2px 避免边界命中空
+            anchor_li_before = self._list.itemAt(QPoint(2, 2))
+            if anchor_li_before is None:
+                anchor_li_before = self._list.itemAt(vp_rect.topLeft())
+        if anchor_li_before is not None:
+            anchor_eid = int(anchor_li_before.data(Qt.UserRole) or -1)
+            # 算这张卡片距离 viewport 顶部的偏移（<0 表示卡片的顶部被滚动条裁掉了多少）
+            v_rect_before = self._list.visualItemRect(anchor_li_before)
+            top_offset_px = v_rect_before.top() - vp_rect.top()
+
+        # 比例法兜底（极端情况用）
+        vscroll = self._list.verticalScrollBar()
+        hscroll = self._list.horizontalScrollBar()
+        v_max_before = max(1, int(vscroll.maximum())) if vscroll is not None else 1
+        h_max_before = max(1, int(hscroll.maximum())) if hscroll is not None else 1
+        v_ratio = (int(vscroll.value()) / v_max_before) if vscroll is not None else 0.0
+        h_ratio = (int(hscroll.value()) / h_max_before) if hscroll is not None else 0.0
+        selected_idx_before = self._current_idx
+
+        # ---------- ② 屏蔽中间重绘，clear → 重新构造卡片 ----------
+        self._list.setUpdatesEnabled(False)
+        try:
+            self._list.clear()
+            mode = getattr(self, "_filter_mode", "all")
+            # 存：每一张仍然显示的卡片 → 它对应的 eid（按显示顺序）
+            visible_eids: List[int] = []
+            visible_li_map: Dict[int, QListWidgetItem] = {}
+            selected_keep_row_in_new = -1
+            row_no = -1
+            for e in self._elements:
+                if mode == "checked" and not bool(e.get("enabled", True)):
+                    continue
+                if mode == "unchecked" and bool(e.get("enabled", True)):
+                    continue
+                if mode == "custom" and not bool(e.get("manual", False)):
+                    continue
+                crop = e.get("crop")
+                if crop is None and e.get("path"):
+                    crop = _read_bgr_file(e["path"])
+                if crop is None:
+                    crop = self._crop_from_src(
+                        int(e.get("x", 0)), int(e.get("y", 0)),
+                        int(e.get("w", 0)), int(e.get("h", 0)),
+                    )
+                    e["crop"] = crop
+                pix = _bgr_to_qpixmap(crop, max_width=110) if crop is not None else QPixmap()
+                icon = QIcon(pix)
+                manual_tag = " ✎" if e.get("manual") else ""
+                enabled_tag = "" if e.get("enabled", True) else " 🚫"
+                eid = int(e.get("idx", -1))
+                label = f"#{eid:03d}  {e.get('w', 0)}×{e.get('h', 0)}{manual_tag}{enabled_tag}"
+                li = QListWidgetItem(icon, label)
+                li.setData(Qt.UserRole, eid)
+                li.setSizeHint(QSize(148, 178))
+                self._list.addItem(li)
+                row_no += 1
+                li.setToolTip(
+                    f"元素 #{eid:03d}\n"
+                    f"位置: ({e.get('x',0)},{e.get('y',0)})  大小: {e.get('w',0)}×{e.get('h',0)}\n"
+                    f"当前: {'保留 (enabled)' if e.get('enabled',True) else '取消 (disabled)'}\n"
+                    f"快捷操作：左键卡片=保留   右键卡片=取消   双击卡片=切换"
                 )
-                e["crop"] = crop
-            pix = _bgr_to_qpixmap(crop, max_width=180) if crop is not None else QPixmap()
-            icon = QIcon(pix)
-            manual_tag = "  ✎" if e.get("manual") else ""
-            enabled_tag = "" if e.get("enabled", True) else "  🚫取消"
-            label = (
-                f"#{int(e.get('idx', -1)):03d} {e.get('w', 0)}x{e.get('h', 0)} "
-                f"@{e.get('x', 0)},{e.get('y', 0)}{manual_tag}{enabled_tag}"
-            )
-            li = QListWidgetItem(icon, label)
-            li.setData(Qt.UserRole, int(e.get("idx", -1)))
-            # --- 嵌入 QCheckbox：保留/取消 ---
-            cb = QCheckBox("保留" if e.get("enabled", True) else "取消")
-            cb.setChecked(bool(e.get("enabled", True)))
-            cb.stateChanged.connect(lambda state, eid=int(e.get("idx", -1)): self._on_right_check_changed(eid, state))
-            li.setSizeHint(QSize(218, 260))
-            self._list.addItem(li)
-            # 操作说明：左键卡片=保留；右键卡片=取消；双击仅作为额外快捷切换
-            li.setToolTip(
-                f"元素 #{int(e.get('idx',-1)):03d}\n"
-                f"位置: ({e.get('x',0)},{e.get('y',0)})  大小: {e.get('w',0)}x{e.get('h',0)}\n"
-                f"当前: {'保留 (enabled)' if e.get('enabled',True) else '取消 (disabled)'}\n"
-                f"快捷操作：左键卡片=保留   右键卡片=取消   双击卡片=切换"
-            )
-        self._list.itemDoubleClicked.connect(self._on_right_item_double_clicked)
+                visible_eids.append(eid)
+                visible_li_map[eid] = li
+                if eid == selected_idx_before:
+                    selected_keep_row_in_new = row_no
+
+            # ---------- ③ 恢复滚动位置：优先策略 1（锚定顶卡片 + 偏移） ----------
+            restored = False
+            if anchor_eid >= 0 and visible_eids:
+                # case A: anchor 卡片自己还在新列表里（说明这张没被过滤）
+                target_eid = -1
+                if anchor_eid in visible_li_map:
+                    target_eid = anchor_eid
+                else:
+                    # case B: anchor 自己被过滤掉了 → 找 self._elements 里 anchor_eid 【后面】第一张仍然显示的
+                    # （就是"顶上来补位的那张"）
+                    found_anchor = False
+                    for e in self._elements:
+                        eid = int(e.get("idx", -1))
+                        if not found_anchor:
+                            if eid == anchor_eid:
+                                found_anchor = True
+                            continue
+                        # 进入 anchor 之后的区域了
+                        if eid in visible_li_map:
+                            target_eid = eid
+                            break
+                    # 如果锚点后面全没了（锚点就是最后一张后面没东西了），兜底用新列表最后一张
+                    if target_eid < 0 and visible_eids:
+                        target_eid = visible_eids[-1]
+
+                if target_eid > 0 and target_eid in visible_li_map:
+                    # 先让这个 target 滚到视口顶部
+                    target_li = visible_li_map[target_eid]
+                    self._list.scrollToItem(target_li, QAbstractItemView.PositionAtTop)
+                    # 再微调 top_offset_px：还原"这张卡片顶部被裁掉多少像素"
+                    vp_now = self._list.viewport()
+                    vp_now_rect = vp_now.rect() if vp_now is not None else QRect()
+                    if vp_now is not None and not vp_now_rect.isEmpty():
+                        vis_rect = self._list.visualItemRect(target_li)
+                        current_top_offset = vis_rect.top() - vp_now_rect.top()
+                        delta = current_top_offset - top_offset_px
+                        vs = self._list.verticalScrollBar()
+                        if vs is not None:
+                            old_v = int(vs.value())
+                            new_v = old_v + delta
+                            vmax = int(vs.maximum())
+                            new_v = max(0, min(vmax, new_v))
+                            vs.blockSignals(True)
+                            try:
+                                vs.setValue(new_v)
+                            finally:
+                                vs.blockSignals(False)
+                    restored = True
+
+            # 策略 2 兜底：没锚定或者锚定后面也全没了 → 比例法
+            if not restored:
+                v_max_after = int(vscroll.maximum()) if vscroll is not None else 0
+                h_max_after = int(hscroll.maximum()) if hscroll is not None else 0
+                v_new_val = min(v_max_after, int(round(v_ratio * max(1, v_max_after)))) if v_max_after > 0 else 0
+                h_new_val = min(h_max_after, int(round(h_ratio * max(1, h_max_after)))) if h_max_after > 0 else 0
+                if vscroll is not None:
+                    vscroll.blockSignals(True)
+                    try:
+                        vscroll.setValue(v_new_val)
+                    finally:
+                        vscroll.blockSignals(False)
+                if hscroll is not None:
+                    hscroll.blockSignals(True)
+                    try:
+                        hscroll.setValue(h_new_val)
+                    finally:
+                        hscroll.blockSignals(False)
+
+            # ---------- ④ 恢复选中（仍然用 NoUpdate 绝对不 auto-scroll！ ----------
+            from PySide6.QtCore import QItemSelectionModel
+            if selected_keep_row_in_new >= 0:
+                keep_eid = visible_eids[selected_keep_row_in_new]
+                keep_li = visible_li_map.get(keep_eid)
+                keep_idx = self._list.indexFromItem(keep_li) if keep_li is not None else None
+                sm = self._list.selectionModel()
+                if keep_idx is not None and sm is not None:
+                    sm.select(keep_idx, QItemSelectionModel.Select | QItemSelectionModel.Rows)
+                    sm.setCurrentIndex(keep_idx, QItemSelectionModel.NoUpdate)
+        finally:
+            # 保证无论上面异常不会让 list widget 永久不重绘
+            self._list.setUpdatesEnabled(True)
+
+    def _on_filter_changed(self, _idx: int):
+        """筛选下拉框变化 → 更新当前筛选模式，然后重新渲染右侧列表（实时显示）"""
+        cmb = getattr(self, "_cmb_filter", None)
+        if cmb is None:
+            return
+        mode = cmb.currentData()
+        if isinstance(mode, str):
+            self._filter_mode = mode
+        self._render_right_list()
+
+    def _re_render_if_filter_depends_on_enabled(self):
+        """【筛选刷新规则】
+        按用户要求：
+        - 仅当当前筛选模式是「✅ 仅勾选（checked）」或「🚫 仅不勾选（unchecked）」时，
+          元素的 enabled 状态变化会直接影响"哪些卡片能显示/不能显示"
+          → 必须立即 _render_right_list 重新走一遍过滤，不然用户点卡片切换开关，
+            但因为筛选过滤，卡片依然留在列表里或不消失，体验断档。
+        - 「📋 全部（all）」和「✎ 仅自定义（custom）」筛选条件和 enabled 无关
+          → enabled 变了不用重渲染，维持原有行为（只刷新文字标签和左侧矩形）。
+        - 『✅ 全选 / ❌ 全不选』两个批量按钮，用户明确说"全选筛选和自定义勾选情况不用做刷新"
+          → 对应调用点（_on_select_all_elements / _on_select_none_elements）不调用本函数。
+        """
+        fm = getattr(self, "_filter_mode", "all")
+        if fm in ("checked", "unchecked"):
+            self._render_right_list()
 
     # ============================================================
     # 事件：左↔右 联动
@@ -1072,8 +1262,14 @@ class ElementSplitDialog(QDialog):
             changed = True
         self._refresh_current_lbl()
         if changed:
-            self._refresh_right_item_text()
-            self._refresh_scene_items_only()
+            # 筛选只依赖 enabled 的模式先重渲染（重渲染后内容全变了，不需要再 refresh_right_item_text 这种局部刷新）
+            fm = getattr(self, "_filter_mode", "all")
+            if fm in ("checked", "unchecked"):
+                self._render_right_list()
+                self._refresh_scene_items_only()
+            else:
+                self._refresh_right_item_text()
+                self._refresh_scene_items_only()
 
     def _on_right_item_context_menu(self, pos):
         """右键点右侧卡片 → 选中 + 明确取消（enabled=False）。"""
@@ -1093,8 +1289,13 @@ class ElementSplitDialog(QDialog):
             changed = True
         self._refresh_current_lbl()
         if changed:
-            self._refresh_right_item_text()
-            self._refresh_scene_items_only()
+            fm = getattr(self, "_filter_mode", "all")
+            if fm in ("checked", "unchecked"):
+                self._render_right_list()
+                self._refresh_scene_items_only()
+            else:
+                self._refresh_right_item_text()
+                self._refresh_scene_items_only()
 
     def _on_right_item_double_clicked(self, item: QListWidgetItem):
         idx = int(item.data(Qt.UserRole) or -1)
@@ -1108,7 +1309,11 @@ class ElementSplitDialog(QDialog):
         if e is None:
             return
         e["enabled"] = enabled
-        self._refresh_right_item_text()
+        fm = getattr(self, "_filter_mode", "all")
+        if fm in ("checked", "unchecked"):
+            self._render_right_list()
+        else:
+            self._refresh_right_item_text()
         self._refresh_scene_items_only()
 
     def _on_toggle_current(self):
@@ -1122,7 +1327,11 @@ class ElementSplitDialog(QDialog):
         if e is None:
             return
         e["enabled"] = not bool(e.get("enabled", True))
-        self._refresh_right_item_text()
+        fm = getattr(self, "_filter_mode", "all")
+        if fm in ("checked", "unchecked"):
+            self._render_right_list()
+        else:
+            self._refresh_right_item_text()
         self._refresh_scene_items_only()
         self._refresh_current_lbl()
 
@@ -1512,92 +1721,6 @@ class ElementSplitDialog(QDialog):
             )
         else:
             QMessageBox.information(self, "模板已保存", f"✅ 模板已保存到:\n{dst}")
-
-    def _on_patch_current(self):
-        # Step1: 校验当前是否选中了一张碎图（与"保存模板/生成节点"两个按钮统一：未选中或用户选了取消继续时，直接静默return，不弹第二个警告框）
-        e = self._current_element()
-        if not e:
-            return
-
-        # Step2: 取钩子函数
-        fn_type = self._resolve_hook("get_current_context_node_type")
-        fn_patch = self._resolve_hook("patch_current_node")
-
-        if not callable(fn_patch):
-            QMessageBox.information(
-                self, "未接入蓝图",
-                "当前没有接入蓝图画布的回填回调。\n"
-                "解决：先打开【蓝图编辑器主窗口】，通过工具栏的『✂ 切分UI元素』按钮打开本窗口。"
-            )
-            return
-
-        # Step3: 判断画布上当前选中的节点类型
-        node_type = None
-        if callable(fn_type):
-            try:
-                node_type = fn_type()
-            except Exception:
-                node_type = None
-
-        if not node_type:
-            QMessageBox.information(
-                self, "画布还没选中节点",
-                "使用『回填』前，需要先回到【蓝图画布】选中一个要填的节点：\n\n"
-                "① 切回蓝图主窗口，在画布上点选一个 FindImage 或 TemplatePicker 节点（让右边 Inspector 显示它的参数）；\n"
-                "② 再切回本窗口，先在右侧选中要回填的碎图；\n"
-                "③ 再点本按钮。\n\n"
-                "回填效果：\n"
-                "  - FindImage    → 自动把碎图保存为模板PNG + 填 template 路径 + 填 region 区域坐标\n"
-                "  - TemplatePicker → 自动把碎图保存为模板PNG + 填 template_path\n"
-            )
-            return
-
-        # Step4: 根据节点类型进行回填，给出清晰提示
-        if node_type in ("FindImage", "TemplatePicker"):
-            dst = self._save_element_as_template(e)
-            if not dst:
-                return
-            pname = "template_path" if node_type == "TemplatePicker" else "template"
-            merge = {pname: dst}
-            if node_type == "FindImage":
-                merge["region"] = (int(e["x"]), int(e["y"]), int(e["w"]), int(e["h"]))
-            ok = False
-            try:
-                ret = fn_patch(merge)
-                ok = bool(ret) if ret is not None else True
-            except Exception:
-                ok = False
-            if ok:
-                # 把 merge 转成人话展示
-                human_lines = []
-                for k, v in merge.items():
-                    if k == "region":
-                        human_lines.append(f"· region = {v[0]},{v[1]}  尺寸 {v[2]}x{v[3]}（相对于截图源图的坐标）")
-                    else:
-                        human_lines.append(f"· {k} = {v}")
-                QMessageBox.information(
-                    self, "✅ 已写入画布节点",
-                    f"节点类型：{node_type}\n\n"
-                    f"已把当前选中碎图的参数写入蓝图画布上选中的节点：\n" + "\n".join(human_lines)
-                )
-            else:
-                QMessageBox.warning(
-                    self, "写入失败",
-                    f"尝试回填到节点『{node_type}』失败。\n"
-                    "可能是画布选中的节点已被删除，请重新选中后再试。"
-                )
-            return
-
-        # 节点类型不支持
-        QMessageBox.information(
-            self, "暂不支持该节点",
-            f"当前画布选中的节点类型是：{node_type}\n\n"
-            "目前回填只支持把碎图参数写入这两种节点：\n"
-            "  · FindImage    → 填 template（模板路径）+ region（搜索区域）\n"
-            "  · TemplatePicker → 填 template_path（模板路径）\n\n"
-            "请在画布上选中这两种节点后，再点本按钮。\n"
-            "（如果要把当前碎图【直接生成】一个新的FindImage节点到画布，点上面的『🔎 生成 FindImage 节点』按钮即可）"
-        )
 
     def _resolve_hook(self, name: str):
         """返回指定 name 的 hook 回调：兼容 dict / 对象属性两种方式。"""

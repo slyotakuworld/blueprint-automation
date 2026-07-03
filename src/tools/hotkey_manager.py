@@ -113,6 +113,16 @@ class GlobalHotkeyManager:
         self._hotkeys = {}
         self._stop_only()
 
+    def pause_all(self):
+        """【临时屏蔽】停止所有全局热键的 pynput listener，但保留 _hotkeys 映射。
+        用于：设置界面录制快捷键时，防止录制的按键刚好触发已注册的全局热键。
+        与 resume_all() 配对使用。"""
+        self._stop_only()
+
+    def resume_all(self) -> bool:
+        """【恢复】pause_all 之后重新启动 listener（保留的 _hotkeys 完整不变）。"""
+        return self._start_only()
+
     def current_hotkey(self, hotkey_id: str) -> Optional[str]:
         return self._hotkeys.get(str(hotkey_id))
 

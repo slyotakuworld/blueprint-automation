@@ -21,12 +21,10 @@ config*.json
 *.log
 .env
 cache/
-screenshot/
+debug/
 screenshots/
 templates/
-debug/
-# 备份文件（每个蓝图5个轮转的本地备份，不进仓库）
-*.bp.backup_*.json
+projects/
 
 # ==========================================================
 # PyInstaller 打包产物

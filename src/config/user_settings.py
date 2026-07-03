@@ -35,10 +35,10 @@ DEFAULT_GLOBAL_CAPTURE_HOTKEY: str = DEFAULT_HOTKEY_CAPTURE_PYNPUT  # 向后兼�
 #   3) 设置界面「🎛 通用」改为开发者介绍文案。】
 SHORTCUT_REGISTRY: tuple = (
     # ---- 全局热键（跨窗口，游戏前台也能按到）—— 顺序=优先级（冲突修复时越靠前越优先保留，现在4项没冲突） ----
-    ("capture_target",      "🎯 截屏 + 打开切分（全局）",              "<f8>",                 "global"),
-    ("run_blueprint",       "▶ 运行蓝图（全局，游戏前台也能按）",        "<f5>",                 "global"),
-    ("pause_blueprint",     "⏸ 暂停 / 继续蓝图（全局，游戏前台也能按）", "<f6>",                 "global"),
-    ("stop_blueprint",      "■ 优雅停止当前蓝图（全局）",              "<f7>",                 "global"),
+    ("capture_target",      "截屏 + 打开切分",              "<f8>",                 "global"),
+    ("run_blueprint",       "运行蓝图",                     "<f5>",                 "global"),
+    ("pause_blueprint",     "暂停 / 继续蓝图",               "<f6>",                "global"),
+    ("stop_blueprint",      "停止蓝图",                     "<f7>",                 "global"),
 )
 # key -> 默认值 快速查表
 _DEFAULT_BY_KEY: Dict[str, str] = {row[0]: row[2] for row in SHORTCUT_REGISTRY}
