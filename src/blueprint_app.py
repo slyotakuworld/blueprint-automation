@@ -250,11 +250,95 @@ class BlueprintMainWindow(QMainWindow):
         except Exception:
             pass
 
+    def _reset_caches_on_switch_project(self):
+        """【工程切换核心清理】→ 解决"A工程资源/变量/模板图串到B工程"老问题。
+
+        所有切工程路径最终都会走 _load_or_new_graph_for_current_project，
+        所以把清理放在这个入口最前面，保证：
+          - 工程A -> 切到工程B 时，A工程的所有内存状态都被完全擦除
+          - 不会出现 B 工程里能看到 A 工程的变量、模板图、节点参数等"串资源"
+        """
+        # 1) 执行器：上一工程可能残留的 BlueprintRunner / matcher 模板缓存 / 运行态变量
+        try:
+            old_runner = getattr(self, "_runner", None)
+            if old_runner is not None:
+                try:
+                    old_runner.request_stop()
+                except Exception:
+                    pass
+                try:
+                    old_runner.wait(200)
+                except Exception:
+                    pass
+                self._runner = None
+        except Exception:
+            pass
+
+        # 2) 蓝图状态：清空当前 graph / 当前路径 / 保存 hash / 撤销栈，避免 A 蓝图的 hash / undo 串到 B 工程
+        self._graph = None
+        self._current_path = None
+        self._last_saved_graph_hash = None
+        try:
+            self._undo_stack.clear()
+        except Exception:
+            pass
+        try:
+            self._redo_stack.clear()
+        except Exception:
+            pass
+        try:
+            self._scene.clear_all()  # 画布图元/节点卡/边全部清空（scene.graph=None）
+        except Exception:
+            pass
+        try:
+            self._scene.clearSelection()
+        except Exception:
+            pass
+
+        # 3) Inspector：绝对不能留着上一工程的节点参数！否则用户切工程后选中
+        #    新节点之前，属性面板还显示 A 工程某节点参数（看起来就像串资源）
+        try:
+            if getattr(self, "_inspector", None) is not None:
+                self._inspector.set_node(None)
+        except Exception:
+            pass
+
+        # 4) 日志面板：切工程时把"正在运行/A工程的日志"清空（可选，但能减少迷惑）
+        try:
+            if getattr(self, "_log", None) is not None and hasattr(self._log, "clear"):
+                clear_fn = getattr(self._log, "clear", None)
+                if callable(clear_fn):
+                    clear_fn()
+        except Exception:
+            pass
+
+        # 5) 第三方老代码/模块级全局缓存清理：
+        #    - template_matcher 目前是 BlueprintRunner 每次 new（ctx级），没单例；
+        #      但未来改单例的话这里加 clear_all_caches() 兜底
+        try:
+            from src.blueprint.runtime.template_matcher import TemplateMatcher
+            clear_cls = getattr(TemplateMatcher, "clear_all_caches", None)
+            if callable(clear_cls):
+                clear_cls()
+        except Exception:
+            pass
+        try:
+            from src.config import app_paths as _ap
+            c = getattr(_ap, "clear_cache", None)
+            if callable(c):
+                c()
+        except Exception:
+            pass
+
     def _load_or_new_graph_for_current_project(self):
         """当前已经有开工程：按三级优先级加载蓝图，绝不自动创建落盘的 .bp.json 文件（首次create_project除外）
         优先级 1：last_opened_blueprint（用户上次打开/保存的那个）
         优先级 2：工程同名默认蓝图（第一次创建工程时自动生成的那张）
         优先级 3：工程内没有任何蓝图 → 仅显示内存中的空画布，不会在磁盘上创建任何 .bp.json（想新建蓝图请点工程菜单→新建蓝图手动创建）"""
+        # ★ 先做【工程切换缓存清理】！
+        #   不管这次是"从A切到B"还是"第一次打开工程"，都把可能残留的上一工程内存状态全部清干净，
+        #   从根源解决"不同工程串资源"的历史问题。
+        self._reset_caches_on_switch_project()
         if self._pm.is_open():
             proj_name = self._pm.project_name or "Untitled"
             # ===== 优先级 1：最近使用的蓝图 =====
@@ -896,6 +980,7 @@ class BlueprintMainWindow(QMainWindow):
         self._inspector.request_pick_template.connect(self._on_pick_template)
         self._inspector.request_fill_from_main_target.connect(self._on_fill_target_from_main)
         self._inspector.request_launch_exe_for_node.connect(self._on_launch_exe_for_node)
+        self._inspector.request_snip_for_node.connect(self._on_snip_for_node)
         self._palette.info_message.connect(lambda m, l: self._log.append_log(m, l))
         # 注意：全局热键已由 GlobalHotkeyManager.set_callback 直接绑定到主线程 QTimer.singleShot，
         # 无需额外 bridge.connect
@@ -1310,8 +1395,37 @@ class BlueprintMainWindow(QMainWindow):
         node.params[param_name] = value
         ni = self._scene.node_item(node_id)
         if ni is not None:
-            # FindAnyImage 多模板分支动态更新（保留一个简化：只做简单日志）
-            pass
+            # 额外名称 / 任何参数变化 → 强制节点卡重绘（刷新标题三段式显示）
+            ni.update()
+            # 动态端口节点（FindAnyImage / VarSwitch / Sequence）：关键参数变化时，重建端口集
+            try:
+                if node.type in ("FindAnyImage", "VarSwitch", "Sequence") and param_name in (
+                    "templates", "num_paths", "cases", "var_name", "var_expr"
+                ):
+                    from src.blueprint.core.node_library import (
+                        _resolve_input_ports_default,
+                        _resolve_output_ports_default,
+                    )
+                    p = dict(node.params or {})
+                    new_in = _resolve_input_ports_default(node.type, p)
+                    new_out = _resolve_output_ports_default(node.type, p)
+                    cur_in_names = [p.name for p in node.inputs]
+                    cur_out_names = [p.name for p in node.outputs]
+                    new_in_names = [p.name for p in new_in]
+                    new_out_names = [p.name for p in new_out]
+                    if cur_in_names != new_in_names or cur_out_names != new_out_names:
+                        node.inputs = list(new_in)
+                        node.outputs = list(new_out)
+                        ni.sync_from_node()
+                        # 端口变了 → 重新 set_node 刷新 inspector 的"当前输出端口列表"Label
+                        if (
+                            getattr(self, "_inspector", None) is not None
+                            and self._inspector._current_node is not None
+                            and self._inspector._current_node.id == node.id
+                        ):
+                            self._inspector.set_node(node)
+            except Exception:
+                pass
         self._scene.graph_changed.emit()
 
     def _on_pick_template(self, node_id: str, param_name: str):
@@ -1345,6 +1459,117 @@ class BlueprintMainWindow(QMainWindow):
                 self._inspector.set_node(self._graph.nodes[node_id])
         except Exception as e:
             self._log.append_log(f"裁图失败: {e}", "ERROR")
+            traceback.print_exc()
+
+    # ---------- IfImageDetect / StillnessDetect 全屏 SnipOverlay 处理 ----------
+    def _on_snip_for_node(self, node_id: str, mode: str):
+        """处理 Inspector 发来的截图请求：
+        mode ∈ {
+            "if_img_add",           # IfImageDetect 追加一张
+            "if_img_replace_<idx>", # IfImageDetect 替换第 idx 张
+            "if_static_roi",        # StillnessDetect 框选 ROI
+        }
+        """
+        if not self._graph or node_id not in self._graph.nodes:
+            return
+        try:
+            from src.blueprint.ui.snip_overlay import SnipOverlay
+        except Exception as e:
+            self._log.append_log(f"SnipOverlay 加载失败: {e}（降级为 region_selector）", "WARN")
+            return
+
+        def _on_result(result, nid=node_id, m=mode):
+            try:
+                # 恢复主窗口
+                try:
+                    self.show()
+                    self.raise_()
+                    self.activateWindow()
+                except Exception:
+                    pass
+                if result is None:
+                    self._log.append_log("[Snip] 用户取消截图", "INFO")
+                    return
+                bbox = result.get("bbox_screen")
+                pil = result.get("pil_img")
+                if not bbox or pil is None:
+                    self._log.append_log("[Snip] 截图结果为空", "WARN")
+                    return
+                x1, y1, x2, y2 = bbox
+                w = max(0, x2 - x1)
+                h = max(0, y2 - y1)
+                if w < 5 or h < 5:
+                    self._log.append_log("[Snip] 选区太小 (宽<5 或 高<5)，忽略", "WARN")
+                    return
+                node = self._graph.nodes.get(nid)
+                if node is None:
+                    return
+                # --- 转 b64 ---
+                try:
+                    import base64, io
+                    buf = io.BytesIO()
+                    pil.save(buf, format="PNG")
+                    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+                except Exception as e:
+                    self._log.append_log(f"[Snip] b64编码失败: {e}", "ERROR")
+                    return
+                # --- 按 mode 回填参数 ---
+                if m == "if_static_roi":
+                    self._on_param_changed(nid, "roi", json.dumps([int(x1), int(y1), int(w), int(h)]))
+                    self._on_param_changed(nid, "roi_preview_b64", b64)
+                    self._log.append_log(
+                        f"[if_static] ROI框选完成: ({x1},{y1}) {w}×{h}", "SUCCESS"
+                    )
+                    self._inspector.set_node(node)
+                    return
+                # IfImageDetect：if_img_add / if_img_replace_<N>
+                import uuid
+                raw = node.params.get("images_json", "[]")
+                try:
+                    arr = json.loads(raw) if isinstance(raw, str) and raw else (list(raw) if isinstance(raw, list) else [])
+                except Exception:
+                    arr = []
+                if not isinstance(arr, list):
+                    arr = []
+                new_item = {
+                    "id": uuid.uuid4().hex[:8],
+                    "b64": b64,
+                    "w": int(w),
+                    "h": int(h),
+                }
+                if m.startswith("if_img_replace_"):
+                    try:
+                        idx = int(m.split("_")[-1])
+                    except Exception:
+                        idx = -1
+                    if 0 <= idx < len(arr):
+                        old_id = ""
+                        try:
+                            old_id = str(arr[idx].get("id", "") or "")
+                        except Exception:
+                            pass
+                        new_item["id"] = old_id or new_item["id"]
+                        arr[idx] = new_item
+                        self._log.append_log(f"[if_img] 替换第 {idx+1} 张参考图: {w}×{h}", "SUCCESS")
+                    else:
+                        arr.append(new_item)
+                        self._log.append_log(f"[if_img] 追加新参考图: {w}×{h} (idx越界，改追加)", "WARN")
+                else:  # if_img_add
+                    arr.append(new_item)
+                    self._log.append_log(f"[if_img] 追加第 {len(arr)} 张参考图: {w}×{h}", "SUCCESS")
+                s = json.dumps(arr, ensure_ascii=False, sort_keys=True)
+                self._on_param_changed(nid, "images_json", s)
+                self._inspector.set_node(node)
+            except Exception as e2:
+                self._log.append_log(f"[Snip] 结果处理失败: {e2}", "ERROR")
+                traceback.print_exc()
+
+        try:
+            overlay = SnipOverlay.prepare_and_run(self, delay_ms=400)
+            overlay.finished.connect(_on_result)
+            self._log.append_log("[Snip] 请在屏幕上框选矩形（ESC取消）...", "INFO")
+        except Exception as e:
+            self._log.append_log(f"[Snip] 启动失败: {e}", "ERROR")
             traceback.print_exc()
 
     # ---------- TargetSetup 快捷填充（Inspector面板动作条） ----------
@@ -1679,10 +1904,14 @@ class BlueprintMainWindow(QMainWindow):
         if not ntype or ntype not in NODE_LIBRARY:
             return None
         pos = snap.get("pos") or (200, 200)
-        node = create_node(ntype, pos=pos)
-        # 强制使用原来的 id（否则重做出来会是新 id，连线恢复对不上）
-        new_id = snap.get("id") or node.id
-        node.id = new_id
+        # 强制使用原id（否则 redo 出来会是新 id，连线恢复对不上）
+        orig_id = snap.get("id")
+        if orig_id is None:
+            # 原快照没 id：退化为自增分配（极少情况）
+            from blueprint.core.graph_store import BlueprintStore
+            node = BlueprintStore.add_node(self._scene.graph, ntype, pos=pos)
+        else:
+            node = create_node(ntype, pos=pos, node_id=str(orig_id))
         params = snap.get("params") or {}
         if params:
             node.params.update(dict(params))
@@ -1699,7 +1928,16 @@ class BlueprintMainWindow(QMainWindow):
                 node.outputs = [Port.from_dict(pd) for pd in outputs_list]
             except Exception:
                 pass
-        self._scene.graph.nodes[node.id] = node
+        # redo 出来的节点注册到 graph；如果强制指定了非自增的数字id，要同步 bump _next 避免后续冲突
+        g = self._scene.graph
+        g.nodes[node.id] = node
+        try:
+            v = int(str(node.id))
+            cur_next = int(getattr(g, "_next_node_id", 1))
+            if v >= cur_next:
+                g._next_node_id = v + 1
+        except (TypeError, ValueError):
+            pass
         # _add_node_item(emit=False) 保持撤销期静默
         self._scene._add_node_item(node, emit=False)
         return node

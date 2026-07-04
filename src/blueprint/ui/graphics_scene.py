@@ -19,6 +19,11 @@ from PySide6.QtWidgets import (
     QGraphicsView,
     QGraphicsItem,
     QWidget,
+    QLineEdit,
+    QHBoxLayout,
+    QLabel,
+    QToolButton,
+    QVBoxLayout,
 )
 
 from ..core.models import BlueprintGraph, Edge, Node, PortDirection
@@ -80,7 +85,8 @@ class NodeScene(QGraphicsScene):
             self._add_node_item(n, emit=False)
         for e in graph.edges.values():
             self._add_edge_item(e, emit=False)
-        self.graph_changed.emit()
+        # ★ 不再 graph_changed.emit()：绑定蓝图 ≠ 用户修改了内容，
+        #   之前发射会让 _update_title 在 self._graph 还是旧对象时就提前跑，误判 dirty。
 
     def clear_all(self):
         for ei in list(self._edge_items.values()):
@@ -140,8 +146,9 @@ class NodeScene(QGraphicsScene):
         if self.graph is None:
             return None
         pos = (int(scene_pos.x()), int(scene_pos.y()))
-        node = create_node(node_type, pos=pos)
-        self.graph.nodes[node.id] = node
+        # 分配自增数字id（1,2,3…），每张蓝图独立计数
+        from ..core.graph_store import BlueprintStore
+        node = BlueprintStore.add_node(self.graph, node_type, pos=pos)
         self._add_node_item(node, emit=True)
         return node
 
@@ -419,6 +426,244 @@ class NodeView(QGraphicsView):
         self.setAcceptDrops(True)
         self.setBackgroundBrush(QBrush(QColor("#1C2128")))
         self.setFrameShape(QGraphicsView.NoFrame)
+
+        # 画布节点搜索框（画布最上方悬浮条，不遮挡中间画布操作区域）——阶段3-⑤
+        self._search_le: Optional[QLineEdit] = None
+        self._search_count_lbl: Optional[QLabel] = None
+        self._search_results: List[str] = []
+        self._search_idx: int = -1
+        self._top_bar: Optional[QWidget] = None   # 搜索条容器（贴顶固定，随窗口resize自动对齐）
+        self._build_search_bar()
+
+    # ---------------- 节点搜索框（阶段3-⑤） ----------------
+    def _build_search_bar(self):
+        # 独立 Widget 挂在 NodeView 自身上（不走scene/viewport），固定在最上方不随缩放/平移移动
+        self._top_bar = QWidget(self)
+        self._top_bar.setObjectName("searchTopBar")
+        self._top_bar.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+        self._top_bar.setStyleSheet("""
+            QWidget#searchTopBar {
+                background: rgba(28, 33, 40, 215);
+                border: 1px solid #30363D;
+                border-radius: 8px;
+            }
+        """)
+
+        outer = QVBoxLayout(self._top_bar)
+        outer.setContentsMargins(8, 6, 8, 6)
+        outer.setSpacing(0)
+        bar = QHBoxLayout()
+        bar.setSpacing(6)
+
+        lbl = QLabel("🔍 节点:")
+        lbl.setStyleSheet("color:#8b949e;")
+        bar.addWidget(lbl)
+
+        self._search_le = QLineEdit()
+        self._search_le.setPlaceholderText(
+            "搜索 title/type/id (支持子串不区分大小写)；Enter下一个；Esc清空；Ctrl+F聚焦"
+        )
+        self._search_le.setStyleSheet("""
+            QLineEdit {
+                background:#2D333B; color:#C9D1D9; border:1px solid #444C56;
+                border-radius:6px; padding:4px 8px; selection-background-color:#1f6feb;
+            }
+            QLineEdit:focus { border:1px solid #ff9800; }
+        """)
+        self._search_le.textChanged.connect(self._on_search_changed)
+        self._search_le.returnPressed.connect(self._on_search_next)
+        bar.addWidget(self._search_le, 1)
+
+        prev_btn = QToolButton()
+        prev_btn.setText("▲")
+        prev_btn.setToolTip("上一个匹配")
+        prev_btn.setStyleSheet(
+            "QToolButton{background:#30363D;color:#C9D1D9;border:1px solid #444C56;"
+            "border-radius:4px;padding:3px 8px;}QToolButton:hover{background:#3A3F4B;}"
+        )
+        prev_btn.clicked.connect(self._on_search_prev)
+        bar.addWidget(prev_btn)
+
+        next_btn = QToolButton()
+        next_btn.setText("▼")
+        next_btn.setToolTip("下一个匹配")
+        next_btn.setStyleSheet(
+            "QToolButton{background:#30363D;color:#C9D1D9;border:1px solid #444C56;"
+            "border-radius:4px;padding:3px 8px;}QToolButton:hover{background:#3A3F4B;}"
+        )
+        next_btn.clicked.connect(self._on_search_next)
+        bar.addWidget(next_btn)
+
+        clear_btn = QToolButton()
+        clear_btn.setText("✕")
+        clear_btn.setToolTip("清空并取消高亮")
+        clear_btn.setStyleSheet(
+            "QToolButton{background:#30363D;color:#C9D1D9;border:1px solid #444C56;"
+            "border-radius:4px;padding:3px 8px;}QToolButton:hover{background:#f44336;color:#fff;}"
+        )
+        clear_btn.clicked.connect(self._clear_search)
+        bar.addWidget(clear_btn)
+
+        self._search_count_lbl = QLabel("0")
+        self._search_count_lbl.setStyleSheet(
+            "color:#8b949e;background:#21262D;padding:2px 8px;border-radius:4px;min-width:36px;"
+            "qproperty-alignment:AlignCenter;"
+        )
+        bar.addWidget(self._search_count_lbl)
+
+        outer.addLayout(bar)
+        self._top_bar.show()
+        # 初始化计算一次位置（后续靠 resizeEvent 自动保持）
+        self._position_top_bar()
+
+    def _position_top_bar(self):
+        """把搜索条固定在画布最上方（QGraphicsView可视区域顶部，不随缩放/平移移动，水平居中但留边）。"""
+        if self._top_bar is None:
+            return
+        vw = max(320, int(self.width()))
+        w = min(vw - 16, 880)           # 宽度不超过880，窄屏自适应
+        x = 8 + max(0, (vw - 16 - w) // 2)
+        y = 8
+        h = 44
+        self._top_bar.setGeometry(x, y, w, h)
+        self._top_bar.raise_()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._position_top_bar()
+
+    def _iter_node_items(self) -> List[NodeItem]:
+        sc = self.scene()
+        if isinstance(sc, NodeScene):
+            return list(sc._node_items.values())
+        return []
+
+    def _node_match(self, ni: NodeItem, kw: str) -> bool:
+        if not kw:
+            return False
+        kw = kw.lower()
+        n = ni.node
+        if n.id and kw in n.id.lower():
+            return True
+        if n.type and kw in n.type.lower():
+            return True
+        meta = ni._meta()
+        if meta:
+            if meta.title and kw in meta.title.lower():
+                return True
+            if meta.description and kw in meta.description.lower():
+                return True
+        # 搜索变量名 / 输出变量字段（常用于快速找赋值节点）
+        try:
+            for k, v in (n.params or {}).items():
+                if isinstance(v, str) and kw in v.lower():
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _on_search_changed(self, text: str):
+        kw = (text or "").strip()
+        self._search_results = []
+        for ni in self._iter_node_items():
+            hit = self._node_match(ni, kw) if kw else False
+            try:
+                ni.set_highlighted(hit)
+            except Exception:
+                pass
+            if hit:
+                self._search_results.append(ni.node.id)
+        self._search_idx = 0 if (kw and self._search_results) else -1
+        if self._search_count_lbl:
+            total = len(self._search_results)
+            if total and self._search_idx >= 0:
+                self._search_count_lbl.setText(f"{self._search_idx + 1}/{total}")
+            else:
+                self._search_count_lbl.setText(str(total))
+        if self._search_idx >= 0:
+            self._goto_search_result(self._search_idx, flash_ok=False)
+
+    def _on_search_next(self):
+        if not self._search_results:
+            return
+        self._search_idx = (self._search_idx + 1) % len(self._search_results)
+        self._goto_search_result(self._search_idx, flash_ok=True)
+
+    def _on_search_prev(self):
+        if not self._search_results:
+            return
+        self._search_idx = (self._search_idx - 1) % len(self._search_results)
+        self._goto_search_result(self._search_idx, flash_ok=True)
+
+    def _goto_search_result(self, idx: int, flash_ok: bool):
+        if not (0 <= idx < len(self._search_results)):
+            return
+        node_id = self._search_results[idx]
+        sc = self.scene()
+        ni = sc._node_items.get(node_id) if isinstance(sc, NodeScene) else None
+        if ni is None:
+            return
+        # 选中 + 居中
+        self.centerOn(ni.global_center())
+        self._zoom_ensure_visible(ni)
+        try:
+            ni.setSelected(True)
+        except Exception:
+            pass
+        if flash_ok:
+            try:
+                ni.flash(1600)
+            except Exception:
+                pass
+        total = len(self._search_results)
+        if self._search_count_lbl:
+            self._search_count_lbl.setText(f"{idx + 1}/{total}")
+
+    def _zoom_ensure_visible(self, ni: NodeItem):
+        # 如果当前缩放太小导致节点几乎不可见，则适当放大
+        try:
+            cur = self.transform().m11()
+            if cur < 0.5:
+                self.scale(0.5 / cur, 0.5 / cur)
+        except Exception:
+            pass
+        br = ni.sceneBoundingRect()
+        self.ensureVisible(br, 80, 80)
+
+    def _clear_search(self):
+        if self._search_le:
+            self._search_le.blockSignals(True)
+            self._search_le.setText("")
+            self._search_le.blockSignals(False)
+        for ni in self._iter_node_items():
+            try:
+                ni.set_highlighted(False)
+            except Exception:
+                pass
+        self._search_results = []
+        self._search_idx = -1
+        if self._search_count_lbl:
+            self._search_count_lbl.setText("0")
+
+    def focus_search_box(self):
+        """外部调用（Ctrl+F / 菜单）聚焦搜索框"""
+        if self._search_le:
+            self._search_le.setFocus()
+            self._search_le.selectAll()
+
+    # ---------------- 快捷键 ----------------
+    def keyPressEvent(self, event):
+        # 搜索框快捷键（阶段3-⑤）
+        if event.key() == Qt.Key_Escape:
+            if self._search_le and self._search_le.text():
+                self._clear_search()
+                event.accept()
+                return
+        elif (event.modifiers() & Qt.ControlModifier) and event.key() == Qt.Key_F:
+            self.focus_search_box()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     # ---------------- 缩放 ----------------
     def wheelEvent(self, event):

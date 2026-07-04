@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
 
@@ -65,31 +66,116 @@ class Node:
     inputs: List[Port] = field(default_factory=list)
     outputs: List[Port] = field(default_factory=list)
     comment: str = ""
+    breakpoint: bool = False
+    # 运行时缓存（不序列化！）：PIL图、临时解析结果等
+    runtime_attrs: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        """序列化：BA内部对象 → Qflow格式JSON。
+
+        变更点（对齐 Qflow）：
+          - type: BA 驼峰 → Qflow小写短名（通过 NodeMeta.qflow_name 查）
+          - pos[] → 拆为独立 int 字段 x/y
+          - params → 重命名为 data（与Qflow一致）
+          - 只有动态端口节点（VarSwitch/Sequence/FindAnyImage等has_dynamic_ports）才写 outputs，静态端口不写（节省空间+对齐Qflow）
+          - 写 breakpoint 字段 bool
+          - comment 保留
+        """
+        from .node_library import NODE_LIBRARY
+
+        meta = NODE_LIBRARY.get(self.type)
+        # 1. 类型名 BA → Qflow
+        q_type: str
+        if meta is not None and getattr(meta, "qflow_name", ""):
+            q_type = meta.qflow_name
+        else:
+            # 兜底：没注册的类型名转小写（兼容旧类型不丢）
+            q_type = str(self.type).lower()
+        # 2. data（原params，语义未变只是key改名字）
+        data = dict(self.params)
+        out: Dict[str, Any] = {
             "id": self.id,
-            "type": self.type,
-            "pos": list(self.pos),
-            "params": self.params,
-            "inputs": [p.to_dict() for p in self.inputs],
-            "outputs": [p.to_dict() for p in self.outputs],
-            "comment": self.comment,
+            "type": q_type,
+            "x": int(self.pos[0]),
+            "y": int(self.pos[1]),
+            "data": data,
+            "breakpoint": bool(getattr(self, "breakpoint", False)),
         }
+        if self.comment:
+            out["comment"] = self.comment
+        # 3. 动态端口：只有 has_dynamic_ports=True 的节点额外写 outputs（inputs静态从不写）
+        has_dynamic = bool(meta is not None and getattr(meta, "has_dynamic_ports", False))
+        if has_dynamic and self.outputs:
+            out["outputs"] = [p.to_dict() for p in self.outputs]
+        return out
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "Node":
-        pos = d.get("pos", [0, 0])
-        pos_t = (int(pos[0]), int(pos[1])) if len(pos) >= 2 else (0, 0)
-        return Node(
+        """反序列化：自动识别「Qflow新格式」与「BA旧格式」，都能读。
+
+        识别顺序（双格式兼容）：
+          1. 类型名反向：优先查 QFLOW2BA，再兜底原样
+          2. 位置：新 x/y int 或 旧 pos[]
+          3. 参数：新 data 或 旧 params（兼容key）
+          4. 端口：JSON里有inputs/outputs则用，否则按NODE_LIBRARY默认补
+          5. 断点：顶层breakpoint字段或d.get('breakpoint')
+        """
+        from .node_library import NODE_LIBRARY, QFLOW2BA
+
+        q_type = d.get("type", "")
+        # 1. 类型名反向：Qflow小写 → BA驼峰
+        ba_type: str = q_type
+        if isinstance(q_type, str) and q_type in QFLOW2BA:
+            ba_type = QFLOW2BA[q_type]
+        elif isinstance(q_type, str) and q_type in NODE_LIBRARY:
+            ba_type = q_type  # 已经是BA驼峰名（旧格式蓝图）
+        meta = NODE_LIBRARY.get(ba_type)
+
+        # 2. 位置：x/y 或 pos[] 双格式识别
+        if "x" in d and "y" in d:
+            pos_t = (int(d["x"]), int(d["y"]))
+        else:
+            pos = d.get("pos", [0, 0])
+            pos_t = (int(pos[0]), int(pos[1])) if isinstance(pos, (list, tuple)) and len(pos) >= 2 else (0, 0)
+
+        # 3. 参数：新 data / 旧 params 二者兼容
+        if "data" in d:
+            params = dict(d["data"]) if isinstance(d["data"], dict) else {}
+        elif "params" in d:
+            params = dict(d["params"]) if isinstance(d["params"], dict) else {}
+        else:
+            params = {}
+
+        # 4. 输入输出端口：有则读，没有则按NODE_LIBRARY默认补
+        if "inputs" in d and isinstance(d["inputs"], list):
+            inputs = [Port.from_dict(p) for p in d["inputs"]]
+        elif meta is not None:
+            inputs = [Port(**p.__dict__) for p in meta.inputs]
+        else:
+            inputs = []
+        if "outputs" in d and isinstance(d["outputs"], list):
+            outputs = [Port.from_dict(p) for p in d["outputs"]]
+        elif meta is not None:
+            from .node_library import _resolve_output_ports_default
+            try:
+                defaults = _resolve_output_ports_default(ba_type, params)
+                outputs = [Port(**p.__dict__) for p in defaults]
+            except Exception:
+                outputs = [Port(**p.__dict__) for p in meta.outputs]
+        else:
+            outputs = []
+
+        n = Node(
             id=d["id"],
-            type=d["type"],
+            type=ba_type,
             pos=pos_t,
-            params=d.get("params", {}),
-            inputs=[Port.from_dict(p) for p in d.get("inputs", [])],
-            outputs=[Port.from_dict(p) for p in d.get("outputs", [])],
+            params=params,
+            inputs=inputs,
+            outputs=outputs,
             comment=d.get("comment", ""),
         )
+        n.breakpoint = bool(d.get("breakpoint", False))
+        return n
 
 
 @dataclass
@@ -112,7 +198,7 @@ class Edge:
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "Edge":
         return Edge(
-            id=d["id"],
+            id=d.get("id") or d.get("from_node", "") + "/" + d.get("from_port", "") + "->" + d.get("to_node", "") + "/" + d.get("to_port", ""),
             from_node=d["from_node"],
             from_port=d["from_port"],
             to_node=d["to_node"],
@@ -125,26 +211,124 @@ class BlueprintGraph:
     name: str
     nodes: Dict[str, Node] = field(default_factory=dict)
     edges: Dict[str, Edge] = field(default_factory=dict)
-    version: str = "1.0"
+    version: str = "2.0"
+    created_at: str = ""
+    updated_at: str = ""
+    dev_scale_x: float = 1.0
+    dev_scale_y: float = 1.0
+    # 运行时：下一个要分配的节点id（1,2,3…自增，每张蓝图独立计数，不序列化）
+    _next_node_id: int = 1
+
+    def __post_init__(self):
+        if not self.created_at:
+            self.created_at = datetime.now().isoformat(timespec="seconds")
+
+    def touch(self):
+        """刷新 updated_at = 当前时间。
+        ⚠️ 只应该在【真正落盘保存】时调用（graph_store.save），
+           绝对不要在 hash 计算 / 判定 dirty / 序列化预览时用：
+           如果 to_dict 每次都写 updated_at，两次 hash 计算的时间戳永远不一样，_need_save 永远 True。
+        """
+        self.updated_at = datetime.now().isoformat(timespec="seconds")
 
     def to_dict(self) -> Dict[str, Any]:
+        """序列化：→ Qflow完全等价顶层结构（nodes+links+breakpoints+metadata）。
+        ⚠️ 纯【只读】调用，不修改 self 的任何字段（保证 hash 计算稳定）。
+        """
+        nodes_d: Dict[str, Any] = {}
+        breakpoints_list: List[str] = []
+        for nid, n in sorted(self.nodes.items()):
+            nd = n.to_dict()
+            nodes_d[nid] = nd
+            if getattr(n, "breakpoint", False):
+                breakpoints_list.append(nid)
+        # links 数组
+        links: List[Dict[str, Any]] = []
+        for eid, e in sorted(self.edges.items()):
+            t = self._edge_exec_data_type(eid)
+            links.append({
+                "from_node": e.from_node,
+                "from_port": e.from_port,
+                "to_node": e.to_node,
+                "to_port": e.to_port,
+                "type": t,
+            })
+        # ★ 注意：这里不再 self.updated_at = datetime.now()！改为只在 save 时 graph.touch() 刷新
         return {
-            "name": self.name,
-            "version": self.version,
-            "nodes": {nid: n.to_dict() for nid, n in sorted(self.nodes.items())},
-            "edges": {eid: e.to_dict() for eid, e in sorted(self.edges.items())},
+            "nodes": nodes_d,
+            "links": links,
+            "breakpoints": breakpoints_list,
+            "metadata": {
+                "name": self.name,
+                "version": "2.0",
+                "dev_scale_x": float(self.dev_scale_x),
+                "dev_scale_y": float(self.dev_scale_y),
+                "created_at": self.created_at,
+                "updated_at": self.updated_at,
+            },
         }
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "BlueprintGraph":
-        g = BlueprintGraph(
-            name=d.get("name", "Untitled"),
-            version=d.get("version", "1.0"),
-        )
-        for nid, nd in d.get("nodes", {}).items():
-            g.nodes[nid] = Node.from_dict(nd)
-        for eid, ed in d.get("edges", {}).items():
-            g.edges[eid] = Edge.from_dict(ed)
+        """反序列化：双格式自动识别（新Qflow links数组 / 旧BA edges对象）。"""
+        nodes_d = d.get("nodes", {}) if isinstance(d.get("nodes"), dict) else {}
+        breakpoints_from_top: set = set(d.get("breakpoints", [])) if isinstance(d.get("breakpoints"), list) else set()
+
+        # links vs edges：二选一
+        if "links" in d and isinstance(d["links"], list):
+            # ✅ 新Qflow格式
+            links = d["links"]
+            edges_d: Dict[str, Any] = {}
+            for i, link in enumerate(links):
+                if not isinstance(link, dict):
+                    continue
+                key_tup = (
+                    str(link.get("from_node", "")),
+                    str(link.get("from_port", "")),
+                    str(link.get("to_node", "")),
+                    str(link.get("to_port", "")),
+                )
+                eid = f"e_{abs(hash(key_tup)):010d}"
+                edges_d[eid] = {
+                    "id": eid,
+                    "from_node": key_tup[0],
+                    "from_port": key_tup[1],
+                    "to_node": key_tup[2],
+                    "to_port": key_tup[3],
+                }
+        elif "edges" in d and isinstance(d["edges"], dict):
+            # ⬅️ 旧 BA 格式（升级器在 graph_store.load 里会转，但这里也能直接读兜底）
+            edges_d = d["edges"]
+        else:
+            edges_d = {}
+
+        nodes: Dict[str, Node] = {nid: Node.from_dict(nd) for nid, nd in nodes_d.items()}
+        edges: Dict[str, Edge] = {eid: Edge.from_dict(ed) for eid, ed in edges_d.items()}
+
+        # 合并断点：顶层 breakpoints list + 每个节点自己的 breakpoint 字段
+        for nid, n in nodes.items():
+            if nid in breakpoints_from_top:
+                n.breakpoint = True
+        meta = d.get("metadata") or {}
+        name_val = meta.get("name") or d.get("name") or "Untitled"
+        g = BlueprintGraph(name=str(name_val))
+        g.nodes = nodes
+        g.edges = edges
+        g.version = str(meta.get("version") or d.get("version") or "2.0")
+        g.dev_scale_x = float(meta.get("dev_scale_x", 1.0))
+        g.dev_scale_y = float(meta.get("dev_scale_y", 1.0))
+        g.created_at = str(meta.get("created_at") or g.created_at)
+        g.updated_at = str(meta.get("updated_at") or g.updated_at)
+        # 根据已加载节点的最大数字id，初始化下一个要分配的自增id（避免与现有节点冲突）
+        _max = 0
+        for nid in list(g.nodes.keys()):
+            try:
+                v = int(str(nid))
+                if v > _max:
+                    _max = v
+            except (TypeError, ValueError):
+                continue
+        g._next_node_id = _max + 1
         return g
 
     def find_start_node(self) -> Optional[Node]:
@@ -152,6 +336,19 @@ class BlueprintGraph:
             if n.type == "Start":
                 return n
         return None
+
+    # -------- 内部辅助：连线 exec / data 类型判别 --------
+    def _edge_exec_data_type(self, edge_id: str) -> str:
+        e = self.edges.get(edge_id)
+        if e is None:
+            return "exec"
+        # 按 from_node 的 from_port 端口类型判
+        src = self.nodes.get(e.from_node)
+        if src is not None:
+            for p in src.outputs:
+                if p.name == e.from_port:
+                    return "exec" if p.type == PortType.EXEC else "data"
+        return "exec"
 
 
 # ---------------- 执行上下文 ----------------
@@ -171,6 +368,8 @@ class ExecutionContext:
         lambda msg, level="INFO": None
     )
     last_progress_ts: float = 0.0
+    # 扩展 runtime_attrs：给 OpenApp → BindWindow 传 last_launched_pid 等（文档P0-5上下文联动）
+    runtime_attrs: Dict[str, Any] = field(default_factory=dict)
 
     def log(self, msg: str, level: str = "INFO"):
         try:

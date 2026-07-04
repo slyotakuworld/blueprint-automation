@@ -205,6 +205,8 @@ class NodeItem(QGraphicsObject):
         self.node = node
         self._port_items: Dict[str, PortItem] = {}
         self._running: bool = False
+        self._highlighted: bool = False
+        self._flash_until_ms: int = 0
         self.setAcceptHoverEvents(True)
         self.setFlags(
             QGraphicsItem.ItemIsSelectable
@@ -275,7 +277,12 @@ class NodeItem(QGraphicsObject):
         meta = self._meta()
         title_color = QColor(meta.color) if meta else QColor("#3A3F4B")
         accent = QColor(meta.accent) if meta else QColor("#58A6FF")
-        title = meta.title if meta else self.node.type
+        base_title = meta.title if meta else self.node.type
+        extra_name = str(self.node.params.get("custom_name", "") or "").strip()
+        if extra_name:
+            title = f"{self.node.id} · {base_title} · {extra_name}"
+        else:
+            title = f"{self.node.id} · {base_title}"
 
         # 选中描边
         is_sel = bool(option.state & QStyle.State_Selected)
@@ -340,6 +347,51 @@ class NodeItem(QGraphicsObject):
             pen = QPen(COL_HIGHLIGHT_RUN, 3)
             painter.setPen(pen)
             painter.drawRoundedRect(rect, NODE_ROUND, NODE_ROUND)
+
+        # 搜索匹配高亮（橙色3px）
+        if self._highlighted:
+            painter.setBrush(Qt.NoBrush)
+            pen = QPen(QColor("#ff9800"), 3)
+            painter.setPen(pen)
+            painter.drawRoundedRect(rect.adjusted(-1, -1, 1, 1), NODE_ROUND + 1, NODE_ROUND + 1)
+
+        # 闪烁（红色3px，到期自动恢复）
+        try:
+            import time
+            now_ms = int(time.time() * 1000)
+            if now_ms < self._flash_until_ms:
+                painter.setBrush(Qt.NoBrush)
+                # 0.5s方波闪烁
+                on = ((now_ms // 250) % 2) == 0
+                pen = QPen(QColor("#f44336"), 4 if on else 2)
+                painter.setPen(pen)
+                painter.drawRoundedRect(rect.adjusted(-2, -2, 2, 2), NODE_ROUND + 2, NODE_ROUND + 2)
+                # 触发下一帧重绘，直到到期
+                if now_ms < self._flash_until_ms - 50:
+                    try:
+                        from PySide6.QtCore import QTimer
+                        QTimer.singleShot(80, self.update)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    # ---------------- 搜索匹配/闪烁接口 ----------------
+    def set_highlighted(self, on: bool):
+        """画布搜索框实时高亮：画一圈橙色3px边"""
+        on = bool(on)
+        if self._highlighted != on:
+            self._highlighted = on
+            self.update()
+
+    def flash(self, duration_ms: int = 2000):
+        """红色方框闪烁（跳转后强调效果）"""
+        try:
+            import time
+            self._flash_until_ms = int(time.time() * 1000) + max(100, int(duration_ms))
+            self.update()
+        except Exception:
+            pass
 
     # ---------------- 事件 ----------------
     def itemChange(self, change, value):

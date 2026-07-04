@@ -123,8 +123,10 @@ def _check_required_params(n: Node, issues: List[ValidationIssue]):
         if not _not_empty(n.params.get("template_path")):
             issues.append(ValidationIssue("WARN", "PICKER_EMPTY", "TemplatePicker 未选择模板图片。", n.id))
     elif t == "SetVariable":
-        if not _not_empty(n.params.get("name")):
-            issues.append(ValidationIssue("ERROR", "SET_NO_NAME", "SetVariable.name 不能为空。", n.id))
+        has_batch = bool(str(n.params.get("batch_text", "") or "").strip())
+        has_legacy_name = bool(str(n.params.get("name", "") or "").strip())
+        if not has_batch and not has_legacy_name:
+            issues.append(ValidationIssue("WARN", "SET_EMPTY", "SetVariable 未设置任何变量：batch_text 与 name 均为空。", n.id))
     elif t == "GetVariable":
         if not _not_empty(n.params.get("name")):
             issues.append(ValidationIssue("ERROR", "GET_NO_NAME", "GetVariable.name 不能为空。", n.id))

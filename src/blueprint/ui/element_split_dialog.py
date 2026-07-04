@@ -1697,12 +1697,12 @@ class ElementSplitDialog(QDialog):
         return dst
 
     def _on_save_template(self):
-        e = self._current_element()
-        if not e:
-            return
-        dst = self._save_element_as_template(e)
-        if dst:
-            QMessageBox.information(self, "保存成功", f"✅ 模板已保存到:\n{dst}")
+        """
+        原实现：只把当前碎图写为模板 PNG，不生成节点；
+        现改：直接调用 _on_as_find → 保存模板 PNG 到 images/ + 在画布中央生成 FindImage 节点（同时填好 template 路径和 region 坐标）。
+        原因：用户认为"模板就是用来找图的"，单独保存一个 PNG 没意义，切分界面"导入/保存"操作应该直接产出可执行的 FindImage 节点。
+        """
+        self._on_as_find()
 
     def _on_as_find(self):
         e = self._current_element()
