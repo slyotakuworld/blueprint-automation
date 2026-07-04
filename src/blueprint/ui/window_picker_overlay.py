@@ -14,7 +14,7 @@ GW_OWNER = 4
 DWMWA_EXTENDED_FRAME_BOUNDS = 9
 DWMWA_CLOAKED = 14
 
-# 系统窗口类名（拾取时跳过，对齐 Qflow is_window_valid_target）
+# 系统窗口类名（拾取时跳过）
 _EXCLUDED_CLASSES = frozenset({
     "Progman", "Shell_TrayWnd", "Button", "Static", "WorkerW",
     "Windows.UI.Core.CoreWindow", "EdgeUiInputTopWnd", "ApplicationFrameWindow",
@@ -24,7 +24,7 @@ _user32 = ctypes.windll.user32
 _dwmapi = ctypes.windll.dwmapi
 _kernel32 = ctypes.windll.kernel32
 
-# EnumWindows 回调签名（对齐 Qflow：c_bool, c_int, c_int —— 实测可用）
+# EnumWindows 回调签名（c_bool, c_int, c_int）
 _WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_int, ctypes.c_int)
 
 
@@ -48,7 +48,7 @@ def _get_window_rect_dwm(hwnd: int) -> Optional[tuple]:
 
 
 def _get_exe_name(pid: int) -> str:
-    """通过 Toolhelp32 进程快照获取 exe 名（对齐 Qflow，不依赖 psutil）。"""
+    """通过 Toolhelp32 进程快照获取 exe 名。"""
     if not pid:
         return ""
     TH32CS_SNAPPROCESS = 0x00000002
@@ -94,7 +94,7 @@ def _get_exe_name(pid: int) -> str:
 
 
 def _is_window_valid_target(hwnd: int, my_pid: int) -> bool:
-    """对齐 Qflow is_window_valid_target 的过滤逻辑。"""
+    """过滤无效窗口的逻辑。"""
     if not _user32.IsWindowVisible(hwnd):
         return False
     if _user32.IsIconic(hwnd):
@@ -154,7 +154,7 @@ def _get_window_info(hwnd: int) -> Optional[Dict[str, Any]]:
 
 
 def enumerate_valid_windows() -> list:
-    """枚举所有有效目标窗口（对齐 Qflow get_all_windows）。"""
+    """枚举所有有效目标窗口。"""
     my_pid = os.getpid()
     results = []
 
@@ -172,7 +172,7 @@ def enumerate_valid_windows() -> list:
 
 
 def get_top_window_at_mouse() -> Optional[Dict[str, Any]]:
-    """获取光标下的顶层窗口（对齐 Qflow get_top_window_at_mouse）。
+    """获取光标下的顶层窗口。
     用 EnumWindows 枚举所有有效窗口，返回第一个矩形包含光标点的。"""
     cx, cy = _get_cursor_pos()
     for win in enumerate_valid_windows():
@@ -183,7 +183,7 @@ def get_top_window_at_mouse() -> Optional[Dict[str, Any]]:
 
 
 class WindowPickerOverlay(FullscreenOverlayBase):
-    """智能拾取窗口全屏遮罩（对齐 Qflow open_window_picker）。
+    """智能拾取窗口全屏遮罩。
 
     流程：
       1. 主窗隐藏 → 全屏半透明遮罩
@@ -192,7 +192,7 @@ class WindowPickerOverlay(FullscreenOverlayBase):
       4. 左键点击 → 拾取该窗口，emit finished({hwnd,title,exe_name,class_name,pid})
       5. ESC / 右键 → 取消，emit finished(None)
 
-    注：Qflow 用 Tkinter 的 <Motion> 绑定，Qt 下 WA_TranslucentBackground
+    注：全屏遮罩交互
     偶尔会让 mouseMoveEvent 不稳定，因此这里用 QTimer 轮询作为主检测机制，
     mouseMoveEvent 作为辅助刷新。
     """

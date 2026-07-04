@@ -130,25 +130,17 @@ class NodePalette(QWidget):
             meta = NODE_LIBRARY.get(ntype)
             if not meta:
                 continue
-            # 1) 新建隐藏节点：跳过（旧蓝图可加载，NODE_LIBRARY仍可正常解析
+            # 1) 新建隐藏节点：跳过（蓝图加载仍可正常解析，NODE_LIBRARY保有完整定义）
             if getattr(meta, "hidden_in_palette", False):
                 continue
             parent = category_items.get(meta.category)
             if parent is None:
                 continue
             title_display = meta.title
-            is_deprecated = bool(getattr(meta, "deprecated", False))
             it = QTreeWidgetItem(parent, [title_display])
             it.setData(0, Qt.UserRole, ntype)
             tip_parts = [ntype, meta.description or ""]
-            if is_deprecated:
-                f = it.font(0)
-                f.setStrikeOut(True)
-                it.setFont(0, f)
-                it.setForeground(0, QColor("#6E7681"))
-                tip_parts.insert(0, "【⚠️ 已废弃，不推荐】")
-            else:
-                it.setForeground(0, QColor("#C9D1D9"))
+            it.setForeground(0, QColor("#C9D1D9"))
             it.setToolTip(0, "\n".join(t for t in tip_parts if t))
         self._tree.expandAll()
 

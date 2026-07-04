@@ -11,7 +11,7 @@ from .fullscreen_overlay import FullscreenOverlayBase
 
 
 class VisualOffsetOverlay(FullscreenOverlayBase):
-    """基准图可视化偏移微调（对齐 Qflow open_visual_offset_picker）。
+    """基准图可视化偏移微调。
 
     交互流程：
       1. 主窗隐藏后 0.3s 延迟（不做黑遮罩，让屏幕保持可见）
@@ -20,7 +20,7 @@ class VisualOffsetOverlay(FullscreenOverlayBase):
            • 找到 → 绿色 #4caf50 粗线 2px 矩形框住匹配区域，匹配中心画红色十字(+/-10px 2px)
            • 没找到 → 外部调用者负责弹 QMessageBox 错误；本组件 finished.emit(None) + 恢复主窗
       4. 鼠标移动：从红色十字中心 → 鼠标光标 画蓝色虚线（dash=4,4 宽 1px）；光标右下角 10px 跟随白底蓝字实时显示 Offset: +23, -15
-      5. 左键点击 → 保存 node.params.offset_x / offset_y，finished.emit({offset_x, offset_y, matched_bbox, match_center})
+      5. 左键点击 → finished.emit( (dx, dy) )，dx/dy 为相对模板中心的像素偏移
       6. 右键/Esc → 取消 finished.emit(None)
 
     Args:
@@ -298,12 +298,5 @@ class VisualOffsetOverlay(FullscreenOverlayBase):
         my = event.pos().y()
         dx = int(mx) - int(self._match_center[0])
         dy = int(my) - int(self._match_center[1])
-        self.finished.emit(
-            {
-                "offset_x": dx,
-                "offset_y": dy,
-                "matched_bbox": self._matched_bbox,
-                "match_center": self._match_center,
-            }
-        )
+        self.finished.emit((dx, dy))
         self._restore_app_window()

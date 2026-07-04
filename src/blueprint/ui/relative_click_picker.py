@@ -9,7 +9,7 @@ from PySide6.QtWidgets import QWidget
 
 
 class RelativeClickPicker(QWidget):
-    """缩略图相对点击位置选择器（对齐 Qflow _draw_image_preview）。
+    """缩略图相对点击位置选择器。
 
     放置在 Inspector 参数区下方：
       - 黑底容器（#111），高度固定 150px

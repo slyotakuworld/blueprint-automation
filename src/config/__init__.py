@@ -21,7 +21,6 @@ from .app_paths import (
 )
 from .recognition_profiles import (
     DEFAULT_RECOGNITION_PROFILES,
-    LEGACY_FH6_PROFILES,
     get_recognition_profile,
 )
 
@@ -46,6 +45,5 @@ __all__ = [
     "auto_extract_configs",
     "auto_extract_images",
     "DEFAULT_RECOGNITION_PROFILES",
-    "LEGACY_FH6_PROFILES",
     "get_recognition_profile",
 ]

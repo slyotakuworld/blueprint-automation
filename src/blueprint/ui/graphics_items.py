@@ -321,7 +321,12 @@ class NodeItem(QGraphicsObject):
             return f"循环{max_it}次  间隔{interval:g}s"
         if t == "Sequence":
             mode = str(p.get("mode", "short_circuit") or "short_circuit")
-            mode_txt = "完全求值" if mode == "complete" else "短路模式"
+            if mode == "complete":
+                mode_txt = "完全求值"
+            elif mode == "or_true":
+                mode_txt = "一真即真"
+            else:
+                mode_txt = "短路模式"
             interval = float(p.get("interval_sec", 1.0) or 1.0)
             num = int(p.get("num_paths", 3) or 3)
             return f"[{mode_txt}] {num}路径  间隔{interval:g}s"
@@ -352,20 +357,6 @@ class NodeItem(QGraphicsObject):
                 if len(labels) > 6:
                     preview += f"…+{len(labels)-6}"
                 return f"{len(valid)}条件: {preview}"
-            # 兼容旧格式简单显示
-            if isinstance(raw, list):
-                ids = [str(x.get("id", "")).strip() for x in raw if isinstance(x, dict) and str(x.get("id", "")).strip()]
-                return f"旧格式: {', '.join(ids[:5])}" if ids else ""
-            stripped = (raw if isinstance(raw, str) else "").strip()
-            if stripped:
-                # 旧格式行式 id=value
-                if "=" in stripped and not stripped.startswith("#"):
-                    ids = []
-                    for line in stripped.splitlines():
-                        if "=" in line and not line.strip().startswith("#"):
-                            ids.append(line.split("=", 1)[0].strip())
-                    if ids:
-                        return f"旧格式: {', '.join(ids[:5])}"
             return "（未设置条件）"
         if t == "Clipboard":
             mode = str(p.get("mode", "read") or "read")
@@ -480,10 +471,7 @@ class NodeItem(QGraphicsObject):
             auto = bool(p.get("auto_scroll", False))
             # 显示 scroll_dy / scroll_dx 具体数值
             if auto:
-                try:
-                    sdy = int(p.get("scroll_dy", -500) or -500)
-                except Exception:
-                    sdy = int(p.get("scroll_amount", -500) or -500)
+                sdy = int(p.get("scroll_dy", -500) or -500)
                 sdx = int(p.get("scroll_dx", 0) or 0)
                 scroll_parts = []
                 if sdy != 0:
@@ -501,16 +489,13 @@ class NodeItem(QGraphicsObject):
                 "right_click": "动作:右键",
             }
             act_txt = act_map.get(act, act)
-            # 如果动作不为none，展示 offset 数值（优先 tuple2，其次 offset_x/offset_y）
+            # 展示 offset 数值
             if act != "none":
-                _o = p.get("offset")
-                if isinstance(_o, (list, tuple)) and len(_o) >= 2:
-                    try:
-                        ox, oy = int(_o[0]), int(_o[1])
-                    except Exception:
-                        ox, oy = int(p.get("offset_x", 0) or 0), int(p.get("offset_y", 0) or 0)
-                else:
-                    ox, oy = int(p.get("offset_x", 0) or 0), int(p.get("offset_y", 0) or 0)
+                try:
+                    off = p.get("offset", (0, 0))
+                    ox, oy = int(off[0] or 0), int(off[1] or 0)
+                except Exception:
+                    ox, oy = 0, 0
                 if ox != 0 or oy != 0:
                     act_txt += f"(+{ox},+{oy})"
                 else:
@@ -526,7 +511,12 @@ class NodeItem(QGraphicsObject):
             return lines
         if t == "IfImageDetect":
             mode = str(p.get("eval_mode", "complete") or "complete")
-            mode_txt = "完全求值" if mode == "complete" else "短路模式"
+            if mode == "complete":
+                mode_txt = "完全求值"
+            elif mode == "or_true":
+                mode_txt = "一真即真"
+            else:
+                mode_txt = "短路模式"
             algo = str(p.get("match_strategy", "hybrid") or "hybrid")
             algo_map = {"hybrid": "混合匹配", "template": "模板匹配", "feature": "特征匹配"}
             algo_txt = algo_map.get(algo, algo)
@@ -607,16 +597,8 @@ class NodeItem(QGraphicsObject):
                 lines.append(f"  …还有 {shown_ok - len(lines)} 条条件")
             if err_count > 0:
                 lines.append(f"⚠ {err_count} 处格式错误（点「检查格式」查看）")
-            if not lines and not conds:
-                # 没任何条件，也没旧格式兜底，显示空提示
-                # 先看旧格式是否有内容，有就按旧格式提示
-                stripped = raw.strip()
-                if isinstance(raw, list) and raw:
-                    lines.append("（旧格式条件判断）")
-                elif stripped:
-                    lines.append("（条件待检查/格式错误）")
-                else:
-                    lines.append("（未设置条件）")
+            if not lines:
+                lines.append("（未设置条件）")
             return lines
         return []
 
@@ -1099,7 +1081,7 @@ class EdgeItem(QGraphicsPathItem):
     def _rebuild_bezier(self):
         """统一用贝塞尔曲线绘制（EXEC/DATA 都用曲线）。
         曲线控制点在水平方向偏移，避免多条线重叠成一根线（问题4）。
-        参考 Qflow 样式：从端口水平出发，到目标端口水平进入。"""
+        曲线绘制：从端口水平出发，到目标端口水平进入。"""
         p1 = self._from_pos
         p2 = self._to_pos
         # 控制点偏移量：水平方向，至少 40px 保证曲线有明显弧度

@@ -8,7 +8,7 @@ from .fullscreen_overlay import FullscreenOverlayBase
 
 
 class SnipOverlay(FullscreenOverlayBase):
-    """全屏半透明遮罩下的矩形框选截图（对齐 Qflow do_snip）。
+    """全屏半透明遮罩下的矩形框选截图。
 
     交互：
       - 鼠标按下（左键）→ 开始拖拽画框

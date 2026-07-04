@@ -7,7 +7,7 @@ from .fullscreen_overlay import FullscreenOverlayBase
 
 
 class CoordOverlay(FullscreenOverlayBase):
-    """坐标点选全屏遮罩（对齐 Qflow _coord_overlay）。
+    """坐标点选全屏遮罩（对齐 _coord_overlay）。
 
     两种模式（构造时传入 hwnd 自动判定）：
       - 绑定窗口模式（hwnd 有效）：
@@ -187,7 +187,7 @@ class CoordOverlay(FullscreenOverlayBase):
 
 
 class VisualOffsetOverlay(FullscreenOverlayBase):
-    """视觉偏移拾取全屏遮罩（对齐 Qflow open_visual_offset_picker）。
+    """视觉偏移拾取全屏遮罩。
 
     显示截屏背景 + 模板匹配位置标记（绿色框 + 红色十字中心），
     鼠标移动时实时显示 offset = (鼠标位置 - 模板中心)，

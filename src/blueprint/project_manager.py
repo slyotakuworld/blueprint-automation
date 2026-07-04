@@ -15,7 +15,7 @@ class ProjectManager(QObject):
             ├── screenshots/               # 热键截图/源图
             │   ├── autocap_autosave/      #   目标窗口自动抓帧保存的PNG
             │   └── imported_images/       #   从外部磁盘导入的图片拷贝（缓存）
-            ├── templates/                 # 裁剪为模板的小PNG（FindAnyImage/WaitAnyImage用）
+            ├── templates/                 # 裁剪为模板的小PNG（FindAnyImage 用）
             ├── split_elements_<ts>/       # ElementSplitDialog自动生成的碎图目录（每帧切一次一个）
             ├── cache/                     # 模板匹配缓存/其它运行期缓存
             └── debug/                     # 运行期debug截图/标注输出
@@ -196,11 +196,18 @@ class ProjectManager(QObject):
         except Exception:
             return False
 
-    def create_project(self, parent_dir: str, project_name: str) -> Optional[str]:
+    def create_project(self, parent_dir: str, project_name: str, auto_open: bool = True) -> Optional[str]:
         """
         新建一个工程。返回工程根目录绝对路径（成功）或 None（失败）。
         同时写 project_meta.json，创建所有子目录，**仅首次创建时自动生成初始空白蓝图（带Start节点）**，
         并把这张同名默认蓝图设为 last_opened_blueprint。
+
+        参数 auto_open：
+          - True  (默认)：创建完成后自动调 open_project 切到新工程，is_open=True，后续可直接操作。
+          - False：只创建磁盘结构 + 写好 meta + 生成初始蓝图，**绝不改动 ProjectManager 的状态**。
+                  用于『切工程前要先 confirm_discard 保存旧工程修改』的场景（时序严格场景），
+                  避免 create_project 内部提前把 project_root / _meta 切到新工程，导致后续
+                  set_last_opened_blueprint 把旧工程的蓝图路径误写进新工程。
         """
         if not parent_dir or not os.path.isdir(parent_dir):
             return None
@@ -231,16 +238,16 @@ class ProjectManager(QObject):
             os.makedirs(os.path.join(project_root, sub), exist_ok=True)
         # project_meta.json（仅首次创建时写入初始字段）
         import time
-        self._meta_path = os.path.join(project_root, "project_meta.json")
-        self._meta = {
+        meta_path = os.path.join(project_root, "project_meta.json")
+        meta_dict = {
             "project_name": safe,
             "version": 1,
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "opened_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
         try:
-            with open(self._meta_path, "w", encoding="utf-8") as f:
-                json.dump(self._meta, f, ensure_ascii=False, indent=2)
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(meta_dict, f, ensure_ascii=False, indent=2)
         except Exception:
             return None
         # 初始蓝图（带Start节点）——**只有首次创建工程时自动生成这一张**
@@ -249,17 +256,41 @@ class ProjectManager(QObject):
         g = BlueprintStore.new_graph(name=safe)
         if not BlueprintStore.save(g, bp_path, make_backup=False):
             return None
-        # 打开它（open_project 后 is_open 才会 True，此时才能成功写 meta）
-        ok = self.open_project(project_root)
-        if not ok:
-            return None
-        # 把这张首次自动生成的同名蓝图设为 last_opened_blueprint（必须放在 open_project 之后）
-        try:
-            self.set_last_opened_blueprint(bp_path)
-        except Exception:
-            pass
+        # 把这张首次自动生成的同名蓝图设为 last_opened_blueprint（直接写 meta 文件，无需 is_open 为 True）
+        # 注意：这里不能用 set_last_opened_blueprint()，因为 auto_open=False 时 is_open 会返回 False，
+        # set_last_opened_blueprint 会直接拒绝。改用内部函数 _write_meta_to_file，接受任意 meta_path。
+        self._write_meta_to_file(meta_path, {"last_opened_blueprint": f"{safe}.bp.json"})
+
+        if auto_open:
+            # 打开它（open_project 后 is_open 才会 True，此时才能成功写 meta）
+            ok = self.open_project(project_root)
+            if not ok:
+                return None
+        # add_recent_project 不管 auto_open 都要做，下次打开最近工程列表里就能看到
         self._add_recent_project(project_root)
         return project_root
+
+    @staticmethod
+    def _write_meta_to_file(meta_path: str, extra_updates: Optional[dict] = None) -> bool:
+        """「无状态」写 meta 文件：不依赖 is_open()，只接受任意 meta_path 并更新字段。
+
+        只用于 create_project(auto_open=False) 这种「工程还没正式打开，但需要先把
+        last_opened_blueprint 写进 meta 磁盘文件」的特殊场景。
+        """
+        if not meta_path or not os.path.isfile(meta_path):
+            return False
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                d = json.load(f) or {}
+            if extra_updates:
+                d.update(extra_updates)
+            tmp = meta_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(d, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, meta_path)
+            return True
+        except Exception:
+            return False
 
     def open_project(self, project_root: str) -> bool:
         """打开工程目录。成功后工程切换到该目录，保存到最近工程列表，发信号。"""
@@ -329,8 +360,27 @@ class ProjectManager(QObject):
             # 用户以为自己的工程丢了（非常困惑）。真实行为：目录仍在就显示，
             # 用户点打开时，再通过 open_project() 里的 is_valid_project_dir 检查弹警告告知损坏，
             # 让用户能明确知道“我的工程还在，只是 meta 坏了，我修一下”，而不是凭空消失。
-            lst = [x for x in lst if isinstance(x, str) and os.path.isdir(x)]
-            return lst[:limit]
+            seen = set()
+            norm_lst: List[str] = []
+            for x in lst:
+                if not isinstance(x, str):
+                    continue
+                try:
+                    nx = os.path.normpath(os.path.abspath(x))
+                except Exception:
+                    continue
+                if not os.path.isdir(nx):
+                    continue
+                # 去重（同一工程绝对路径只保留首次出现的那条）
+                try:
+                    key = nx.lower() if os.name == "nt" else nx
+                except Exception:
+                    key = nx
+                if key in seen:
+                    continue
+                seen.add(key)
+                norm_lst.append(nx)
+            return norm_lst[:limit]
         except Exception:
             return []
 
@@ -357,16 +407,168 @@ class ProjectManager(QObject):
                     d = json.load(f) if os.path.isfile(p) else {}
             except Exception:
                 d = {}
-            lst = list(d.get("recent_projects", []) or [])
-            # 去重+置顶
-            root = os.path.abspath(project_root)
-            if root in lst:
-                lst.remove(root)
-            lst.insert(0, root)
-            lst = lst[:16]
-            d["recent_projects"] = lst
+            raw_lst = list(d.get("recent_projects", []) or [])
+
+            # 目标路径规范化（统一格式：绝对路径 + normpath，避免反斜杠/多余点号差异）
+            try:
+                root_norm = os.path.normpath(os.path.abspath(project_root))
+            except Exception:
+                return
+            try:
+                root_key = root_norm.lower() if os.name == "nt" else root_norm
+            except Exception:
+                root_key = root_norm
+
+            # 第一步：遍历现有列表，做「逐个规范化 + 去重」
+            # （老 config 里可能混了单反斜杠/双反斜杠/大小写等多种写法）
+            dedup_keys = set()
+            clean_lst: List[str] = []
+            for x in raw_lst:
+                if not isinstance(x, str):
+                    continue
+                try:
+                    nx = os.path.normpath(os.path.abspath(x))
+                except Exception:
+                    continue
+                try:
+                    k = nx.lower() if os.name == "nt" else nx
+                except Exception:
+                    k = nx
+                if k in dedup_keys:
+                    # 同一工程重复出现 → 只保留第一次（不影响排序）
+                    continue
+                # 如果与新加入的目标相同 → 跳过（后面统一 insert 到最前做置顶）
+                if k == root_key:
+                    continue
+                dedup_keys.add(k)
+                clean_lst.append(nx)
+
+            # 第二步：把「目标工程」置顶插入最前
+            clean_lst.insert(0, root_norm)
+            clean_lst = clean_lst[:16]
+
+            d["recent_projects"] = clean_lst
             os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
             with open(p, "w", encoding="utf-8") as f:
                 json.dump(d, f, ensure_ascii=False, indent=2)
         except Exception:
             pass
+
+    def remove_recent_project(self, project_root: str) -> bool:
+        """只从『最近工程列表』里移除一条记录，不碰磁盘上的工程目录。
+        返回 True 表示 config 写回成功（或记录根本就不在，也算成功）。
+        """
+        try:
+            p = self._recent_projects_file()
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    d = json.load(f) if os.path.isfile(p) else {}
+            except Exception:
+                d = {}
+            raw_lst = list(d.get("recent_projects", []) or [])
+
+            # 目标路径规范化
+            try:
+                target_norm = os.path.normpath(os.path.abspath(project_root))
+            except Exception:
+                target_norm = ""
+            try:
+                target_key = target_norm.lower() if os.name == "nt" else target_norm
+            except Exception:
+                target_key = target_norm
+
+            # 遍历现有列表：逐个规范化 + 移除匹配项（所有变体都移除）+ 顺手去重
+            seen = set()
+            clean_lst: List[str] = []
+            changed = False
+            for x in raw_lst:
+                if not isinstance(x, str):
+                    changed = True
+                    continue
+                try:
+                    nx = os.path.normpath(os.path.abspath(x))
+                except Exception:
+                    changed = True
+                    continue
+                try:
+                    k = nx.lower() if os.name == "nt" else nx
+                except Exception:
+                    k = nx
+                if k == target_key:
+                    # 命中 → 移除
+                    changed = True
+                    continue
+                if k in seen:
+                    # 重复 → 移除
+                    changed = True
+                    continue
+                seen.add(k)
+                clean_lst.append(nx)
+
+            if changed or clean_lst != raw_lst:
+                d["recent_projects"] = clean_lst
+                os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
+                with open(p, "w", encoding="utf-8") as f:
+                    json.dump(d, f, ensure_ascii=False, indent=2)
+            return True
+        except Exception:
+            return False
+
+    def delete_project(self, project_root: str, permanent: bool = False) -> tuple[bool, str]:
+        """【单一删除入口】从磁盘删除一个工程目录，同时从最近工程列表里移除。
+
+        参数：
+          project_root: 工程根目录的绝对路径（必须 is_valid_project_dir() 才允许）。
+          permanent:    True  → shutil.rmtree 永久删除（不可恢复）。
+                        False → 先尝试移动到回收站；回收站不可用则抛错，由调用方决定是否升级为 permanent。
+
+        返回：
+          (ok: bool, reason: str)
+            ok=True   → 删除完成，reason 为"移动到回收站"或"已永久删除"的可读描述。
+            ok=False  → 删除被拒绝或失败，reason 是具体原因（含 "TRASH_UNAVAILABLE" 标识供调用方识别）。
+
+        安全保护（任一命中都会直接拒绝，返回 False）：
+          - 目标不是合法工程目录
+          - 目标工程当前正在被打开（pm.is_open() 且 project_root == 当前根目录）
+          - 目标是 default_projects_root() 的父级或根级（防删除整个 projects 文件夹）
+        """
+        if not isinstance(project_root, str) or not project_root:
+            return False, "空路径"
+        target = os.path.abspath(project_root)
+        # 安全 1：禁止删除当前正打开的工程
+        if self.is_open() and os.path.abspath(self.project_root) == target:
+            return False, "该工程正在使用中，请先关闭或切换到其他工程后再删除。"
+        # 安全 2：必须是合法工程（有 project_meta.json + project_name），避免删错用户目录
+        if not ProjectManager.is_valid_project_dir(target):
+            return False, (
+                f"{target}\n不是合法的 BlueprintAutomation 工程目录"
+                f"（缺少 project_meta.json 或 project_name）。"
+            )
+        # 安全 3：不能是 default_projects_root 本身（防止误删整个 projects/）
+        try:
+            dpr = os.path.abspath(ProjectManager.default_projects_root())
+            if target == dpr:
+                return False, "禁止删除全局默认工程父目录（projects/）。"
+        except Exception:
+            pass
+        # 真正执行删除（只做一次，绝不重复）
+        removed_by_trash = False
+        err = ""
+        if not permanent:
+            try:
+                import send2trash  # type: ignore
+                send2trash.send2trash(target)
+                removed_by_trash = True
+            except Exception as e:
+                return False, f"TRASH_UNAVAILABLE: 移动到回收站失败：{e}"
+        if permanent and not removed_by_trash:
+            import shutil as _sh
+            try:
+                _sh.rmtree(target)
+            except Exception as e:
+                return False, f"永久删除失败（shutil.rmtree）：{e}"
+        # 最后：从最近工程列表里移除（仅一次）
+        self.remove_recent_project(target)
+        if removed_by_trash:
+            return True, f"工程已移动到回收站：{target}"
+        return True, f"工程已永久删除：{target}"

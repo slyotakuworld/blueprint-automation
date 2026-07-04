@@ -305,10 +305,10 @@ class ElementSplitDialog(QDialog):
 
         # 底部操作按钮（移除"切换当前元素"按钮，左右键已直接操作）
         row1 = QHBoxLayout()
-        self._btn_save_tpl = QPushButton("💾 保存为模板PNG")
-        self._btn_save_tpl.clicked.connect(self._on_save_template)
-        self._btn_as_find = QPushButton("🔎 生成 FindImage 节点")
-        self._btn_as_find.clicked.connect(self._on_as_find)
+        self._btn_save_tpl = QPushButton("💾 保存PNG")
+        self._btn_save_tpl.clicked.connect(self._on_save_template_png)
+        self._btn_as_find = QPushButton("🔎 生成节点")
+        self._btn_as_find.clicked.connect(self._on_create_findimage_node)
         row1.addWidget(self._btn_save_tpl)
         row1.addWidget(self._btn_as_find)
         right_l.addLayout(row1)
@@ -355,7 +355,7 @@ class ElementSplitDialog(QDialog):
         batch_row1.addWidget(btn_sel_none)
         right_l.addLayout(batch_row1)
 
-        btn_export_sel = QPushButton("💾 导出选中的碎图…（每次都选目录）")
+        btn_export_sel = QPushButton("💾 导出选中的碎图")
         btn_export_sel.setMinimumHeight(34)
         btn_export_sel.setStyleSheet(
             "QPushButton{background:#1F6FEB;color:#fff;border:1px solid #388BFD;border-radius:6px;padding:6px 10px;font-weight:600;}"
@@ -1680,7 +1680,7 @@ class ElementSplitDialog(QDialog):
                 e["path"] = dst
         return crop, e.get("path")
 
-    def _save_element_as_template(self, e) -> Optional[str]:
+    def _save_element_as_template_png(self, e) -> Optional[str]:
         crop, _ = self._ensure_element_has_crop_and_path(e)
         if crop is None:
             QMessageBox.warning(self, "无法保存", "该元素没有可用的图像数据。")
@@ -1690,37 +1690,116 @@ class ElementSplitDialog(QDialog):
             f"split_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_"
             f"{int(e.get('idx', 0)):03d}.png"
         )
-        dst = os.path.join(template_dir(), name)
+        try:
+            tpl_dir = template_dir()
+        except Exception as e_tpl:
+            QMessageBox.warning(
+                self, "保存失败",
+                f"无法获取工程 templates/ 目录：\n{e_tpl}\n\n请先新建或打开一个 BlueprintAutomation 工程。"
+            )
+            return None
+        dst = os.path.join(tpl_dir, name)
         if not write_png_cn(dst, crop):
             QMessageBox.warning(self, "保存失败", f"无法写文件: {dst}")
             return None
         return dst
 
-    def _on_save_template(self):
+    @staticmethod
+    def _bgr_to_b64_preview(crop_bgr: np.ndarray, max_side: int = 220) -> str:
+        """把 BGR numpy 数组（element crop）缩成 (max_side, max_side) 以内的缩略图 PNG，输出 base64 ASCII 串。
+        用于回填 FindImage 节点的 template_b64 参数，让 inspector 直接显示预览图。
         """
-        原实现：只把当前碎图写为模板 PNG，不生成节点；
-        现改：直接调用 _on_as_find → 保存模板 PNG 到 images/ + 在画布中央生成 FindImage 节点（同时填好 template 路径和 region 坐标）。
-        原因：用户认为"模板就是用来找图的"，单独保存一个 PNG 没意义，切分界面"导入/保存"操作应该直接产出可执行的 FindImage 节点。
-        """
-        self._on_as_find()
+        if crop_bgr is None or not isinstance(crop_bgr, np.ndarray) or crop_bgr.size == 0:
+            return ""
+        try:
+            import cv2 as _cv
+            import base64 as _b64
+            h, w = crop_bgr.shape[:2]
+            scale = 1.0
+            if max(h, w) > max_side:
+                scale = max_side / float(max(h, w))
+            if abs(scale - 1.0) > 1e-3:
+                nw = max(1, int(round(w * scale)))
+                nh = max(1, int(round(h * scale)))
+                small = _cv.resize(crop_bgr, (nw, nh), interpolation=_cv.INTER_AREA)
+            else:
+                small = crop_bgr
+            # BGR -> PNG bytes (imencode 支持中文路径无关的内存编码)
+            ok, buf = _cv.imencode(".png", small)
+            if not ok or buf is None:
+                return ""
+            return _b64.b64encode(buf.tobytes()).decode("ascii")
+        except Exception:
+            return ""
 
-    def _on_as_find(self):
+    def _on_save_template_png(self):
+        """【💾 保存PNG】只写模板PNG文件到 templates/，不做其他事。
+        与『🔎 生成节点』严格区分：
+          - 保存PNG  = 纯导出图片（用户只想拿素材文件，不想在画布上加东西）
+          - 生成节点 = 保存PNG + 在蓝图画布上自动生成 FindImage 节点并填好参数
+        """
         e = self._current_element()
         if not e:
             return
-        dst = self._save_element_as_template(e)
+        dst = self._save_element_as_template_png(e)
         if not dst:
             return
+        QMessageBox.information(
+            self, "保存成功",
+            f"✅ 模板PNG已保存：\n  {dst}\n\n"
+            f"（只保存了图片，画布上没有新增节点；要生成找图节点请点【🔎 生成节点】。）"
+        )
+
+    def _on_create_findimage_node(self):
+        """【🔎 生成节点】保存模板PNG + 在画布中央生成 FindImage 节点（template/region/template_b64 全部预填好）。"""
+        e = self._current_element()
+        if not e:
+            return
+        # 1) 确保 crop 已经有
+        crop, _ = self._ensure_element_has_crop_and_path(e)
+        if crop is None:
+            QMessageBox.warning(self, "无法生成", "该元素没有可用的图像数据。")
+            return
+        # 2) 保存为 templates/*.png（复用保存函数，避免重复写文件）
+        dst = self._save_element_as_template_png(e)
+        if not dst:
+            return
+        # 3) 生成 b64 预览缩略图（直接用已经裁剪好的 BGR numpy）
+        thumb_b64 = ElementSplitDialog._bgr_to_b64_preview(crop)
+        # 4) 调主窗口钩子生成节点
         fn = self._hooks.get("create_find_image_node") if isinstance(self._hooks, dict) else None
         region = (int(e["x"]), int(e["y"]), int(e["w"]), int(e["h"]))
+        node_id = None
         if callable(fn):
-            fn(dst, region)
+            try:
+                node_id = fn(dst, region, thumb_b64)
+            except TypeError:
+                # 兼容旧版只接收 2 参数的钩子（万一升级不完整）
+                try:
+                    node_id = fn(dst, region)
+                except Exception as _e:
+                    QMessageBox.warning(self, "生成节点失败", f"回调执行异常：\n{_e}")
+                    return
+            except Exception as _e:
+                QMessageBox.warning(self, "生成节点失败", f"回调执行异常：\n{_e}")
+                return
+        # 5) 提示（区分两种情况：是否成功调用到主窗口）
+        if node_id is not None:
             QMessageBox.information(
                 self, "已生成节点",
-                f"✅ 已在画布中央生成 FindImage 节点：\n  模板={dst}\n  region={region}"
+                f"✅ 已在画布中央生成 FindImage 节点：\n"
+                f"  · 模板：{dst}\n"
+                f"  · region：{region}\n"
+                f"  · 预览：已附上（inspector 中可直接看到缩略图）\n\n"
+                f"（图片也已保存到 templates 目录，若只想要图片下次点【💾 保存PNG】即可。）"
             )
         else:
-            QMessageBox.information(self, "模板已保存", f"✅ 模板已保存到:\n{dst}")
+            # 没有主窗口挂钩子的情况（比如单独启动 Dialog），只做存图提示
+            QMessageBox.information(
+                self, "模板已保存",
+                f"✅ 模板已保存到:\n  {dst}\n\n"
+                f"（未找到主窗口的「生成节点」回调，未在画布上新增节点。）"
+            )
 
     def _resolve_hook(self, name: str):
         """返回指定 name 的 hook 回调：兼容 dict / 对象属性两种方式。"""

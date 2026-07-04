@@ -60,8 +60,6 @@ class InspectorPanel(QWidget):
 
     param_changed = Signal(str, str, object)  # node_id, param_name, value
     request_pick_template = Signal(str, str)  # node_id, param_name
-    request_fill_from_main_target = Signal(str)  # node_id（TargetSetup：从主界面当前目标填充）
-    request_launch_exe_for_node = Signal(str)  # node_id（TargetSetup：选EXE启动并填充）
     request_snip_for_node = Signal(str, str)  # node_id, mode（"if_img_add" / "if_static_roi" / "if_img_replace_<idx>"）
     request_pick_coord = Signal(str, str)  # node_id, param_name（Mouse 点属性 📍 坐标拾取）
 
@@ -139,7 +137,7 @@ class InspectorPanel(QWidget):
         elif t in ("Loop", "Sequence", "VarSwitch", "If", "Wait"):
             opening = "🐺 <b style='color:#E3B341'>赫萝：</b>嗯，盘盘算算、思前想后，这就是商人的本事哟。"
             flair = "条件算不清的话，可是要赔上一整袋麦子的唷～汝可得像精明的行商一样，把每条分支都瞧清楚咯。"
-        elif t in ("VarSet", "VarGet", "VarCalc"):
+        elif t in ("SetVariable",):
             opening = "🐺 <b style='color:#E3B341'>赫萝：</b>记好账、算明白金币，这可是旅途中顶顶重要的事。"
             flair = "把变量的账本理清楚，后面的伙伴才能不被糊涂账坑害呀。咱最讨厌糊涂的商人了，哼。"
         elif t in ("Mouse", "Keyboard", "PressKey"):
@@ -261,22 +259,6 @@ class InspectorPanel(QWidget):
             return
         self._action_host.hide()
 
-    def _open_dev_doc(self):
-        doc = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "docs", "Qflow对齐改造_开发设计文档.md"))
-        if not os.path.exists(doc):
-            QMessageBox.information(self, "提示", f"设计文档不在期望位置：\n{doc}")
-            return
-        try:
-            import subprocess, sys, os
-            if sys.platform.startswith("win"):
-                os.startfile(doc)  # type: ignore[attr-defined]
-            elif sys.platform == "darwin":
-                subprocess.Popen(["open", doc])
-            else:
-                subprocess.Popen(["xdg-open", doc])
-        except Exception as e:
-            QMessageBox.warning(self, "打开失败", f"无法打开设计文档：\n{e}")
-
     def _list_windows_for_bind(self):
         """列出当前所有可见窗口，让用户从列表中选择一个，回填 BindWindow 节点参数。"""
         if self._current_node is None or self._current_node.type != "BindWindow":
@@ -352,7 +334,7 @@ class InspectorPanel(QWidget):
 
     def _pick_window_for_bind(self):
         """智能拾取窗口：全屏半透明遮罩，鼠标移动高亮目标窗口，点击拾取。
-        对齐 Qflow 的 open_window_picker 交互。"""
+        窗口拾取交互。"""
         if self._current_node is None or self._current_node.type != "BindWindow":
             return
 
@@ -566,8 +548,6 @@ class InspectorPanel(QWidget):
             try:
                 self._hide_param_row("template_b64")
                 self._hide_param_row("template")
-                self._hide_param_row("offset_x")  # 旧字段，用统一的 offset(tuple2) 替代
-                self._hide_param_row("offset_y")
                 self._append_findimage_panel()
                 # 注意：每次 set_node 创建的是全新控件（_clear_form 已销毁旧控件），
                 # 不存在重复连接问题，所以不需要 disconnect()。
@@ -747,7 +727,8 @@ class InspectorPanel(QWidget):
 
     def _get_project_templates_dir(self) -> str:
         """获取当前工程的 templates 目录路径。
-        优先级：当前工程的 templates 子目录 > 工程根目录 > 用户主目录。
+        有工程时：返回 <project>/templates（不存在则自动创建）。
+        无工程时：返回用户主目录。
         """
         try:
             mw = self.window()
@@ -756,9 +737,8 @@ class InspectorPanel(QWidget):
                 root = pm.project_root
                 if root and os.path.isdir(root):
                     tpl_dir = os.path.join(root, "templates")
-                    if os.path.isdir(tpl_dir):
-                        return tpl_dir
-                    return root
+                    os.makedirs(tpl_dir, exist_ok=True)
+                    return tpl_dir
         except Exception:
             pass
         return os.path.expanduser("~")
@@ -1241,11 +1221,7 @@ class InspectorPanel(QWidget):
             "scroll_dy": auto_scroll,
             "scroll_dx": auto_scroll,
             "offset": show_offsets,
-            "offset_x": False,   # 旧字段，强制隐藏（我们已经在set_node里调了_hide_param_row，这里双重保险）
-            "offset_y": False,   # 旧字段，强制隐藏
         }
-        # 再兼容 scroll_amount 旧名（如果还有的话，一起跟着 auto_scroll 显隐）
-        vis_map.setdefault("scroll_amount", auto_scroll)
 
         for i in range(form.rowCount()):
             li = form.itemAt(i, QFormLayout.LabelRole)
@@ -1450,17 +1426,26 @@ class InspectorPanel(QWidget):
         final_path = path
         try:
             import shutil, uuid, time
-            import src.blueprint  # type: ignore
-            proj_root = os.path.abspath(os.path.join(os.path.dirname(src.blueprint.__file__), "..", ".."))
-            tpl_dir = os.path.join(proj_root, "templates")
+            from src.config.app_paths import template_dir
+            tpl_dir = template_dir()
             os.makedirs(tpl_dir, exist_ok=True)
             ext = os.path.splitext(path)[1] or ".png"
             fname = f"findimg_import_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}{ext}"
             fpath = os.path.join(tpl_dir, fname)
             shutil.copy2(path, fpath)
             final_path = fpath
-        except Exception:
-            pass
+        except Exception as e_img:
+            # 未开工程等场景：template_dir() 会直接抛 RuntimeError，必须显式拒绝而不是静默吞
+            try:
+                from PySide6.QtWidgets import QMessageBox
+                QMessageBox.warning(
+                    self, "导入模板失败",
+                    f"无法将模板图片拷贝到工程 templates/ 目录：\n{e_img}\n\n"
+                    "请先新建或打开一个 BlueprintAutomation 工程后再导入图片。"
+                )
+            except Exception:
+                pass
+            return
         # 生成预览 b64（缩略图，避免过大）
         b64 = ""
         if pil is not None:
@@ -1482,53 +1467,9 @@ class InspectorPanel(QWidget):
         # 刷新面板显示
         self.set_node(node)
 
-    # ---- FindImage 专属：搜索区域加「📍 框选区域」按钮（已废弃，改用上面的独立按钮行） ----
-    def _findimg_add_region_snip_button(self):
-        """把 region 参数的 widget 换成「QLineEdit + 📍框选按钮」的组合"""
-        node = self._current_node
-        if node is None or node.type != "FindImage":
-            return
-        w_region = self._widgets.get("region")
-        if w_region is None:
-            return
-        # 找到 region 在 form 中的行
-        target_row = -1
-        for row_i in range(self._form.rowCount()):
-            fld_item = self._form.itemAt(row_i, QFormLayout.FieldRole)
-            fld_w = fld_item.widget() if fld_item else None
-            if fld_w is w_region:
-                target_row = row_i
-                break
-        if target_row < 0:
-            return
-        # 创建容器：旧的region widget + 按钮
-        container = QWidget()
-        hlay = QHBoxLayout(container)
-        hlay.setContentsMargins(0, 0, 0, 0)
-        hlay.setSpacing(4)
-        # 如果旧的是 QLineEdit（EDITOR_STRING），直接放进去；否则兜底保留旧widget
-        hlay.addWidget(w_region, 1)
-        btn_snip = QPushButton("📍")
-        btn_snip.setFixedWidth(32)
-        btn_snip.setToolTip("全屏框选一个矩形区域作为搜索区域 [x,y,w,h]")
-        btn_snip.setStyleSheet(
-            "QPushButton { background: #0969DA; color: white; border: none;"
-            " border-radius: 4px; font-size: 14px; }"
-            "QPushButton:hover { background: #58A6FF; }"
-        )
-        nid = node.id
-        btn_snip.clicked.connect(lambda _=False, n=nid: self.request_snip_for_node.emit(n, "findimg_region"))
-        hlay.addWidget(btn_snip, 0)
-        # 替换 form 里的旧控件
-        lab_item = self._form.itemAt(target_row, QFormLayout.LabelRole)
-        lab_w = lab_item.widget() if lab_item else None
-        self._form.removeRow(target_row)
-        self._form.insertRow(target_row, lab_w, container)
-        self._widgets["region"] = w_region  # 旧 QLineEdit 仍是值绑定的主体
-
     # ---- FindImage 专属：偏移量加「📍 定位偏移位置」按钮 ----
     def _findimg_add_offset_pick_button(self):
-        """在 offset_x / offset_y 区域下，单独加一行「📍 定位偏移位置」按钮，点后在屏幕取点，算出相对目标模板左上角的偏移。"""
+        """在 offset 区域下，单独加一行「📍 定位偏移位置」按钮，点后在屏幕取点，算出相对目标模板左上角的偏移。"""
         node = self._current_node
         if node is None or node.type != "FindImage":
             return

@@ -38,7 +38,7 @@ if errorlevel 1 (
 
 echo.
 echo [PREP] Clean up old artifacts ...
-if exist "build" echo   Removing legacy root build/ ... & rmdir /s /q "build" 2>nul
+if exist "build" echo   Removing top-level build/ ... & rmdir /s /q "build" 2>nul
 if not exist "dist" mkdir "dist" 2>nul
 if exist "dist\build" echo   Cleaning dist/build/ workpath ... & rmdir /s /q "dist\build" 2>nul
 mkdir "dist\build" 2>nul

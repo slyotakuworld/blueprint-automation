@@ -78,7 +78,7 @@ def _sanitize_params_for_save(params: Dict[str, Any]) -> Dict[str, Any]:
         # 尝试 PIL
         b64 = _pil_to_b64(v)
         if b64 is not None:
-            # 如果原本字段是 image_b64 或 preview_b64，直接写；否则设 _pil_b64 并保留原始key(兼容)
+            # 如果原本字段是 image_b64 或 preview_b64，直接写；否则设 _pil_b64 并保留原始key
             if k in ("image_b64", "b64", "roi_preview_b64", "b64_preview"):
                 out[k] = b64
             else:
@@ -122,7 +122,7 @@ def _hydrate_params_after_load(node_type: str, params: Dict[str, Any]) -> Dict[s
         if pil is not None:
             runtime_attrs["_pil_image"] = pil
             return runtime_attrs
-    # b64：几个常见 key 都试一遍（Qflow用 b64 / b64_preview，BA旧的用 image_b64 / roi_preview_b64）
+    # b64：几个常见 key 都试一遍（常见格式 b64 / b64_preview，其他：image_b64 / roi_preview_b64）
     for k in ("image_b64", "b64", "b64_preview", "roi_preview_b64"):
         v = params.get(k)
         if isinstance(v, str) and v:
@@ -161,156 +161,7 @@ def _hydrate_params_after_load(node_type: str, params: Dict[str, Any]) -> Dict[s
 
 
 # ============================================================
-# BlueFormatUpgrader：旧 BA v1（edges dict / pos[] / params ）→ 新 v2（links[] / x+y / data ）
-# ============================================================
-class BlueFormatUpgrader:
-    """纯函数式格式升级器：不读文件、只接受 dict、返回 dict，好写单测。"""
-
-    @staticmethod
-    def _fixup_click_to_mouse(nd: Dict[str, Any]) -> Dict[str, Any]:
-        """旧 Click 节点 → 等价 Mouse(click) 节点参数映射。保存时会自然写成新类型。"""
-        old_type = nd.get("type", "")
-        # 兼容两种可能：v1里是 Click（还没lower）；或 v2里已经是 click（lower过）
-        if old_type not in ("Click", "click", "Click".lower()):
-            return nd
-        data = nd.get("data", nd.get("params", {}) or {})
-        mode = str(data.get("mode", "position") or "position")
-        new_data: Dict[str, Any] = {
-            "coord_mode": "absolute",
-            "action": "click",
-            "pos": [int(data.get("x", 0) or 0), int(data.get("y", 0) or 0)],
-            "offset": [0, 0],
-            "from_pos": [0, 0],
-            "to_pos": [0, 0],
-            "drag_duration_ms": 300,
-            "button": "left",
-            "click_count": 2 if bool(data.get("double", False)) else 1,
-            "hold_ms_min": int(data.get("hold_ms_min", 30) or 30),
-            "hold_ms_max": int(data.get("hold_ms_max", 80) or 80),
-            "move_speed_ms": 0,
-            "scroll_dy": 0,
-            "scroll_dx": 0,
-            "scroll_steps": 1,
-            "post_delay_min_ms": int(data.get("post_delay_min_ms", 80) or 80),
-            "post_delay_max_ms": int(data.get("post_delay_max_ms", 200) or 200),
-        }
-        if mode == "key":
-            # 旧 Click 的按键模式：无法精确映射，退化为键盘节点PressKey更合适，这里保留为click但打日志
-            pass
-        nd["type"] = "mouse"
-        nd["data"] = new_data
-        if "params" in nd:
-            del nd["params"]
-        return nd
-
-    @staticmethod
-    def v1_to_v2(raw_v1: Dict[str, Any]) -> Dict[str, Any]:
-        """旧BA v1蓝图dict → 新Qflow格式v2 dict。
-
-        注意：不迁移 TargetSetup（用户决策：旧蓝图含TargetSetup需用户自行重建，不做自动改写），
-        只把顶层结构 / 节点序列化字段按新格式改，保留旧类型名不动。
-        """
-        from .node_library import NODE_LIBRARY, QFLOW2BA
-
-        nodes_v1 = raw_v1.get("nodes", {}) if isinstance(raw_v1.get("nodes"), dict) else {}
-        edges_v1 = raw_v1.get("edges", {}) if isinstance(raw_v1.get("edges"), dict) else {}
-
-        nodes_v2: Dict[str, Any] = {}
-        breakpoints_list = []
-        for nid, nd in nodes_v1.items():
-            if not isinstance(nd, dict):
-                continue
-            nd2 = dict(nd)
-            old_type = nd2.get("type", "")
-            # 先做 Click→Mouse 修复（在类型名小写转换前）
-            nd2 = BlueFormatUpgrader._fixup_click_to_mouse(nd2)
-            # 类型名：v1 里可能是BA驼峰（TargetSetup、Click、FindImage…），先按NODE_LIBRARY查qflow_name，查不到就原样保留不丢
-            meta = NODE_LIBRARY.get(str(old_type))
-            if meta is not None and getattr(meta, "qflow_name", ""):
-                nd2["type"] = meta.qflow_name
-            else:
-                nd2["type"] = str(old_type).lower() if isinstance(old_type, str) else old_type
-            # pos[] → x+y int
-            pos = nd2.pop("pos", None)
-            if isinstance(pos, (list, tuple)) and len(pos) >= 2:
-                nd2["x"] = int(pos[0])
-                nd2["y"] = int(pos[1])
-            else:
-                nd2.setdefault("x", 0)
-                nd2.setdefault("y", 0)
-            # params → data
-            if "params" in nd2 and "data" not in nd2:
-                nd2["data"] = _sanitize_params_for_save(dict(nd2.pop("params") or {}))
-            # breakpoint 顶层冗余记录
-            bp = bool(nd2.get("breakpoint", False))
-            if bp:
-                breakpoints_list.append(str(nid))
-            # 静态端口：默认不写（与Qflow一致，省空间且反序列化时会自动补）；如果是动态端口节点，保留outputs不删
-            has_dyn = bool(meta is not None and getattr(meta, "has_dynamic_ports", False))
-            if not has_dyn:
-                nd2.pop("inputs", None)
-                # outputs 只在动态端口保留；静态情况可以不写（反序列化会按NODE_LIBRARY补）
-                nd2.pop("outputs", None)
-            else:
-                # 动态端口：保留outputs（如果有）
-                pass
-            nodes_v2[str(nid)] = nd2
-
-        # edges dict → links 数组
-        links: list = []
-        for eid, ed in edges_v1.items():
-            if not isinstance(ed, dict):
-                continue
-            fn = str(ed.get("from_node", ""))
-            fp = str(ed.get("from_port", ""))
-            tn = str(ed.get("to_node", ""))
-            tp = str(ed.get("to_port", ""))
-            # exec / data 类型粗略推断：from_port 名字以 "out_" 开头但不是 "out_exec" 的可能是data（保守都写exec，运行时实际走啥由Port类型决定无关）
-            t = "exec"
-            if fp.startswith("out_") and fp not in ("out_exec",) and not fp.startswith("out_found"):
-                t = "data"
-            links.append({
-                "from_node": fn,
-                "from_port": fp,
-                "to_node": tn,
-                "to_port": tp,
-                "type": t,
-            })
-
-        old_name = raw_v1.get("name", "Untitled")
-        if isinstance(raw_v1.get("metadata"), dict):
-            old_name = (raw_v1["metadata"].get("name") or old_name)
-        from datetime import datetime
-        now = datetime.now().isoformat(timespec="seconds")
-        return {
-            "nodes": nodes_v2,
-            "links": links,
-            "breakpoints": breakpoints_list,
-            "metadata": {
-                "name": str(old_name),
-                "version": "2.0",
-                "dev_scale_x": 1.0,
-                "dev_scale_y": 1.0,
-                "created_at": str(raw_v1.get("created_at") or now),
-                "updated_at": now,
-                "_migrated_from_v1": True,
-            },
-        }
-
-    @staticmethod
-    def _save_v2(raw_v2: Dict[str, Any], file_path: str) -> bool:
-        try:
-            directory = os.path.dirname(file_path) or "."
-            os.makedirs(directory, exist_ok=True)
-            with open(file_path, "w", encoding="utf-8") as f:
-                json.dump(raw_v2, f, sort_keys=True, indent=2, ensure_ascii=False)
-            return True
-        except Exception:
-            return False
-
-
-# ============================================================
-# BlueprintStore：save/load + 自动备份 + 升级 + 图像预处理
+# BlueprintStore：save/load + 自动备份 + 图像预处理
 # ============================================================
 class BlueprintStore:
     """蓝图 JSON 存储：save/load + 自动备份 + sort_keys + ensure_ascii=False。"""
@@ -396,13 +247,12 @@ class BlueprintStore:
                 raw = json.load(f)
 
             # ---------------- 格式前置校验 ----------------
-            # 蓝图 JSON 必须包含 nodes；可能是新格式（有links）或旧格式（有edges）；都合法
+            # 蓝图 JSON 必须包含 nodes 和 links
             if not isinstance(raw, dict):
                 return None
             has_nodes_dict = "nodes" in raw and isinstance(raw["nodes"], dict)
             has_links_list = "links" in raw and isinstance(raw["links"], list)
-            has_edges_dict = "edges" in raw and isinstance(raw["edges"], dict)
-            has_blueprint_signature = has_nodes_dict and (has_links_list or has_edges_dict)
+            has_blueprint_signature = has_nodes_dict and has_links_list
             if not has_blueprint_signature:
                 signature_hint = ""
                 if "project_name" in raw and "created_at" in raw:
@@ -411,37 +261,9 @@ class BlueprintStore:
                     signature_hint = "（看起来是用户配置 config.json，不是蓝图）"
                 print(
                     f"[WARN] BlueprintStore.load: 跳过非蓝图文件 {file_path} "
-                    f"缺少 nodes/links|edges 蓝图结构 {signature_hint}"
+                    f"缺少 nodes/links 蓝图结构 {signature_hint}"
                 )
                 return None
-
-            # ---------------- 旧 v1 格式自动升级 ----------------
-            is_old_format = has_edges_dict and not has_links_list
-            v1_bak_path = None
-            if is_old_format:
-                v1_bak_path = file_path + ".v1.bak"
-                try:
-                    if not os.path.exists(v1_bak_path):
-                        shutil.copy2(file_path, v1_bak_path)
-                    upgraded = BlueFormatUpgrader.v1_to_v2(raw)
-                    BlueFormatUpgrader._save_v2(upgraded, file_path)
-                    BlueprintStore._emit_log(
-                        f"[Migrate] 旧格式蓝图已自动升级为v2（Qflow对齐），备份：{os.path.basename(v1_bak_path)}"
-                    )
-                    raw = upgraded
-                except Exception as e:
-                    BlueprintStore._emit_log(f"[Migrate] 自动升级失败: {e} ，尝试以旧格式直接加载…", level="WARN")
-                    # 回滚：删掉可能损坏的新写入文件，从备份再读
-                    try:
-                        if os.path.exists(v1_bak_path):
-                            shutil.copy2(v1_bak_path, file_path)
-                    except Exception:
-                        pass
-                    try:
-                        with open(file_path, "r", encoding="utf-8") as f2:
-                            raw = json.load(f2)
-                    except Exception:
-                        pass
 
             # ---------------- 真正反序列化 ----------------
             g = BlueprintGraph.from_dict(raw)

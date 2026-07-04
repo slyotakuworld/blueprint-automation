@@ -202,7 +202,7 @@ class BlueprintMainWindow(QMainWindow):
         return False
 
     def _finalize_project_switch(self) -> None:
-        """工程切换成功后的统一收尾：清全局缓存、停旧蓝图、日志提示、刷新菜单。
+        """工程切换成功后的统一收尾：清全局缓存、停运行中蓝图、日志提示、刷新菜单。
 
         必须在「所有切工程路径（_open_project_startup / _on_open_recent_project /
         _on_open_project 等）成功调用 _load_or_new_graph_for_current_project
@@ -217,7 +217,7 @@ class BlueprintMainWindow(QMainWindow):
                 self._log.append_log(f"[Project] 清理工程缓存失败: {e}", "WARN")
             except Exception:
                 pass
-        # 2) 如果旧工程的蓝图还在跑 → 请求它停止（否则新工程截图/运行时，旧蓝图还在后台操作）
+        # 2) 如果当前打开工程的蓝图还在跑 → 请求它停止（否则新工程截图/运行时，原有蓝图还在后台操作）
         try:
             r = getattr(self, "_runner", None)
             if r is not None and r.isRunning():
@@ -258,6 +258,19 @@ class BlueprintMainWindow(QMainWindow):
           - 工程A -> 切到工程B 时，A工程的所有内存状态都被完全擦除
           - 不会出现 B 工程里能看到 A 工程的变量、模板图、节点参数等"串资源"
         """
+        def _warn(msg: str):
+            """写日志（如果 _log 还没初始化就 print），不要静默丢异常。"""
+            try:
+                if getattr(self, "_log", None) is not None and hasattr(self._log, "append_log"):
+                    self._log.append_log(f"[Project][WARN] {msg}", "WARN")
+                    return
+            except Exception:
+                pass
+            try:
+                print(f"[WARN][switch_project] {msg}", flush=True)
+            except Exception:
+                pass
+
         # 1) 执行器：上一工程可能残留的 BlueprintRunner / matcher 模板缓存 / 运行态变量
         try:
             old_runner = getattr(self, "_runner", None)
@@ -271,8 +284,8 @@ class BlueprintMainWindow(QMainWindow):
                 except Exception:
                     pass
                 self._runner = None
-        except Exception:
-            pass
+        except Exception as e:
+            _warn(f"清理旧 runner 失败（不影响后续）: {type(e).__name__}: {e}")
 
         # 2) 蓝图状态：清空当前 graph / 当前路径 / 保存 hash / 撤销栈，避免 A 蓝图的 hash / undo 串到 B 工程
         self._graph = None
@@ -280,28 +293,35 @@ class BlueprintMainWindow(QMainWindow):
         self._last_saved_graph_hash = None
         try:
             self._undo_stack.clear()
-        except Exception:
-            pass
+        except Exception as e:
+            _warn(f"清理 undo_stack 失败（不影响后续）: {type(e).__name__}: {e}")
         try:
             self._redo_stack.clear()
-        except Exception:
-            pass
+        except Exception as e:
+            _warn(f"清理 redo_stack 失败（不影响后续）: {type(e).__name__}: {e}")
         try:
             self._scene.clear_all()  # 画布图元/节点卡/边全部清空（scene.graph=None）
-        except Exception:
-            pass
+        except Exception as e:
+            # ⚠ 这个是最危险的：如果 clear_all 抛异常且被静默，用户会以为切到 B 工程了
+            #   但画布上还显示 A 工程的所有节点/连线，就会误以为"B加载了A的蓝图"（串资源）。
+            #   至少一定要写一条明显的 WARN 日志，让用户/开发者在 debug 时能一眼看到。
+            _warn(
+                "scene.clear_all() 抛异常！"
+                " 画布可能残留旧工程图元（会造成『串资源』视觉假象）："
+                f" {type(e).__name__}: {e}"
+            )
         try:
             self._scene.clearSelection()
-        except Exception:
-            pass
+        except Exception as e:
+            _warn(f"清理 scene selection 失败（不影响后续）: {type(e).__name__}: {e}")
 
         # 3) Inspector：绝对不能留着上一工程的节点参数！否则用户切工程后选中
         #    新节点之前，属性面板还显示 A 工程某节点参数（看起来就像串资源）
         try:
             if getattr(self, "_inspector", None) is not None:
                 self._inspector.set_node(None)
-        except Exception:
-            pass
+        except Exception as e:
+            _warn(f"清理 inspector 失败（不影响后续）: {type(e).__name__}: {e}")
 
         # 4) 日志面板：切工程时把"正在运行/A工程的日志"清空（可选，但能减少迷惑）
         try:
@@ -309,8 +329,8 @@ class BlueprintMainWindow(QMainWindow):
                 clear_fn = getattr(self._log, "clear", None)
                 if callable(clear_fn):
                     clear_fn()
-        except Exception:
-            pass
+        except Exception as e:
+            _warn(f"清理日志面板 失败（不影响后续）: {type(e).__name__}: {e}")
 
         # 5) 第三方老代码/模块级全局缓存清理：
         #    - template_matcher 目前是 BlueprintRunner 每次 new（ctx级），没单例；
@@ -347,7 +367,7 @@ class BlueprintMainWindow(QMainWindow):
                 try:
                     g = BlueprintStore.load(last_bp)
                     if g is not None:
-                        # 兼容历史遗留：JSON.name 是默认 Untitled 但文件名是中文/可读 → 回填
+                        # JSON.name 是默认 Untitled 但文件名是中文/可读 → 回填
                         _, stem, _ = BlueprintStore._split_bp_path(last_bp)
                         if stem and (not g.name or g.name == "Untitled") and stem != "Untitled":
                             g.name = stem
@@ -377,7 +397,7 @@ class BlueprintMainWindow(QMainWindow):
                 try:
                     g = BlueprintStore.load(default_bp)
                     if g is not None:
-                        # 同样：兼容历史遗留，把文件名回填到 JSON 默认的 Untitled
+                        # 同样：把文件名回填到 JSON 默认的 Untitled
                         _, stem, _ = BlueprintStore._split_bp_path(default_bp)
                         if stem and (not g.name or g.name == "Untitled") and stem != "Untitled":
                             g.name = stem
@@ -424,7 +444,23 @@ class BlueprintMainWindow(QMainWindow):
         self._open_project_startup(start_tab=1)
 
     def _open_project_startup(self, start_tab: int = 0):
-        """重新弹工程选择框，成功则切换工程并重载蓝图"""
+        """重新弹工程选择框，成功则：先 confirm_discard 保存旧工程修改 → 再切工程 → 最后加载蓝图。
+
+        ★ 严格时序（和「最近工程菜单项」保持一致），解决「串资源」的历史老问题：
+          ① dlg.exec() → ProjectStartupDialog 只验证/创建工程（用 auto_open=False），**绝不提前切 PM**，
+             只返回目标路径（result_project_root）。
+          ② _confirm_discard() → 问用户要不要保存当前修改（此时 PM 还在旧工程，保存/set_last_opened
+             都是写进旧工程的 meta，100% 正确）。
+          ③ pm.open_project() → 真正把 ProjectManager 的 project_root/_meta 从旧工程切到新工程
+             （这一步才真正卸载旧 provider + 注册新 provider + 发信号 + 写 recent）。
+          ④ _load_or_new_graph_for_current_project() → 现在才读新工程的 meta/last_bp，不会串。
+          ⑤ _finalize_project_switch() → 清全局缓存/停旧运行/刷新菜单/日志提示收尾。
+
+        为什么不能先切工程再 confirm_discard？
+          → _on_save() 里会 self._pm.set_last_opened_blueprint(self._current_path)，
+            如果 PM 已经切到新工程，就会把旧工程的蓝图路径写到新工程的 meta.last_opened_blueprint 里，
+            于是新工程一打开就会加载旧工程的图——这就是用户反馈的「game1 资源串到 game2」的根因。
+        """
         dlg = ProjectStartupDialog(self)
         try:
             tw = dlg.findChild(QTabWidget)
@@ -434,16 +470,20 @@ class BlueprintMainWindow(QMainWindow):
             pass
         if dlg.exec() != QDialog.Accepted:
             return
-        # 切工程前：先问用户要不要保存当前修改
-        if not self._confirm_discard():
-            return
         root = dlg.result_project_root
         if not root:
             return
-        # ProjectManager.open_project 已经在 ProjectStartupDialog 里执行过，
-        # 会自动卸载旧provider、注册新provider、发信号。
+        # —— 时序 1：先确认要不要保存旧工程修改（此时 PM 还在旧工程，保存不会写进新工程）
+        if not self._confirm_discard():
+            return
+        # —— 时序 2：真正切工程（ProjectStartupDialog 没有切，现在才切）
+        ok = self._pm.open_project(root)
+        if not ok:
+            QMessageBox.warning(self, "打开失败", f"不是合法的 Blueprint 工程目录：\n{root}")
+            return
+        # —— 时序 3：加载蓝图（此时 PM 已在新工程，last_bp 读取的是新工程自己的 meta）
         self._load_or_new_graph_for_current_project()
-        # 收尾：清全局缓存、停旧运行、刷新菜单+日志提示
+        # —— 时序 4：收尾
         self._finalize_project_switch()
 
     # ==================== UI 构建 ====================
@@ -454,8 +494,8 @@ class BlueprintMainWindow(QMainWindow):
         root_layout.setContentsMargins(0, 0, 0, 0)
         root_layout.setSpacing(0)
 
-        # ========== 4面板QDockWidget布局（Qflow风格 + Qt增强可停靠可浮动） ==========
-        # 中央只有【画布】NodeView（和Qflow FlowEditor对等）
+        # ========== 4面板QDockWidget布局（Qt增强可停靠可浮动） ==========
+        # 中央只有【画布】NodeView（中央画布）
         self._scene = NodeScene(self)
         # ========== 撤销栈信号监听 ==========
         self._scene.node_created.connect(self._on_scene_node_created)
@@ -515,7 +555,7 @@ class BlueprintMainWindow(QMainWindow):
         dock_right.show()
         self._dock_inspector = dock_right
 
-        # 底：📜执行日志（和Qflow LogPanel对等，最小80高初始160）
+        # 底：📜执行日志（最小80高初始160）
         self._log = LogPanel()
         dock_bottom = QDockWidget("📜 执行日志", self)
         dock_bottom.setObjectName("dockLog")
@@ -669,7 +709,7 @@ class BlueprintMainWindow(QMainWindow):
         self._act_save_global.setShortcut(QKeySequence("Ctrl+S"))
         self.addAction(self._act_save_global)
 
-        # --------------- 运行控制组（Qflow风格：暂停 → 运行/停止） ---------------
+        # --------------- 运行控制组（暂停 → 运行/停止） ---------------
         self._act_pause = mk_act("#9A6700", "⏸ 暂停", self._on_toggle_pause)
         self._act_pause.setEnabled(False)
         self._act_pause.setToolTip("运行中可点，临时冻结所有步骤；再点一次继续（不会丢状态）")
@@ -783,7 +823,7 @@ class BlueprintMainWindow(QMainWindow):
             for i, path in enumerate(lst):
                 name = None
                 try:
-                    meta_path = os.path.join(path, ".bp", "project_meta.json")
+                    meta_path = os.path.join(path, "project_meta.json")
                     if os.path.isfile(meta_path):
                         with open(meta_path, "r", encoding="utf-8") as f:
                             md = json.load(f)
@@ -973,8 +1013,6 @@ class BlueprintMainWindow(QMainWindow):
         self._scene.graph_changed.connect(self._update_title)
         self._inspector.param_changed.connect(self._on_param_changed)
         self._inspector.request_pick_template.connect(self._on_pick_template)
-        self._inspector.request_fill_from_main_target.connect(self._on_fill_target_from_main)
-        self._inspector.request_launch_exe_for_node.connect(self._on_launch_exe_for_node)
         self._inspector.request_snip_for_node.connect(self._on_snip_for_node)
         self._inspector.request_pick_coord.connect(self._on_pick_coord)
         self._palette.info_message.connect(lambda m, l: self._log.append_log(m, l))
@@ -992,7 +1030,7 @@ class BlueprintMainWindow(QMainWindow):
         except Exception:
             pass
         try:
-            self._inspector.set_node(None)  # 关键！避免属性面板显示旧蓝图节点参数
+            self._inspector.set_node(None)  # 关键！避免属性面板显示之前蓝图的节点参数
         except Exception:
             pass
         # 2) 绑定到 scene（会清空旧节点/边，重新渲染）
@@ -1136,7 +1174,7 @@ class BlueprintMainWindow(QMainWindow):
         if g is None:
             QMessageBox.warning(self, "打开失败", "无法读取蓝图文件，格式可能已损坏。")
             return
-        # 兼容历史遗留：如果 JSON.name 还是默认 Untitled，但文件名是中文/非 Untitled 的可读名称
+        # 如果 JSON.name 还是默认 Untitled，但文件名是中文/非 Untitled 的可读名称
         # → 用文件名 stem 覆盖 graph.name，让标题栏显示中文而不是 "Untitled"
         _, stem, _ = BlueprintStore._split_bp_path(path)
         if stem and (not g.name or g.name == "Untitled") and stem != "Untitled":
@@ -1548,6 +1586,10 @@ class BlueprintMainWindow(QMainWindow):
         """
         if not self._graph or node_id not in self._graph.nodes:
             return
+        # findimg_target / if_img_add / if_img_replace 都需要 templates 目录保存文件，
+        # 工程未打开时禁止操作（避免 fallback 到全局 APP_DIR 污染 src/）
+        if not self._ensure_project_open("裁剪模板保存到工程templates/"):
+            return
         try:
             from src.blueprint.ui.snip_overlay import SnipOverlay
         except Exception as e:
@@ -1609,8 +1651,8 @@ class BlueprintMainWindow(QMainWindow):
                     try:
                         import uuid
                         # templates 目录：工程根/templates （不存在则创建）
-                        proj_root = os.path.abspath(os.path.join(os.path.dirname(__file__)))
-                        tpl_dir = os.path.join(proj_root, "templates")
+                        from src.config.app_paths import template_dir
+                        tpl_dir = template_dir()
                         os.makedirs(tpl_dir, exist_ok=True)
                         fname = f"findimg_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}.png"
                         fpath = os.path.join(tpl_dir, fname)
@@ -1777,7 +1819,7 @@ class BlueprintMainWindow(QMainWindow):
 
     # ---------- FindImage 偏移视觉拾取（以模板中心为基准） ----------
     def _start_findimg_offset_pick(self, node_id: str):
-        """找图节点 offset 偏移视觉拾取（对齐 Qflow open_visual_offset_picker）：
+        """找图节点 offset 偏移视觉拾取：
         隐藏主窗口 → 截全屏 → 用模板做一次匹配 → 显示截图+模板标记 →
         用户点目标位置 → 计算 offset = 目标点 - 模板中心 → 写入 offset 参数
         """
@@ -1894,7 +1936,7 @@ class BlueprintMainWindow(QMainWindow):
         )
 
     def _on_findimg_offset_picked(self, node_id: str, result):
-        """VisualOffsetOverlay 拾取完成回调：result = (offset_x, offset_y) 或 None"""
+        """VisualOffsetOverlay 拾取完成回调：result = (dx, dy) 相对模板中心像素偏移，或 None"""
         try:
             self.show()
             self.raise_()
@@ -1912,67 +1954,6 @@ class BlueprintMainWindow(QMainWindow):
         )
         if self._graph and node_id in self._graph.nodes:
             self._inspector.set_node(self._graph.nodes[node_id])
-
-    # ---------- TargetSetup 快捷填充（Inspector面板动作条） ----------
-    def _on_fill_target_from_main(self, node_id: str):
-        if not self._graph or node_id not in self._graph.nodes:
-            return
-        hwnd = self.get_active_hwnd()
-        if not hwnd:
-            QMessageBox.information(self, "没选目标窗口", "请先在工具栏右侧「🎯 目标程序」下拉里选一个窗口。")
-            return
-        try:
-            import win32gui
-            title = win32gui.GetWindowText(hwnd) or ""
-            try:
-                _tid, pid = win32gui.GetWindowThreadProcessId(hwnd)
-            except Exception:
-                pid = 0
-            rect = win32gui.GetWindowRect(hwnd)
-            width = rect[2] - rect[0]
-            height = rect[3] - rect[1]
-            params = {
-                "window_title": title.strip()[:80] if title.strip() else "",
-                "resolution_w": int(width),
-                "resolution_h": int(height),
-            }
-            if pid:
-                try:
-                    import psutil
-                    p = psutil.Process(pid)
-                    exe_path = p.exe()
-                    if exe_path and os.path.isfile(exe_path):
-                        params["exe_path"] = exe_path
-                except Exception:
-                    pass
-            self._inspector.apply_params_merge(params)
-            self._log.append_log(f"[TargetSetup] 从主界面目标填充 window_title=\"{params.get('window_title')}\"  res={params.get('resolution_w')}x{params.get('resolution_h')}  exe={params.get('exe_path') or '(未填)'}", "SUCCESS")
-            # 刷新 Inspector 表单显示
-            node = self._graph.nodes.get(node_id)
-            if node:
-                self._inspector.set_node(node)
-        except Exception as e:
-            self._log.append_log(f"[TargetSetup] 填充失败: {e}", "ERROR")
-            traceback.print_exc()
-
-    def _on_launch_exe_for_node(self, node_id: str):
-        if not self._graph or node_id not in self._graph.nodes:
-            return
-        fp, _ = QFileDialog.getOpenFileName(self, "选择要启动的EXE（自动化目标程序）", "", "应用程序 (*.exe);;所有文件 (*)")
-        if not fp or not os.path.isfile(fp):
-            return
-        self._inspector.apply_params_merge({"exe_path": fp, "wait_sec_after_launch": 1.5})
-        # 立即启动一次，方便用户看到效果，并加入目标下拉
-        ok, pid, msg = start_exe(fp, wait_sec_after_launch=1.5, log_fn=lambda m, l="INFO": self._log.append_log(f"[TargetSetup] {m}", l))
-        if not ok:
-            QMessageBox.warning(self, "启动失败", msg)
-            return
-        self._log.append_log(f"[TargetSetup] 已写入exe_path={fp}", "SUCCESS")
-        QTimer.singleShot(900, self._reload_target_windows)
-        # 刷新 Inspector 表单显示
-        node = self._graph.nodes.get(node_id)
-        if node:
-            self._inspector.set_node(node)
 
     # ==================== 运行/停止 ====================
     def _on_run_clicked(self):
@@ -2562,7 +2543,16 @@ class BlueprintMainWindow(QMainWindow):
         self._scene.graph_changed.emit()
 
     # ---------- Hooks implementation ----------
-    def _hook_create_find_image_node(self, template_path, region_tuple4_or_None):
+    def _hook_create_find_image_node(self, template_path, region_tuple4_or_None, template_b64_or_None=None):
+        """切分工具/截图工具回调：在画布中央新增一个 FindImage 节点，并预填参数。
+
+        参数：
+          template_path        - 已保存到磁盘的模板 PNG 绝对路径（必填）。
+          region_tuple4_or_None - (x, y, w, h) 源图上的相对矩形，用于 FindImage 的 region（可选）。
+          template_b64_or_None - 模板的 base64 PNG 缩略图（可选，<=220px），用于 inspector 直接显示预览。
+
+        返回：成功=返回 node.id（非空字符串）；失败=返回 None。
+        """
         try:
             from PySide6.QtCore import QPointF
             scene_center = self._view.mapToScene(
@@ -2575,6 +2565,8 @@ class BlueprintMainWindow(QMainWindow):
                 return None
             node.params["template"] = template_path
             node.params["threshold"] = float(node.params.get("threshold", 0.75) or 0.75)
+            if isinstance(template_b64_or_None, str) and template_b64_or_None:
+                node.params["template_b64"] = template_b64_or_None
             if region_tuple4_or_None is not None and len(region_tuple4_or_None) == 4:
                 rx, ry, rw, rh = region_tuple4_or_None
                 node.params["region"] = (int(rx), int(ry), int(rw), int(rh))
@@ -2650,7 +2642,7 @@ class BlueprintMainWindow(QMainWindow):
          以下标准快捷键在 BlueprintMainWindow._build_toolbar() 中直接绑到 QAction.setShortcut：
            Ctrl+N 新建 / Ctrl+O 打开 / Ctrl+S 保存 / Ctrl+Shift+S 另存为 / Ctrl+0 适应 / Ctrl+1 100%
            Ctrl+Z 撤销 / Ctrl+C 复制 / Ctrl+V 粘贴
-         此函数返回 {} 作为兼容占位（_apply_shortcuts_from_settings 遍历 SHORTCUT_REGISTRY，
+         此函数返回 {} 作为占位（_apply_shortcuts_from_settings 遍历 SHORTCUT_REGISTRY，
          现在 SHORTCUT_REGISTRY 里没有 scope=local 条目，所以实际不会被调用）。】
         """
         return {}
@@ -2787,7 +2779,7 @@ class BlueprintMainWindow(QMainWindow):
         热键绑定到了 F5，录制时按 F5 就把蓝图停了）。设置窗口关闭后（无论点确定还是取消）
         再恢复监听。
         """
-        # 用当前内存里的 user_settings 初始化（SettingsDialog会自己read_user_settings，但保持capture_target兼容行为）
+        # 用当前内存里的 user_settings 初始化（SettingsDialog会自己read_user_settings，但保持capture_target行为）
         dlg = SettingsDialog(parent=self)
         # 临时屏蔽所有 pynput 全局热键（listener 停止，但 _hotkeys map 完整保留，resume 时直接用）
         try:
@@ -3193,8 +3185,15 @@ def main() -> int:
     if startup.exec() != QDialog.Accepted:
         # 用户点「退出程序」或者右上角× → 直接退出，不让进
         return 0
-    if not startup.result_project_root or not pm.is_open():
-        # 理论不会走到这（accept返回时pm已经open了）
+    # ⚠ 【启动时也要自己切工程】
+    # ProjectStartupDialog 已经改成：回调里绝不提前 open_project，以解决「切工程前必须先 confirm_discard」
+    # 的严格时序要求；所以启动时自己在这里调 open_project 让 PM 状态正确。
+    root = startup.result_project_root
+    if not root or not pm.open_project(root):
+        print(f"[BOOT] 启动失败：无法打开工程 {root!r}，已退出。")
+        return 1
+    if not pm.is_open():
+        # 兜底：理论 open_project 成功后 is_open 必为 True
         return 1
 
     win = BlueprintMainWindow()

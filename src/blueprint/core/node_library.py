@@ -24,7 +24,7 @@ CLICK_MODE_OPTIONS = ["position", "region", "key"]
 
 
 # ============================================================
-# 节点分类（对齐《借鉴Qflow-main蓝图节点.txt》四大类 + 废弃分类）
+# 节点分类（四大类节点分类）
 # ============================================================
 CATEGORY_APP       = "应用控制"     # 第一类：打开程序/绑定窗口/系统命令/网页
 CATEGORY_LOGIC     = "逻辑组件"     # 第二类：开始/结束/循环/序列/变量/条件判断/剪贴板/提示
@@ -108,9 +108,8 @@ class NodeMeta:
     inputs: List[Port] = field(default_factory=list)
     outputs: List[Port] = field(default_factory=list)
     params: List[ParamDef] = field(default_factory=list)
-    qflow_name: str = ""
+    type_short_name: str = ""
     has_dynamic_ports: bool = False
-    deprecated: bool = False
     hidden_in_palette: bool = False
 
     def default_params(self) -> Dict[str, Any]:
@@ -118,13 +117,13 @@ class NodeMeta:
 
 
 # ============================================================
-# 类型名反向映射：Qflow小写短名 -> BA驼峰名（序列化 from_dict 时用）
-# 动态构建：NODE_LIBRARY 初始化完后，通过每个 NodeMeta.qflow_name 自动生成 QFLOW2BA
+# 类型名反向映射：小写短名 -> 驼峰名（序列化 from_dict 时用）
+# 动态构建：NODE_LIBRARY 初始化完后，通过每个 NodeMeta.type_short_name 自动生成 SHORT_NAME_MAP 映射表
 # ============================================================
-def _build_qflow2ba_map() -> Dict[str, str]:
+def _build_short_name_map() -> Dict[str, str]:
     mapping: Dict[str, str] = {}
     for ba_name, meta in NODE_LIBRARY.items():
-        qn = getattr(meta, "qflow_name", "") or ""
+        qn = getattr(meta, "type_short_name", "") or ""
         if qn:
             mapping[qn] = ba_name
     return mapping
@@ -166,7 +165,7 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         color="#238636",
         accent="#3FB950",
         outputs=[_exec_out()],
-        qflow_name="start",
+        type_short_name="start",
     ),
     "End": NodeMeta(
         type="End",
@@ -178,7 +177,7 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         inputs=[_exec_in("in_exec", label="▶")],
         outputs=[],
         params=[],
-        qflow_name="end",
+        type_short_name="end",
     ),
     "Loop": NodeMeta(
         type="Loop",
@@ -202,7 +201,7 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
                      min=0.0, max=60.0, step=0.05,
                      help="每轮循环体执行完后的等待时间（秒）"),
         ],
-        qflow_name="loop",
+        type_short_name="loop",
     ),
     "Wait": NodeMeta(
         type="Wait",
@@ -235,7 +234,7 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
                      min=0.0, max=3600.0, step=0.1,
                      help="【随机延时】随机范围上限。"),
         ],
-        qflow_name="wait",
+        type_short_name="wait",
     ),
     "VarSwitch": NodeMeta(
         type="VarSwitch",
@@ -261,14 +260,14 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
                 help='每行写一个条件：变量名 运算符 值（全部 AND 逻辑，同时满足才走 yes）\n运算符：== 等于、!= 不等于、> 大于、< 小于、>= 大于等于、<= 小于等于\n值：字符串需加引号 "abc" 或 \'abc\'；数字直接写；布尔写 true/false；支持 {变量} 插值\n空行 和 // 或 # 开头的行 作为注释忽略'
             ),
         ],
-        qflow_name="var_switch",
+        type_short_name="var_switch",
         has_dynamic_ports=False,
     ),
     "Sequence": NodeMeta(
         type="Sequence",
         category=CATEGORY_LOGIC,
         title="顺序执行",
-        description="按顺序一条条试路径~短路模式只要有一条跑成功就收工走完成；完全模式得条条都成功才过；要是全失败了就走「失败」出口，每两条之间还能歇一会儿哟。",
+        description="按顺序一条条试路径~短路和一真即真只要一条跑成功就收工走完成；完全模式得条条都成功才过；全败了就走失败口，每两条之间还能歇一会儿哟。",
         color="#57606A",
         accent="#58A6FF",
         inputs=[_exec_in()],
@@ -281,10 +280,10 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         ],
         params=[
             ParamDef(name="mode", editor=EDITOR_ENUM, default="short_circuit",
-                     options=["short_circuit", "complete"],
-                     option_labels={"short_circuit": "短路模式", "complete": "完全求值"},
+                     options=["short_circuit", "complete", "or_true"],
+                     option_labels={"short_circuit": "短路模式", "complete": "完全求值", "or_true": "一真即真"},
                      label="模式",
-                     help="短路模式(short_circuit)：任一分支走到成功语义出口(yes/success/out/found)即立即走 out_done 完成；失败语义出口(no/fail/timeout/not_found)则自动尝试下一条；全部失败走 else。\n完全模式(complete)：所有分支都必须走到成功语义出口才算通过，走 out_done；任一分支失败则走 else。"),
+                     help="短路模式(short_circuit)：任一分支走到成功语义出口(yes/success/out/found)即立即走 out_done 完成；失败语义出口(no/fail/timeout/not_found)则自动尝试下一条；全部失败走 else。\n完全模式(complete)：所有分支都必须走到成功语义出口才算通过，走 out_done；任一分支失败则走 else。\n一真即真(or_true)（逻辑或）：按顺序尝试各条分支，只要有任意一条分支返回成功语义就立即结束并走 out_done；全部失败才走 else。"),
             ParamDef(name="num_paths", editor=EDITOR_INT, default=3, label="路径数",
                      min=1, max=50, step=1, required=True,
                      help="分支路径数量（1~50）。建议用属性面板的 +/- 按钮调整，避免误操作"),
@@ -292,10 +291,10 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
                      min=0.0, max=3600.0, step=0.05,
                      help="每条路径尝试之间的等待时间（秒）"),
         ],
-        qflow_name="seq",
+        type_short_name="seq",
         has_dynamic_ports=True,
     ),
-    # ---------------- 场景/窗口绑定（Qflow对齐：拆分后OpenApp + BindWindow） ----------------
+    # ---------------- 场景/窗口绑定（拆分后OpenApp + BindWindow） ----------------
     "OpenApp": NodeMeta(
         type="OpenApp",
         category=CATEGORY_APP,
@@ -313,7 +312,7 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
             ParamDef(name="args", editor=EDITOR_STRING, default="", label="启动参数"),
             ParamDef(name="wait_sec_after_launch", editor=EDITOR_FLOAT, default=2.0, label="等待时间(s)", min=0.0, max=120.0, step=0.1),
         ],
-        qflow_name="open_app",
+        type_short_name="open_app",
     ),
     "BindWindow": NodeMeta(
         type="BindWindow",
@@ -332,7 +331,7 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
             ParamDef(name="exe_name", editor=EDITOR_STRING, default="", label="程序名"),
             ParamDef(name="class_name", editor=EDITOR_STRING, default="", label="窗口类名"),
         ],
-        qflow_name="bind_win",
+        type_short_name="bind_win",
     ),
     # ---------------- 动作 / 识别 ----------------
     "FindImage": NodeMeta(
@@ -404,12 +403,8 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
             ParamDef(name="offset", editor=EDITOR_TUPLE2, default=(0, 0), label="点击偏移",
                      pick_coord=True,
                      help="找到目标后，相对目标中心的像素偏移 (X, Y)。X 正值向右，负值向左；Y 正值向下，负值向上。点右侧 📍 按钮可在屏幕上拾取坐标（取绝对坐标；如需相对模板中心可手动微调）。"),
-            ParamDef(name="offset_x", editor=EDITOR_INT, default=0, label="点击偏移X(旧)", min=-9999, max=9999, step=1,
-                     help="（保留用于旧蓝图兼容，请用上方「点击偏移」tuple2 参数）"),
-            ParamDef(name="offset_y", editor=EDITOR_INT, default=0, label="点击偏移Y(旧)", min=-9999, max=9999, step=1,
-                     help="（保留用于旧蓝图兼容，请用上方「点击偏移」tuple2 参数）"),
         ],
-        qflow_name="image",
+        type_short_name="image",
     ),
 
     "PressKey": NodeMeta(
@@ -447,7 +442,7 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
             ParamDef(name="interval_ms", editor=EDITOR_INT, default=100, label="间隔(ms)", min=1, max=60000, step=1,
                      help="【按键组合模式】重复按键之间的间隔。"),
         ],
-        qflow_name="keyboard",
+        type_short_name="keyboard",
     ),
     "Mouse": NodeMeta(
         type="Mouse",
@@ -524,7 +519,7 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
             ParamDef(name="scroll_steps", editor=EDITOR_INT, default=1, min=1, max=100,
                      label="重复次数"),
         ],
-        qflow_name="mouse",
+        type_short_name="mouse",
     ),
     # ---------------- 变量 ----------------
     "SetVariable": NodeMeta(
@@ -542,7 +537,7 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
             ParamDef(name="batch_text", editor=EDITOR_MULTILINE, default="", label="批量设置",
                      help="每行 name=value。value 支持 {var}/${var}/{= expr} 插值。\n示例：\nuser = Alice\nport = 8080\nresult = {= {port} * 2}"),
         ],
-        qflow_name="set_var",
+        type_short_name="set_var",
     ),
     # ---------------- 通知 ----------------
     "Notify": NodeMeta(
@@ -575,7 +570,7 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
             ParamDef(name="play_sound", editor=EDITOR_BOOL, default=False, label="提示音",
                      help="勾选后播放系统提示音"),
         ],
-        qflow_name="notify",
+        type_short_name="notify",
     ),
     # ---------------- 系统交互 ----------------
     "Clipboard": NodeMeta(
@@ -604,7 +599,7 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
                      label="输出变量名",
                      help='仅 mode=read 生效：读到的文本同时存到 ctx.variables，后续节点 {clip_text} 直接用'),
         ],
-        qflow_name="clipboard",
+        type_short_name="clipboard",
     ),
     "Command": NodeMeta(
         type="Command",
@@ -640,7 +635,7 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
                      label="非零退出走err",
                      help='不勾（默认）：不论exit_code是几都走out_done，用户自己用if判断exit_code；勾了：exit_code!=0就走err分支'),
         ],
-        qflow_name="cmd",
+        type_short_name="cmd",
     ),
     "WebBrowser": NodeMeta(
         type="WebBrowser",
@@ -668,7 +663,7 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
                      label="浏览器"
                      ),
         ],
-        qflow_name="web_browser",
+        type_short_name="web_browser",
     ),
     "HttpRequest": NodeMeta(
         type="HttpRequest",
@@ -709,14 +704,14 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
                      label="JSON拆成变量",
                      help='勾了后响应JSON若是字典，每个 key 自动塞到 ctx.variables["web_"+key]'),
         ],
-        qflow_name="http_request",
+        type_short_name="http_request",
     ),
     # ---------------- 检测节点 ----------------
     "IfImageDetect": NodeMeta(
         type="IfImageDetect",
         category=CATEGORY_VISION,
         title="检测",
-        description="当下就检查好几张图是不是全都在屏幕上~全部都出现才算是，缺任何一张就走否，只判断一次不会等太久；还能选全求值打印每张分数方便调试。",
+        description="当下就检查好几张图是不是都在屏幕上~完全求值全中才走是，短路缺一张就立马否决，一真即真（逻辑或）只要撞见任意一张中就喊是；只瞅当下这一眼，不会等太久哟。",
         color="#ef6c00",
         accent="#ff9800",
         inputs=[_exec_in()],
@@ -755,14 +750,16 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
                 name="eval_mode",
                 editor=EDITOR_ENUM,
                 default="complete",
-                options=["complete", "short_circuit"],
+                options=["complete", "short_circuit", "or_true"],
                 option_labels={
                     "complete": "完全求值",
                     "short_circuit": "短路模式",
+                    "or_true": "一真即真",
                 },
                 label="求值模式",
-                help="完全求值=不管中间是否失败，都会检测所有参考图并在日志输出每张分数，便于调试；\n"
-                     "短路模式=从左到右依次检测，只要有一张不匹配就立刻返回no，省时间。",
+                help="完全求值=不管中间是否失败，都会检测所有参考图并在日志输出每张分数，便于调试；全部匹配才走yes。\n"
+                     "短路模式=从左到右依次检测（AND语义），只要有一张不匹配就立刻返回no，省时间。\n"
+                     "一真即真(or_true)（逻辑或）= 只要有任意一张图匹配成功就立刻返回yes；全部都不匹配才走no。",
             ),
             ParamDef(
                 name="images_json",
@@ -772,7 +769,7 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
                 help='[{"b64":"...","w":100,"h":80},...] Inspector中提供可视化增删UI',
             ),
         ],
-        qflow_name="if_img",
+        type_short_name="if_img",
     ),
     "StillnessDetect": NodeMeta(
         type="StillnessDetect",
@@ -841,7 +838,7 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
                 help="两帧ROI像素差低于该值视为静止",
             ),
         ],
-        qflow_name="if_static",
+        type_short_name="if_static",
     ),
     "SoundDetect": NodeMeta(
         type="SoundDetect",
@@ -880,7 +877,7 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
                      label="调试可视化",
                      help="仅debug时勾；会在日志用ASCII字符画绘制采样波形+阈值线"),
         ],
-        qflow_name="if_sound",
+        type_short_name="if_sound",
     ),
 }
 
@@ -907,14 +904,14 @@ for cat in CATEGORIES_ORDER:
 
 
 # ============================================================
-# QFLOW2BA: Qflow小写短名 -> BA驼峰名（序列化 from_dict 自动识别）
+# SHORT_NAME_MAP: 小写短名 -> 驼峰名（序列化 from_dict 自动识别）
 # 在 NODE_LIBRARY 初始化后构建，避免循环
 # ============================================================
-QFLOW2BA: Dict[str, str] = {}
+SHORT_NAME_MAP: Dict[str, str] = {}
 for _ba_name, _meta in NODE_LIBRARY.items():
-    _qn = getattr(_meta, "qflow_name", "") or ""
+    _qn = getattr(_meta, "type_short_name", "") or ""
     if _qn:
-        QFLOW2BA.setdefault(_qn, _ba_name)
+        SHORT_NAME_MAP.setdefault(_qn, _ba_name)
 
 
 def parse_varswitch_conditions(raw: str) -> List[Dict[str, Any]]:

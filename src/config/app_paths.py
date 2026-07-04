@@ -57,14 +57,15 @@ DEFAULT_IMAGES_DIRNAME = "1080p"
 def cache_dir() -> str:
     """
     有工程时：<project>/cache/
-    未开工程：<APP_DIR>/cache/
+    未开工程：直接抛 RuntimeError（禁止写入全局 APP_DIR/cache/，避免串工程和污染 src/ 代码目录）
     """
     p = _project_sub("cache")
     if p:
         return p
-    p = os.path.join(APP_DIR, "cache")
-    os.makedirs(p, exist_ok=True)
-    return p
+    raise RuntimeError(
+        "[cache_dir] 尚未打开任何 BlueprintAutomation 工程，无法获取缓存目录。"
+        "请先新建或打开一个工程后再执行此操作。"
+    )
 
 
 def template_cache_file() -> str:
@@ -80,51 +81,50 @@ CURRENT_VERSION = "4.1"
 
 def template_dir() -> str:
     """
-    有工程时：<project>/templates/  （FindAnyImage/WaitAnyImage 的模板小图）
-    未开工程：<APP_DIR>/templates/
+    有工程时：<project>/templates/  （FindAnyImage 的模板小图）
+    未开工程：直接抛 RuntimeError（禁止写入全局 APP_DIR/templates/，避免串工程和污染 src/ 代码目录）
     """
     p = _project_sub("template")
     if p:
         return p
-    p = os.path.join(APP_DIR, "templates")
-    os.makedirs(p, exist_ok=True)
-    return p
+    raise RuntimeError(
+        "[template_dir] 尚未打开任何 BlueprintAutomation 工程，无法获取 templates/ 目录。"
+        "请先新建或打开一个工程后再保存模板图片。"
+    )
 
 
 def screenshot_dir() -> str:
     """
     有工程时：<project>/screenshots/  （热键截图/源截图所在）
-    未开工程：<APP_DIR>/screenshots/
+    未开工程：直接抛 RuntimeError（禁止写入全局 APP_DIR/screenshots/，避免串工程和污染 src/ 代码目录）
     """
     p = _project_sub("screenshot")
     if p:
         return p
-    p = os.path.join(APP_DIR, "screenshots")
-    os.makedirs(p, exist_ok=True)
-    return p
+    raise RuntimeError(
+        "[screenshot_dir] 尚未打开任何 BlueprintAutomation 工程，无法获取 screenshots/ 目录。"
+        "请先新建或打开一个工程后再执行截图操作。"
+    )
 
 
 def debug_dir() -> str:
     """
     有工程时：<project>/debug/
-    未开工程：<APP_DIR>/debug/
+    未开工程：直接抛 RuntimeError（禁止写入全局 APP_DIR/debug/，避免串工程和污染 src/ 代码目录）
     """
     p = _project_sub("debug")
     if p:
         return p
-    p = os.path.join(APP_DIR, "debug")
-    os.makedirs(p, exist_ok=True)
-    return p
+    raise RuntimeError(
+        "[debug_dir] 尚未打开任何 BlueprintAutomation 工程，无法获取 debug/ 目录。"
+        "请先新建或打开一个工程后再运行蓝图。"
+    )
 
 
 def get_images_dir(base_dir):
     profiled_dir = os.path.join(base_dir, "images", DEFAULT_IMAGES_DIRNAME)
     if os.path.isdir(profiled_dir):
         return profiled_dir
-
-    legacy_dir = os.path.join(base_dir, "images")
-    if os.path.isdir(legacy_dir):
-        return legacy_dir
 
     return None
 
@@ -207,16 +207,6 @@ def get_img_path(filename):
         if os.path.exists(int_path):
             cache[rel_name] = int_path
             return int_path
-
-        ext_legacy = os.path.join(APP_DIR, "images", candidate_name)
-        if os.path.exists(ext_legacy):
-            cache[rel_name] = ext_legacy
-            return ext_legacy
-
-        int_legacy = os.path.join(INTERNAL_DIR, "images", candidate_name)
-        if os.path.exists(int_legacy):
-            cache[rel_name] = int_legacy
-            return int_legacy
 
     cache[rel_name] = filename
     return filename

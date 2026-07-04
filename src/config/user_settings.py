@@ -20,9 +20,9 @@ from .app_paths import USER_CONFIG_FILE, get_app_dir
 # ============================================================
 
 # ---------- 默认热键（pynput 格式）----------
-# 兼容别名：CAPTURE 是之前已有的全局截图热键
+# CAPTURE 是之前已有的全局截图热键
 DEFAULT_HOTKEY_CAPTURE_PYNPUT: str = "<f8>"              # 全局：截目标窗口（F8=截图 是用户一直以来的肌肉记忆）
-DEFAULT_GLOBAL_CAPTURE_HOTKEY: str = DEFAULT_HOTKEY_CAPTURE_PYNPUT  # 向后兼容变量名
+DEFAULT_GLOBAL_CAPTURE_HOTKEY: str = DEFAULT_HOTKEY_CAPTURE_PYNPUT
 
 # 全部快捷键：有序注册 → 用于设置页面逐行显示 / 主窗口统一绑定
 # 结构: ( key_id, 中文说明, 默认pynput值, scope: "global"|"local" )
@@ -76,11 +76,14 @@ _DEFAULT_SETTINGS: Dict[str, Any] = {
 # ============================================================
 def read_user_settings() -> Dict[str, Any]:
     """读取用户 settings，缺失字段自动补默认值（不破坏用户文件里已有的其他键）。
-    兼容历史遗留格式：文件里只有一个字符串 "<f8>"（早期版本整文件存 capture_target 热键）。
+
+    ⚠️ 重要：返回的 settings 对象里**不包含 recent_projects 字段**。
+    recent_projects 由 ProjectManager 独立维护（直接读写 config.json），
+    不应该被缓存在任何内存 settings 对象里——否则旧快照会覆盖 PM 刚写入的最新值。
+    （内部会执行一次 recent_projects 的清理操作，但清理完不把这个字段带给调用方。）
     """
     data: Dict[str, Any] = {}
     path = USER_CONFIG_FILE
-    legacy_capture: Optional[str] = None
     try:
         if path and os.path.isfile(path):
             loaded_raw: Any = None
@@ -96,66 +99,14 @@ def read_user_settings() -> Dict[str, Any]:
 
             if isinstance(loaded_raw, dict):
                 data = loaded_raw
-            elif isinstance(loaded_raw, str) and loaded_raw.strip():
-                # 兼容 2026-07 之前遗留：整个文件只存 json.dump("<f8>") 这一个 capture_target 热键
-                legacy_capture = normalize_pynput_hotkey(loaded_raw.strip())
     except Exception:
         data = {}
 
-    # 回填历史遗留 capture_target
-    if legacy_capture:
-        data.setdefault("hotkeys", {})
-        data["hotkeys"].setdefault("capture_target", legacy_capture)
-
-    # ============================================================
-    # 【2026-07-03 历史遗留清理 + 用户自定义热键永久保留策略】
-    # ⚠ 这一步必须放在 _merge_defaults 之前执行！
-    # 核心原则：
-    #   ① 【永远执行】删除 7 个历史遗留非法热键ID（防止用户手动编辑/旧版本写入污染）
-    #   ② 【仅首次迁移时执行】强制 4 个全局热键 = 用户最终要求的默认值(F8/F5/F6/F7)
-    #      → 触发条件：当前 config 里还留有非法ID  或  缺少 4 个必备ID中的任何一个
-    #      → 一旦 config 干净了（4ID都存在且无非法ID），之后用户在 ⚙设置 里自己改的任何值永久保留
-    #        不会再被强制覆盖回默认（解决用户最担心的『在设置里改了白改』的问题！）
-    # ============================================================
-    _INVALID_LEGACY_IDS = {
-        "emergency_kill", "split_ui_elements",
-        "new_blueprint", "open_blueprint", "save_as_blueprint",
-        "zoom_fit", "zoom_reset",
-    }
-    _CORRECT_4 = dict(_DEFAULT_BY_KEY)   # capture=F8 / run=F5 / pause=F6 / stop=F7（就是 SHORTCUT_REGISTRY 4条）
-    changed_for_force_clean = False
-    if isinstance(data.get("hotkeys"), dict):
-        hk: Dict[str, Any] = data["hotkeys"]
-        # ① 先判断当前状态（在删非法ID之前判断，更准确）
-        had_invalid = any(b in hk for b in _INVALID_LEGACY_IDS)
-        missing_any = not all(k in hk for k in _CORRECT_4.keys())
-        # ② 永远清一次非法ID（哪怕用户又手动写回来了，下次启动直接干掉）
-        for bad in _INVALID_LEGACY_IDS:
-            if bad in hk:
-                del hk[bad]
-                changed_for_force_clean = True
-        # ③ 判断是否需要『强制值 = 默认值』（只要之前有非法ID 或 缺少任何一个必备ID，就说明还没迁移干净）
-        need_force_values = (had_invalid or missing_any)
-        if need_force_values:
-            for k, correct_val in _CORRECT_4.items():
-                if hk.get(k) != correct_val:
-                    hk[k] = correct_val
-                    changed_for_force_clean = True
-        data["hotkeys"] = hk
-    else:
-        # hotkeys 字段根本不存在或类型错误 → 肯定需要强制赋值（由下面的 _merge_defaults 补结构）
-        changed_for_force_clean = True
-
-    # 补默认键（不覆盖已有）——必须放在强制清理之后！
     _merge_defaults(data, _DEFAULT_SETTINGS)
 
-    # 如果这次真的做了清理/赋值（不是用户正常改设置的场景）→ 立刻写盘
-    if changed_for_force_clean:
-        try:
-            save_user_settings(data)
-        except Exception:
-            pass
-    # 另外顺带清理一下 recent_projects 里可能存在的 Temp/bp_* 垃圾路径（之前 Smoke 脚本写进去的）
+    # ---------------- 启动时顺便清理 recent_projects（清理完直接写磁盘，不把字段带进返回值） ----------------
+    changed_for_force_clean = False
+    cleaned_recent = None
     if isinstance(data.get("recent_projects"), list):
         import tempfile as _tmp
         _tmp_root = _tmp.gettempdir()
@@ -168,43 +119,90 @@ def read_user_settings() -> Dict[str, Any]:
                 tr = os.path.realpath(_tmp_root)
                 if os.path.commonpath([rp, tr]) == tr:
                     changed_for_force_clean = True
-                    continue  # 临时目录下的假工程，直接扔了
+                    continue
             except Exception:
                 pass
             if not os.path.isdir(x):
                 changed_for_force_clean = True
-                continue  # 目录已经不存在的，也清理掉
+                continue
             clean_lst.append(x)
         if clean_lst != data["recent_projects"]:
-            data["recent_projects"] = clean_lst
+            changed_for_force_clean = True
+        cleaned_recent = clean_lst
+        # 从内存 data 里剔除（不返回给调用方缓存）
+        data.pop("recent_projects", None)
+        # 有变化就写磁盘（这里传 include_recent=True，因为 cleaned_recent 就是刚读磁盘+清理的最新版本）
+        if changed_for_force_clean:
             try:
-                save_user_settings(data)
+                data_with_recent = dict(data)
+                data_with_recent["recent_projects"] = cleaned_recent
+                _save_user_settings_impl(data_with_recent, preserve_recent=False)
             except Exception:
                 pass
+    else:
+        # 没有 recent_projects 字段就确保 data 里也不带
+        data.pop("recent_projects", None)
     return data
 
 
 def save_user_settings(settings: Dict[str, Any]) -> bool:
-    """保存用户 settings 到 USER_CONFIG_FILE。失败返回 False。"""
+    """保存用户 settings 到 USER_CONFIG_FILE。失败返回 False。
+
+    ⚠️ 默认 preserve_recent=True：写入前会**从磁盘读回当前的 recent_projects**，
+    避免调用方用内存里的旧 settings 对象（不含/含旧 recent_projects）覆盖掉
+    ProjectManager 刚刚写入的最新最近工程列表。
+
+    如果你明确要覆盖 recent_projects（比如 read_user_settings 内部清理完后保存），
+    请调用内部函数 _save_user_settings_impl(..., preserve_recent=False)。
+    """
+    return _save_user_settings_impl(settings, preserve_recent=True)
+
+
+def _save_user_settings_impl(settings: Dict[str, Any], preserve_recent: bool) -> bool:
+    """save_user_settings 的内部实现。
+
+    参数 preserve_recent：
+      - True  (对外 save_user_settings 默认)：写入前先读磁盘上的 recent_projects，
+        把磁盘上的值合并进 settings，避免内存旧 settings 覆盖 ProjectManager 维护的最近工程。
+      - False (内部使用)：直接用 settings 里的 recent_projects 写磁盘，
+        只允许 read_user_settings 启动清理流程调用（此时 settings.recent_projects 是最新值）。
+    """
     try:
         path = USER_CONFIG_FILE
-        if path:
-            parent = os.path.dirname(path)
-            if parent:
-                os.makedirs(parent, exist_ok=True)
-            tmp = path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(settings, f, ensure_ascii=False, indent=2)
+        if not path:
+            return False
+        # ============================================================
+        # 【关键保护】recent_projects 字段是 ProjectManager 独立维护的，不要相信
+        # 内存 settings 对象里的值（它是启动时的旧快照）。
+        # 写入前先从磁盘读回当前 config.json 的 recent_projects 原样保留。
+        # ============================================================
+        final_settings = dict(settings) if isinstance(settings, dict) else {}
+        if preserve_recent:
             try:
-                os.replace(tmp, path)
-            except OSError:
-                # Windows 上 replace 偶尔因句柄/杀毒失败，直接 rename 兜底
-                try:
-                    if os.path.exists(path):
-                        os.remove(path)
-                except Exception:
-                    pass
-                os.rename(tmp, path)
+                if os.path.isfile(path):
+                    with open(path, "r", encoding="utf-8") as f:
+                        disk_raw = json.load(f)
+                    if isinstance(disk_raw, dict) and "recent_projects" in disk_raw:
+                        final_settings["recent_projects"] = disk_raw["recent_projects"]
+            except Exception:
+                # 读磁盘失败就不合并（至少不要把已有 recent_projects 弄丢）
+                pass
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(final_settings, f, ensure_ascii=False, indent=2, sort_keys=False)
+        try:
+            os.replace(tmp, path)
+        except OSError:
+            # Windows 上 replace 偶尔因句柄/杀毒失败，直接 rename 兜底
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except Exception:
+                pass
+            os.rename(tmp, path)
         return True
     except Exception as e:
         print(f"[user_settings] save failed: {e}")

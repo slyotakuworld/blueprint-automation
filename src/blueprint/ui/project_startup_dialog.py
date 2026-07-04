@@ -1,8 +1,8 @@
 import os
 from typing import Optional
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QFont
+from PySide6.QtCore import Qt, QPoint
+from PySide6.QtGui import QAction, QFont
 from PySide6.QtWidgets import (
     QDialog,
     QFileDialog,
@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QMenu,
     QMessageBox,
     QPushButton,
     QTabWidget,
@@ -144,7 +145,10 @@ class ProjectStartupDialog(QDialog):
         if not parent or not os.path.isdir(parent):
             QMessageBox.warning(self, "父目录无效", "父目录不存在，请先选择一个合法的父目录。")
             return
-        created = self._pm.create_project(parent, name)
+        # ⚠ 【关键：auto_open=False】只创建磁盘结构/meta/初始蓝图，不切 ProjectManager 状态。
+        # 真正的工程切换（close旧+open新）必须在主程序里先 confirm_discard 保存完旧工程修改之后再做，
+        # 否则 set_last_opened_blueprint 会把旧工程的蓝图路径写到新工程的 meta 里，造成「串资源」。
+        created = self._pm.create_project(parent, name, auto_open=False)
         if not created:
             QMessageBox.warning(self, "创建失败", "创建工程失败（可能是权限问题）。请换个父目录或换个工程名试试。")
             return
@@ -220,11 +224,10 @@ class ProjectStartupDialog(QDialog):
                 "请先确认目录是否正确，或者点【新建工程】创建一个。"
             )
             return
-        ok = self._pm.open_project(p)
-        if not ok:
-            QMessageBox.warning(self, "打开失败", "打开工程失败（读取 project_meta.json 失败）。")
-            return
-        self.result_project_root = self._pm.project_root
+        # ⚠ 【不在这里 open_project】只验证合法性+返回目标路径。
+        # 真正的工程切换（close旧+open新）必须在主程序里先 confirm_discard 保存完旧工程修改之后再做，
+        # 否则 set_last_opened_blueprint 会把旧工程的蓝图路径写到新工程的 meta 里，造成「串资源」。
+        self.result_project_root = os.path.abspath(p)
         self.accept()
 
     # ============================================================
@@ -243,6 +246,8 @@ class ProjectStartupDialog(QDialog):
             " QListWidget::item:hover { background:#2D333B; }"
             " QListWidget::item:selected { background:#0969DA; color:white; }"
         )
+        self._recent_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._recent_list.customContextMenuRequested.connect(self._on_recent_context_menu)
         v.addWidget(self._recent_list, 1)
 
         empty_hint = QLabel("（暂无最近工程，先点【🆕 新建工程】创建第一个）")
@@ -253,8 +258,23 @@ class ProjectStartupDialog(QDialog):
 
         btn_bar = QHBoxLayout()
         btn_bar.addStretch(1)
+
+        btn_del_sel = QPushButton("🗑 删除选中的工程")
+        btn_del_sel.setMinimumHeight(36)
+        btn_del_sel.setStyleSheet(
+            "QPushButton { background:#DA3633; color:white; border-radius:6px; font-weight:600; }"
+            " QPushButton:hover { background:#F85149; }"
+        )
+        btn_del_sel.setToolTip("将工程目录整个移动到回收站（可恢复），并从最近工程列表里移除")
+        btn_del_sel.clicked.connect(lambda _=False: self._on_delete_selected_project(double_click=False))
+        btn_bar.addWidget(btn_del_sel)
+
         btn_open_sel = QPushButton("🗂 打开选中的最近工程")
         btn_open_sel.setMinimumHeight(36)
+        btn_open_sel.setStyleSheet(
+            "QPushButton { background:#0969DA; color:white; border-radius:6px; font-weight:600; }"
+            " QPushButton:hover { background:#1F6FEB; }"
+        )
         btn_open_sel.clicked.connect(lambda _=False: self._on_open_recent(double_click=False))
         btn_bar.addWidget(btn_open_sel)
         v.addLayout(btn_bar)
@@ -262,7 +282,154 @@ class ProjectStartupDialog(QDialog):
         self._recent_list.itemDoubleClicked.connect(
             lambda _it: self._on_open_recent(double_click=True)
         )
+        self._recent_empty_hint = empty_hint
         return w
+
+    def _selected_recent_path(self, show_warning: bool = False) -> Optional[str]:
+        it = self._recent_list.currentItem()
+        if not it:
+            if show_warning:
+                QMessageBox.information(self, "请先选中", "请先在列表里选一个最近工程。")
+            return None
+        p = it.data(Qt.UserRole)
+        return p if isinstance(p, str) and p else None
+
+    def _on_recent_context_menu(self, pos: QPoint):
+        it = self._recent_list.itemAt(pos)
+        if not it:
+            return
+        self._recent_list.setCurrentItem(it)
+        p = it.data(Qt.UserRole)
+        if not isinstance(p, str) or not p:
+            return
+
+        menu = QMenu(self)
+        act_open = QAction("🗂 打开此工程", self)
+        act_open.triggered.connect(lambda _=False: self._on_open_recent(double_click=False))
+        menu.addAction(act_open)
+
+        menu.addSeparator()
+
+        act_delete = QAction("🗑 从磁盘删除此工程…", self)
+        act_delete.triggered.connect(lambda _=False: self._on_delete_selected_project(double_click=False))
+        menu.addAction(act_delete)
+
+        menu.exec(self._recent_list.viewport().mapToGlobal(pos))
+
+    def _on_remove_selected_from_list(self):
+        p = self._selected_recent_path(show_warning=True)
+        if not p:
+            return
+        name = os.path.basename(p.rstrip("\\/"))
+        ret = QMessageBox.question(
+            self, "仅从列表移除",
+            f"确认把『{name}』从最近工程列表里移除此记录？\n\n"
+            f"  · 磁盘上的工程目录不会被删除\n"
+            f"  · 下次手动打开此工程时会重新出现在列表里\n\n"
+            f"  路径：{p}",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+        )
+        if ret != QMessageBox.Yes:
+            return
+        ok = self._pm.remove_recent_project(p)
+        if not ok:
+            QMessageBox.warning(self, "移除失败", "写回用户配置失败，请稍后重试。")
+            return
+        self._fill_recent(self._recent_empty_hint)
+
+    def _on_delete_selected_project(self, double_click: bool = False):
+        p = self._selected_recent_path(show_warning=not double_click)
+        if not p:
+            return
+
+        if not os.path.isdir(p):
+            ret = QMessageBox.question(
+                self, "目录不存在",
+                f"该工程目录在磁盘上已不存在：\n  {p}\n\n是否仅从最近工程列表里移除对应记录？",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+            )
+            if ret == QMessageBox.Yes:
+                self._pm.remove_recent_project(p)
+                self._fill_recent(self._recent_empty_hint)
+            return
+
+        if not ProjectManager.is_valid_project_dir(p):
+            ret = QMessageBox.warning(
+                self, "工程已损坏",
+                f"{p}\n不再是合法工程（缺少 project_meta.json 或 project_name）。\n\n"
+                f"是否仍要删除整个目录？\n\n⚠ 这不会经过 send2trash，只能彻底删除（需手动确认永久删除二次弹框）。",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if ret != QMessageBox.Yes:
+                return
+            permanent_ret = QMessageBox.warning(
+                self, "⚠ 永久删除",
+                f"因无法识别为合法工程，只能直接彻底删除（不会进回收站）。\n\n确认删除整个目录？\n  {p}",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if permanent_ret != QMessageBox.Yes:
+                return
+            import shutil as _sh
+            try:
+                _sh.rmtree(p)
+            except Exception as e:
+                QMessageBox.critical(self, "删除失败", f"彻底删除失败：\n{e}")
+                return
+            self._pm.remove_recent_project(p)
+            self._fill_recent(self._recent_empty_hint)
+            return
+
+        # 正常流程：合法工程 → 走 ProjectManager 的安全删除
+        name = os.path.basename(p.rstrip("\\/"))
+        # 读工程 meta 名，更友好
+        meta_path = os.path.join(p, "project_meta.json")
+        try:
+            import json as _j
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta_d = _j.load(f) or {}
+            pn = str(meta_d.get("project_name") or "").strip()
+            if pn:
+                name = pn
+        except Exception:
+            pass
+
+        ret = QMessageBox.warning(
+            self, "⚠ 删除工程",
+            f"确定要删除这个工程吗？\n\n"
+            f"  · 工程名称：{name}\n"
+            f"  · 路径：{p}\n\n"
+            f"✅ 优先移动到【回收站】（删除后可从回收站恢复）。\n"
+            f"⚠ 回收站不可用时，会询问是否改为永久删除（不可恢复）。\n\n"
+            f"工程内的截图、模板、蓝图、运行日志会一起被删除。",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if ret != QMessageBox.Yes:
+            return
+
+        ok, reason = self._pm.delete_project(p, permanent=False)
+        if ok:
+            QMessageBox.information(self, "删除成功", reason)
+            self._fill_recent(self._recent_empty_hint)
+            return
+        # 回收站路径失败 → 询问是否升级为 permanent
+        if isinstance(reason, str) and reason.startswith("TRASH_UNAVAILABLE"):
+            cleaned = reason.replace("TRASH_UNAVAILABLE:", "").strip()
+            r2 = QMessageBox.warning(
+                self, "回收站不可用",
+                f"{cleaned}\n\n是否改为【永久删除】（不可恢复，不会进回收站）？\n\n  路径：{p}",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if r2 != QMessageBox.Yes:
+                return
+            ok2, reason2 = self._pm.delete_project(p, permanent=True)
+            if ok2:
+                QMessageBox.information(self, "已永久删除", reason2)
+                self._fill_recent(self._recent_empty_hint)
+                return
+            QMessageBox.critical(self, "删除失败", reason2)
+            return
+        # 其他拒绝/失败：直接弹原因（如"正在使用中"、"不是合法工程"）
+        QMessageBox.critical(self, "无法删除", reason)
 
     def _fill_recent(self, empty_hint: QLabel):
         self._recent_list.clear()
@@ -270,7 +437,7 @@ class ProjectStartupDialog(QDialog):
         if not recents:
             empty_hint.setText("（暂无最近工程，先点【🆕 新建工程】创建第一个）")
             return
-        empty_hint.setText(f"（共 {len(recents)} 个最近工程，双击可直接打开）")
+        empty_hint.setText(f"（共 {len(recents)} 个最近工程，双击可直接打开；右键菜单可删除/移除）")
         for p in recents:
             meta = os.path.join(p, "project_meta.json")
             name = os.path.basename(p.rstrip("\\/"))
@@ -302,9 +469,8 @@ class ProjectStartupDialog(QDialog):
         if not ProjectManager.is_valid_project_dir(p):
             QMessageBox.warning(self, "工程已损坏", f"{p} 不再是合法工程（缺少 project_meta.json）。")
             return
-        ok = self._pm.open_project(p)
-        if not ok:
-            QMessageBox.warning(self, "打开失败", "打开工程失败。")
-            return
-        self.result_project_root = self._pm.project_root
+        # ⚠ 【不在这里 open_project】只验证合法性+返回目标路径。
+        # 真正的工程切换（close旧+open新）必须在主程序里先 confirm_discard 保存完旧工程修改之后再做，
+        # 否则 set_last_opened_blueprint 会把旧工程的蓝图路径写到新工程的 meta 里，造成「串资源」。
+        self.result_project_root = os.path.abspath(p)
         self.accept()

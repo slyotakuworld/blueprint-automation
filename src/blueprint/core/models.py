@@ -71,27 +71,26 @@ class Node:
     runtime_attrs: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
-        """序列化：BA内部对象 → Qflow格式JSON。
+        """序列化：内部对象 → 标准格式 JSON。
 
-        变更点（对齐 Qflow）：
-          - type: BA 驼峰 → Qflow小写短名（通过 NodeMeta.qflow_name 查）
-          - pos[] → 拆为独立 int 字段 x/y
-          - params → 重命名为 data（与Qflow一致）
-          - 只有动态端口节点（VarSwitch/Sequence/FindAnyImage等has_dynamic_ports）才写 outputs，静态端口不写（节省空间+对齐Qflow）
-          - 写 breakpoint 字段 bool
-          - comment 保留
+        输出字段：
+          - type: 通过 NodeMeta.type_short_name 映射为标准短名
+          - x/y: 独立 int 坐标字段
+          - data: 参数字典
+          - outputs: 仅动态端口节点写出（节省空间）
+          - breakpoint: bool
+          - comment: 字符串
         """
         from .node_library import NODE_LIBRARY
 
         meta = NODE_LIBRARY.get(self.type)
-        # 1. 类型名 BA → Qflow
+        # 1. 类型名转换
         q_type: str
-        if meta is not None and getattr(meta, "qflow_name", ""):
-            q_type = meta.qflow_name
+        if meta is not None and getattr(meta, "type_short_name", ""):
+            q_type = meta.type_short_name
         else:
-            # 兜底：没注册的类型名转小写（兼容旧类型不丢）
-            q_type = str(self.type).lower()
-        # 2. data（原params，语义未变只是key改名字）
+            q_type = str(self.type)
+        # 2. data：参数字典
         data = dict(self.params)
         out: Dict[str, Any] = {
             "id": self.id,
@@ -111,38 +110,33 @@ class Node:
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "Node":
-        """反序列化：自动识别「Qflow新格式」与「BA旧格式」，都能读。
+        """反序列化：加载当前标准格式蓝图。
 
-        识别顺序（双格式兼容）：
-          1. 类型名反向：优先查 QFLOW2BA，再兜底原样
-          2. 位置：新 x/y int 或 旧 pos[]
-          3. 参数：新 data 或 旧 params（兼容key）
+        读取字段：
+          1. 类型名：查 SHORT_NAME_MAP 映射（短名 → 驼峰），不在映射中则原样
+          2. 位置：x/y 字段，缺失则 (0, 0)
+          3. 参数：data 字段，缺失则空字典
           4. 端口：JSON里有inputs/outputs则用，否则按NODE_LIBRARY默认补
-          5. 断点：顶层breakpoint字段或d.get('breakpoint')
+          5. 断点：breakpoint 字段
         """
-        from .node_library import NODE_LIBRARY, QFLOW2BA
+        from .node_library import NODE_LIBRARY, SHORT_NAME_MAP
 
         q_type = d.get("type", "")
-        # 1. 类型名反向：Qflow小写 → BA驼峰
+        # 1. 类型名反向：短名 → 驼峰
         ba_type: str = q_type
-        if isinstance(q_type, str) and q_type in QFLOW2BA:
-            ba_type = QFLOW2BA[q_type]
-        elif isinstance(q_type, str) and q_type in NODE_LIBRARY:
-            ba_type = q_type  # 已经是BA驼峰名（旧格式蓝图）
+        if isinstance(q_type, str) and q_type in SHORT_NAME_MAP:
+            ba_type = SHORT_NAME_MAP[q_type]
         meta = NODE_LIBRARY.get(ba_type)
 
-        # 2. 位置：x/y 或 pos[] 双格式识别
+        # 2. 位置：只认 x/y 字段
         if "x" in d and "y" in d:
             pos_t = (int(d["x"]), int(d["y"]))
         else:
-            pos = d.get("pos", [0, 0])
-            pos_t = (int(pos[0]), int(pos[1])) if isinstance(pos, (list, tuple)) and len(pos) >= 2 else (0, 0)
+            pos_t = (0, 0)
 
-        # 3. 参数：新 data / 旧 params 二者兼容
+        # 3. 参数：只认 data 字段
         if "data" in d:
             params = dict(d["data"]) if isinstance(d["data"], dict) else {}
-        elif "params" in d:
-            params = dict(d["params"]) if isinstance(d["params"], dict) else {}
         else:
             params = {}
 
@@ -232,7 +226,7 @@ class BlueprintGraph:
         self.updated_at = datetime.now().isoformat(timespec="seconds")
 
     def to_dict(self) -> Dict[str, Any]:
-        """序列化：→ Qflow完全等价顶层结构（nodes+links+breakpoints+metadata）。
+        """序列化：→ 顶层标准结构（nodes+links+breakpoints+metadata）。
         ⚠️ 纯【只读】调用，不修改 self 的任何字段（保证 hash 计算稳定）。
         """
         nodes_d: Dict[str, Any] = {}
@@ -270,13 +264,12 @@ class BlueprintGraph:
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "BlueprintGraph":
-        """反序列化：双格式自动识别（新Qflow links数组 / 旧BA edges对象）。"""
+        """反序列化：加载标准格式蓝图。"""
         nodes_d = d.get("nodes", {}) if isinstance(d.get("nodes"), dict) else {}
         breakpoints_from_top: set = set(d.get("breakpoints", [])) if isinstance(d.get("breakpoints"), list) else set()
 
-        # links vs edges：二选一
+        # 只认 links[] 数组
         if "links" in d and isinstance(d["links"], list):
-            # ✅ 新Qflow格式
             links = d["links"]
             edges_d: Dict[str, Any] = {}
             for i, link in enumerate(links):
@@ -296,9 +289,6 @@ class BlueprintGraph:
                     "to_node": key_tup[2],
                     "to_port": key_tup[3],
                 }
-        elif "edges" in d and isinstance(d["edges"], dict):
-            # ⬅️ 旧 BA 格式（升级器在 graph_store.load 里会转，但这里也能直接读兜底）
-            edges_d = d["edges"]
         else:
             edges_d = {}
 
