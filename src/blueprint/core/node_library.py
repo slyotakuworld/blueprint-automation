@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .models import Port, PortDirection, PortType, Node
 
@@ -27,7 +27,7 @@ CLICK_MODE_OPTIONS = ["position", "region", "key"]
 # 节点分类（对齐《借鉴Qflow-main蓝图节点.txt》四大类 + 废弃分类）
 # ============================================================
 CATEGORY_APP       = "应用控制"     # 第一类：打开程序/绑定窗口/系统命令/网页
-CATEGORY_LOGIC     = "逻辑组件"     # 第二类：开始/结束/循环/序列/变量/分流/剪贴板/提示
+CATEGORY_LOGIC     = "逻辑组件"     # 第二类：开始/结束/循环/序列/变量/条件判断/剪贴板/提示
 CATEGORY_EXECUTE   = "执行动作"     # 第三类：鼠标/键盘/延时
 CATEGORY_VISION    = "视觉、感知"   # 第四类：找图/检索/静止/声音
 
@@ -54,7 +54,7 @@ CATEGORY_NODE_ORDER: Dict[str, List[str]] = {
         "Loop",          # 3、循环
         "Sequence",      # 4、序列
         "SetVariable",   # 5、变量
-        "VarSwitch",     # 6、分流 → VarSwitch(多分支)：支持布尔 yes/no（等价于被废弃的Branch）+ 多值枚举 N选一
+        "VarSwitch",     # 6、条件判断 → AND 多条件判断，每行 变量名 运算符 值，全部同时满足 → yes / 任一不满足 → no
         "Clipboard",     # 7、剪贴板
         "Notify",        # 8、提示
     ],
@@ -65,7 +65,6 @@ CATEGORY_NODE_ORDER: Dict[str, List[str]] = {
     ],
     CATEGORY_VISION: [
         "FindImage",     # 1、找图 → 单图Find
-        "FindAnyImage",  # 1、找图 → 多图任找（Qflow增强）
         "IfImageDetect", # 2、检索 → 多图AND
         "StillnessDetect",# 3、静止
         "SoundDetect",   # 4、声音
@@ -87,6 +86,12 @@ class ParamDef:
     step: float = 1.0
     required: bool = False
     help: str = ""
+    # 中文下拉框显示：{option_value: 显示文本}；不填则直接显示 options 原值
+    option_labels: Optional[Dict[Any, str]] = None
+    # tuple2 点属性是否附带 📍 坐标拾取按钮（仅 Mouse 节点用）
+    pick_coord: bool = False
+    # 输入框 placeholder 提示文本（EDITOR_STRING / EDITOR_MULTILINE 用）
+    placeholder: str = ""
 
 
 # ============================================================
@@ -157,7 +162,7 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         type="Start",
         category=CATEGORY_LOGIC,
         title="开始",
-        description="蓝图唯一入口，每张图必须且仅能有 1 个。",
+        description="咱是整张蓝图唯一的起点哟~每张蓝图只能放一个咱，从这里开始往下跑！",
         color="#238636",
         accent="#3FB950",
         outputs=[_exec_out()],
@@ -167,7 +172,7 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         type="End",
         category=CATEGORY_LOGIC,
         title="结束",
-        description="【对齐Qflow】蓝图执行终点（Start配对），到达此处视为该分支结束，不再向下流转。",
+        description="和Start配对的终点~跑到咱这里就算这条分支收工啦，不会再继续往下走咯。",
         color="#0b3d91",
         accent="#1565c0",
         inputs=[_exec_in("in_exec", label="▶")],
@@ -179,7 +184,7 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         type="Loop",
         category=CATEGORY_LOGIC,
         title="循环",
-        description="while 语义；每轮走 loop_body，超过 max_iterations 或条件不满足走 out_exit。",
+        description="循环跑圈儿~要么到了设定的最大次数就退出，要么勾上「无限循环」就一直跑（只能暂停/停止），每轮之间还能等一小会儿再跑下一圈哟。",
         color="#8250DF",
         accent="#A371F7",
         inputs=[_exec_in()],
@@ -188,8 +193,14 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
             _exec_out("out_exit", label="退出"),
         ],
         params=[
-            ParamDef(name="max_iterations", editor=EDITOR_INT, default=9999, label="最大迭代", min=1, max=10000000, step=1, required=True, help="硬约束：防止死循环"),
-            ParamDef(name="interval_sec", editor=EDITOR_FLOAT, default=0.0, label="每轮间隔(s)", min=0.0, max=60.0, step=0.05),
+            ParamDef(name="infinite", editor=EDITOR_BOOL, default=False, label="无限循环",
+                     help="勾选后忽略最大迭代次数，仅手动停止或条件退出才结束（慎用）"),
+            ParamDef(name="max_iterations", editor=EDITOR_INT, default=5, label="最大迭代",
+                     min=1, max=10000000, step=1, required=True,
+                     help="硬约束：防止死循环。无限循环模式下此项不生效"),
+            ParamDef(name="interval_sec", editor=EDITOR_FLOAT, default=1.0, label="每轮间隔(s)",
+                     min=0.0, max=60.0, step=0.05,
+                     help="每轮循环体执行完后的等待时间（秒）"),
         ],
         qflow_name="loop",
     ),
@@ -197,7 +208,7 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         type="Wait",
         category=CATEGORY_EXECUTE,
         title="等待",
-        description="睡眠一段时间。优先走 in_seconds 数据线，否则用默认参数。",
+        description="歇会儿再接着跑~要么固定睡几秒，要么在范围内随机小睡更像真人，上游传过来秒数也能用，实际等了多久还能输出给下游用哟。",
         color="#2D333B",
         accent="#8B949E",
         inputs=[
@@ -206,45 +217,58 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         ],
         outputs=[_exec_out()],
         params=[
-            ParamDef(name="default_sec", editor=EDITOR_FLOAT, default=1.0, label="默认秒数", min=0.0, max=3600.0, step=0.1),
+            # 模式选择（第一位）
+            ParamDef(name="delay_type", editor=EDITOR_ENUM, default="fixed",
+                     options=["fixed", "random"],
+                     option_labels={"fixed": "固定延时", "random": "随机延时"},
+                     label="模式",
+                     help="固定延时(fixed)：总是等待 seconds 秒；\n随机延时(random)：在 min_seconds ~ max_seconds 之间随机等待，更拟人。"),
+            # --- 固定延时参数 ---
+            ParamDef(name="seconds", editor=EDITOR_FLOAT, default=1.0, label="秒数",
+                     min=0.0, max=3600.0, step=0.1,
+                     help="【固定延时】等待的秒数。"),
+            # --- 随机延时参数 ---
+            ParamDef(name="min_seconds", editor=EDITOR_FLOAT, default=1.0, label="最小(秒)",
+                     min=0.0, max=3600.0, step=0.1,
+                     help="【随机延时】随机范围下限。"),
+            ParamDef(name="max_seconds", editor=EDITOR_FLOAT, default=3.0, label="最大(秒)",
+                     min=0.0, max=3600.0, step=0.1,
+                     help="【随机延时】随机范围上限。"),
         ],
         qflow_name="wait",
     ),
     "VarSwitch": NodeMeta(
         type="VarSwitch",
         category=CATEGORY_LOGIC,
-        title="变量分流",
-        description="二模式：简单模式（var_name非空，输出yes/no）；多分支模式（cases数组，输出case.id...+else）。均支持DATA连线 in_value 或从变量引擎读取。",
+        title="条件判断",
+        description="一条条检查汝写的条件~全部都对上了就走「满足」，只要有一条不对就走「不满足」。",
         color="#57606A",
         accent="#F78166",
         inputs=[
             _exec_in(),
-            _data_in("in_value", "any", label="比较值（可选）"),
         ],
         outputs=[
-            # 默认 2 输出（简单模式yes/no），实际动态由 params 决定，序列化时 outputs 会写全分支
-            _exec_out("yes", label="是"),
-            _exec_out("no", label="否"),
+            _exec_out("yes", label="满足"),
+            _exec_out("no", label="不满足"),
         ],
         params=[
-            ParamDef(name="var_name", editor=EDITOR_STRING, default="", label="简单模式-变量名（留空=多分支模式）"),
-            ParamDef(name="var_expr", editor=EDITOR_STRING, default="", label="简单模式-表达式（可选，写{var}，留空则变量真值判断）"),
             ParamDef(
                 name="cases",
                 editor=EDITOR_MULTILINE,
                 default="",
-                label="多分支模式 cases（每行：case_id = 值 或 直接写JSON数组 [{id,value}]）",
-                help='示例：\ncase_a = 100\ncase_b = hello\n或 JSON: [{"id":"case_a","value":"100"}, {"id":"case_b","value":"hello"}]'
+                label="批量设置",
+                placeholder="hp >= 30\nhp <= 100\nscore >= 60\ngender != \"female\"\nlevel > {min_level}",
+                help='每行写一个条件：变量名 运算符 值（全部 AND 逻辑，同时满足才走 yes）\n运算符：== 等于、!= 不等于、> 大于、< 小于、>= 大于等于、<= 小于等于\n值：字符串需加引号 "abc" 或 \'abc\'；数字直接写；布尔写 true/false；支持 {变量} 插值\n空行 和 // 或 # 开头的行 作为注释忽略'
             ),
         ],
         qflow_name="var_switch",
-        has_dynamic_ports=True,
+        has_dynamic_ports=False,
     ),
     "Sequence": NodeMeta(
         type="Sequence",
         category=CATEGORY_LOGIC,
-        title="顺序分支(短路OR)",
-        description="短路OR分支：按顺序尝试 #1→#2→…→#N 路径，任一分支走到成功语义出口(yes/success/out/found)则立即走 out_done 完成；若分支走到失败语义出口(no/fail/timeout/not_found)则自动尝试下一条；全部失败走 else。",
+        title="顺序执行",
+        description="按顺序一条条试路径~短路模式只要有一条跑成功就收工走完成；完全模式得条条都成功才过；要是全失败了就走「失败」出口，每两条之间还能歇一会儿哟。",
         color="#57606A",
         accent="#58A6FF",
         inputs=[_exec_in()],
@@ -252,12 +276,21 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
             _exec_out("1", label="#1"),
             _exec_out("2", label="#2"),
             _exec_out("3", label="#3"),
-            _exec_out("else", label="全失败"),
+            _exec_out("else", label="失败"),
             _exec_out("out_done", label="完成"),
         ],
         params=[
-            ParamDef(name="num_paths", editor=EDITOR_INT, default=3, label="路径数N", min=1, max=50, step=1, required=True),
-            ParamDef(name="interval_sec", editor=EDITOR_FLOAT, default=0.0, label="每条路径间间隔(s)", min=0.0, max=3600.0, step=0.05),
+            ParamDef(name="mode", editor=EDITOR_ENUM, default="short_circuit",
+                     options=["short_circuit", "complete"],
+                     option_labels={"short_circuit": "短路模式", "complete": "完全求值"},
+                     label="模式",
+                     help="短路模式(short_circuit)：任一分支走到成功语义出口(yes/success/out/found)即立即走 out_done 完成；失败语义出口(no/fail/timeout/not_found)则自动尝试下一条；全部失败走 else。\n完全模式(complete)：所有分支都必须走到成功语义出口才算通过，走 out_done；任一分支失败则走 else。"),
+            ParamDef(name="num_paths", editor=EDITOR_INT, default=3, label="路径数",
+                     min=1, max=50, step=1, required=True,
+                     help="分支路径数量（1~50）。建议用属性面板的 +/- 按钮调整，避免误操作"),
+            ParamDef(name="interval_sec", editor=EDITOR_FLOAT, default=1.0, label="路径间隔(s)",
+                     min=0.0, max=3600.0, step=0.05,
+                     help="每条路径尝试之间的等待时间（秒）"),
         ],
         qflow_name="seq",
         has_dynamic_ports=True,
@@ -267,7 +300,7 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         type="OpenApp",
         category=CATEGORY_APP,
         title="启动程序",
-        description="启动外部程序：path + args（支持空格分隔或shlex）；working_dir为工作目录，wait_sec为启动后等待秒数。成功走out端口，失败走fail端口。",
+        description="帮汝打开外部程序~告诉咱程序在哪、要传啥参数，启动成功就继续，开不起来就走失败分支。",
         color="#8957E5",
         accent="#BC8CFF",
         inputs=[_exec_in()],
@@ -276,10 +309,9 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
             _exec_out("fail", label="失败"),
         ],
         params=[
-            ParamDef(name="path", editor=EDITOR_PATH, default="", label="程序路径(EXE)", required=True),
-            ParamDef(name="args", editor=EDITOR_STRING, default="", label="启动参数(空格分隔)"),
-            ParamDef(name="working_dir", editor=EDITOR_PATH, default="", label="工作目录(可选)", help="不填默认用EXE所在目录"),
-            ParamDef(name="wait_sec_after_launch", editor=EDITOR_FLOAT, default=2.0, label="启动后等待(s)", min=0.0, max=120.0, step=0.1),
+            ParamDef(name="path", editor=EDITOR_PATH, default="", label="程序路径"),
+            ParamDef(name="args", editor=EDITOR_STRING, default="", label="启动参数"),
+            ParamDef(name="wait_sec_after_launch", editor=EDITOR_FLOAT, default=2.0, label="等待时间(s)", min=0.0, max=120.0, step=0.1),
         ],
         qflow_name="open_app",
     ),
@@ -287,23 +319,18 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         type="BindWindow",
         category=CATEGORY_APP,
         title="绑定窗口",
-        description="绑定目标窗口HWND到Screen/Matcher/InputActions：三维搜索(title子串/exe文件名/class_name)，对应3个开关；全开全不开时退化兜底强制开启title；分辨率参考用于坐标缩放。成功走success，失败走fail。",
+        description="告诉咱要操作哪个窗口~标题、程序名、类名这仨条件填了就得全对上才算配对成功，绑好之后后面的截图、点击、找图都会自动对准这个窗口的坐标哒。",
         color="#8957E5",
         accent="#A371F7",
         inputs=[_exec_in()],
         outputs=[
-            _exec_out("success", label="绑定成功"),
-            _exec_out("fail", label="绑定失败"),
+            _exec_out("success", label="成功"),
+            _exec_out("fail", label="失败"),
         ],
         params=[
-            ParamDef(name="title", editor=EDITOR_STRING, default="", label="窗口标题(子串)"),
-            ParamDef(name="use_title", editor=EDITOR_BOOL, default=True, label="启用标题搜索"),
-            ParamDef(name="exe_name", editor=EDITOR_STRING, default="", label="程序名(ex: notepad.exe)"),
-            ParamDef(name="use_exe_name", editor=EDITOR_BOOL, default=True, label="启用程序名搜索"),
+            ParamDef(name="title", editor=EDITOR_STRING, default="", label="窗口标题"),
+            ParamDef(name="exe_name", editor=EDITOR_STRING, default="", label="程序名"),
             ParamDef(name="class_name", editor=EDITOR_STRING, default="", label="窗口类名"),
-            ParamDef(name="use_class_name", editor=EDITOR_BOOL, default=False, label="启用类名搜索"),
-            ParamDef(name="resolution_w", editor=EDITOR_INT, default=1920, label="参考宽", min=800, max=7680, step=1),
-            ParamDef(name="resolution_h", editor=EDITOR_INT, default=1080, label="参考高", min=600, max=4320, step=1),
         ],
         qflow_name="bind_win",
     ),
@@ -312,70 +339,113 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         type="FindImage",
         category=CATEGORY_VISION,
         title="找图",
-        description="在屏幕或指定区域内用模板匹配找指定模板。找到输出 out_pos 与 out_found=True，并继续执行。",
+        description="给咱一张参考图就在屏幕上找~在超时时间里反复试，找不到还能滚动鼠标页面后继续找；找到了可以顺手点一下，就算最后没找到，也会继续往下跑，下游靠「找到」信号自己判断就行啦。",
         color="#0969DA",
         accent="#58A6FF",
         inputs=[
             _exec_in(),
             _data_in("in_template", "path", label="模板"),
-            _data_in("in_region", "tuple4", label="区域"),
             _data_in("in_threshold", "float", label="阈值"),
         ],
         outputs=[
-            _exec_out(),
+            _exec_out("out_exec", label="执行"),
             _data_out("out_pos", "tuple2", label="位置"),
             _data_out("out_found", "bool", label="找到"),
             _data_out("out_score", "float", label="最高得分"),
         ],
         params=[
-            ParamDef(name="template", editor=EDITOR_PATH, default="", label="模板路径", required=True),
-            ParamDef(name="threshold", editor=EDITOR_FLOAT, default=0.75, label="匹配阈值", min=0.3, max=1.0, step=0.01),
-            ParamDef(name="fast_mode", editor=EDITOR_BOOL, default=True, label="快速模式"),
-            ParamDef(name="use_gray", editor=EDITOR_BOOL, default=True, label="灰度匹配"),
-            ParamDef(name="on_fail", editor=EDITOR_ENUM, default="stop", label="失败策略", options=ON_FAIL_OPTIONS, help="stop=终止；continue=继续；retry_then_skip=重试几次后跳过"),
-            ParamDef(name="retry_count", editor=EDITOR_INT, default=3, label="重试次数", min=0, max=100, step=1),
-            ParamDef(name="retry_interval_ms", editor=EDITOR_FLOAT, default=500.0, label="重试间隔(ms)", min=50.0, max=60000.0, step=10.0),
+            ParamDef(
+                name="match_strategy",
+                editor=EDITOR_ENUM,
+                default="hybrid",
+                options=["hybrid", "template", "feature"],
+                option_labels={
+                    "hybrid": "智能混合",
+                    "template": "模板匹配",
+                    "feature": "特征匹配",
+                },
+                label="匹配算法",
+                help='各算法优缺点：\n'
+                     '● 智能混合(hybrid)【推荐】：先用灰度模板匹配快速初筛，不通过再试特征点。速度较快，兼顾准确性和抗形变能力，大多数场景首选。\n'
+                     '● 模板匹配(template)：直接做像素归一化相关。速度最快，像素级精度最高；但参考图和屏幕只要有缩放、旋转、轻微形变或压缩失真就会匹配失败。适合尺寸固定、画面清晰的UI按钮/图标。\n'
+                     '● 特征匹配(feature)：提取SIFT/ORB局部特征点做匹配。抗缩放、旋转、部分遮挡和光照变化；但对于大面积纯色、缺少纹理的图片（如纯色方块）会找不到特征点而失败，速度也稍慢。',
+            ),
+            ParamDef(name="threshold", editor=EDITOR_FLOAT, default=0.75, label="匹配阈值", min=0.3, max=1.0, step=0.01,
+                     help="相似度阈值，越高越严格。模板匹配/混合模式=相关系数；特征匹配=内点比例。"),
+            ParamDef(name="timeout_seconds", editor=EDITOR_FLOAT, default=10.0, label="超时(秒)", min=0.5, max=600.0, step=0.5,
+                     help="在超时时间内会根据自动滚动设置反复重试，直到找到或超时。"),
+            ParamDef(name="template", editor=EDITOR_PATH, default="", label="模板路径",
+                     help="要查找的图片文件路径（PNG/JPG/BMP等），也可点上面工具栏「📸 截取目标」或「📂 导入图片」直接选择，自动写入路径+预览。"),
+            ParamDef(name="template_b64", editor=EDITOR_STRING, default="", label="模板预览图(只读)",
+                     help="通过「📸 截取目标」/「📂 导入图片」时会写入b64缩略图，便于画布节点直接预览。"),
+            # 未找到时尝试滚动
+            ParamDef(name="auto_scroll", editor=EDITOR_BOOL, default=False,
+                     label="未找到时尝试滚动",
+                     help="勾选=找图失败后自动把鼠标移到屏幕中心并滚动一次，然后继续重试，直到超时。"),
+            ParamDef(name="scroll_dy", editor=EDITOR_INT, default=-500, label="垂直滚动量(负=向下)", min=-5000, max=5000, step=10,
+                     help="pyautogui.scroll 的垂直 clicks 值，典型值：向下翻页=-500；向上翻页=500。仅勾选「未找到时尝试滚动」才生效。"),
+            ParamDef(name="scroll_dx", editor=EDITOR_INT, default=0, label="水平滚动量(正=向右)", min=-5000, max=5000, step=10,
+                     help="pyautogui.hscroll 的水平 clicks 值（Windows下部分程序有效）：向右=正数，向左=负数。0=不做水平滚动。仅勾选「未找到时尝试滚动」才生效。"),
+            # 找到后执行
+            ParamDef(
+                name="after_action",
+                editor=EDITOR_ENUM,
+                default="none",
+                options=["none", "click", "double_click", "right_click"],
+                option_labels={
+                    "none": "不执行（仅输出位置）",
+                    "click": "左键单击（推荐）",
+                    "double_click": "左键双击",
+                    "right_click": "右键单击",
+                },
+                label="找到后执行",
+                help="找到目标后要自动做的动作。建议用默认「左键单击」直接点击目标；不需要鼠标操作则选「不执行」仅把位置传给下游Mouse节点。",
+            ),
+            ParamDef(name="offset", editor=EDITOR_TUPLE2, default=(0, 0), label="点击偏移",
+                     pick_coord=True,
+                     help="找到目标后，相对目标中心的像素偏移 (X, Y)。X 正值向右，负值向左；Y 正值向下，负值向上。点右侧 📍 按钮可在屏幕上拾取坐标（取绝对坐标；如需相对模板中心可手动微调）。"),
+            ParamDef(name="offset_x", editor=EDITOR_INT, default=0, label="点击偏移X(旧)", min=-9999, max=9999, step=1,
+                     help="（保留用于旧蓝图兼容，请用上方「点击偏移」tuple2 参数）"),
+            ParamDef(name="offset_y", editor=EDITOR_INT, default=0, label="点击偏移Y(旧)", min=-9999, max=9999, step=1,
+                     help="（保留用于旧蓝图兼容，请用上方「点击偏移」tuple2 参数）"),
         ],
         qflow_name="image",
     ),
-    "FindAnyImage": NodeMeta(
-        type="FindAnyImage",
-        category=CATEGORY_VISION,
-        title="多图任找(分支)",
-        description="依次尝试多张模板，命中的那张走对应的 out_found_N 分支；全部未中走 out_not_found。同时输出命中序号/位置/是否命中的数据线。",
-        color="#0969DA",
-        accent="#79C0FF",
-        inputs=[_exec_in()],
-        outputs=[
-            _exec_out("out_not_found", label="都没找到"),
-            _data_out("out_found_index", "int", label="命中序号"),
-            _data_out("out_pos", "tuple2", label="命中位置"),
-            _data_out("out_found", "bool", label="是否命中"),
-        ],
-        params=[
-            ParamDef(name="templates", editor=EDITOR_STRING, default="", label="模板列表(逗号分隔)", required=True, help="如: btn_a.png,btn_b.png,btn_c.png"),
-            ParamDef(name="threshold", editor=EDITOR_FLOAT, default=0.75, label="阈值", min=0.3, max=1.0, step=0.01),
-            ParamDef(name="fast_mode", editor=EDITOR_BOOL, default=True, label="快速模式"),
-            ParamDef(name="timeout_ms", editor=EDITOR_FLOAT, default=0.0, label="总超时(ms)", min=0.0, max=3600000.0, step=100.0, help="0=只查一次不等待"),
-            ParamDef(name="interval_ms", editor=EDITOR_FLOAT, default=300.0, label="轮询间隔(ms)", min=50.0, max=60000.0, step=10.0),
-        ],
-        qflow_name="find_any_image",
-        has_dynamic_ports=True,
-    ),
+
     "PressKey": NodeMeta(
         type="PressKey",
         category=CATEGORY_EXECUTE,
         title="按键",
-        description="按下并释放硬件级按键（scan code）。支持多次按。",
+        description="键盘交给咱~要么输入一段文字（还能用剪贴板粘贴防乱码、末尾按回车），要么按组合键（ctrl+c、alt+f4这种，还能重复按好几次）。",
         color="#B62324",
         accent="#FF7B72",
         inputs=[_exec_in()],
         outputs=[_exec_out()],
         params=[
-            ParamDef(name="key", editor=EDITOR_STRING, default="", label="按键名", required=True, help="如: enter, space, esc, a, 1, up, f1, lctrl"),
-            ParamDef(name="count", editor=EDITOR_INT, default=1, label="次数", min=1, max=1000, step=1),
-            ParamDef(name="hold_ms", editor=EDITOR_INT, default=50, label="保持(ms)", min=1, max=5000, step=1),
-            ParamDef(name="interval_ms", editor=EDITOR_INT, default=100, label="间隔(ms)", min=1, max=60000, step=1),
+            # 模式选择（第一位）
+            ParamDef(name="kb_mode", editor=EDITOR_ENUM, default="text",
+                     options=["text", "key"],
+                     option_labels={"text": "输入文本", "key": "按键组合"},
+                     label="模式",
+                     help="输入文本模式(text)：输入一段文字，可选粘贴模式防乱码、可选末尾按回车；\n按键组合模式(key)：按下组合键，如 ctrl+c、alt+f4、win+r。"),
+            # --- 输入文本模式参数 ---
+            ParamDef(name="text", editor=EDITOR_MULTILINE, default="", label="文本内容",
+                     help="【输入文本模式】要输入的文本内容，支持 {var} 变量插值。"),
+            ParamDef(name="use_paste", editor=EDITOR_BOOL, default=True, label="粘贴模式",
+                     help="【输入文本模式】勾选=用剪贴板粘贴（快速、防中文乱码）；不勾=逐字符输入。"),
+            ParamDef(name="press_enter", editor=EDITOR_BOOL, default=False, label="末尾按回车",
+                     help="【输入文本模式】输入完文本后再按一次回车键。"),
+            # --- 按键组合模式参数 ---
+            ParamDef(name="key_name", editor=EDITOR_STRING, default="", label="组合键",
+                     required=False,
+                     placeholder="如: enter, ctrl+c, alt+f4, win+r, shift+1",
+                     help="【按键组合模式】按键名，多键用 + 连接。如: enter, ctrl+c, alt+f4, win+r, shift+1。\n单键: enter, space, esc, a, 1, up, f1 等。"),
+            ParamDef(name="count", editor=EDITOR_INT, default=1, label="次数", min=1, max=1000, step=1,
+                     help="【按键组合模式】重复按几次。"),
+            ParamDef(name="hold_ms", editor=EDITOR_INT, default=50, label="保持(ms)", min=1, max=5000, step=1,
+                     help="【按键组合模式】每次按下保持时间。"),
+            ParamDef(name="interval_ms", editor=EDITOR_INT, default=100, label="间隔(ms)", min=1, max=60000, step=1,
+                     help="【按键组合模式】重复按键之间的间隔。"),
         ],
         qflow_name="keyboard",
     ),
@@ -383,7 +453,7 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         type="Mouse",
         category=CATEGORY_EXECUTE,
         title="鼠标操作",
-        description="【对齐Qflow】统一鼠标操作节点（点击/按住/释放/移动/拖拽/滚动），用 action 选择类型。",
+        description="鼠标交给咱啦~点击、按住、释放、移动、拖拽、滚轮随便选，坐标既能去屏幕上点着选，也能从上游找图节点直接连线传过来更省心哟。",
         color="#ef6c00",
         accent="#ff9800",
         inputs=[
@@ -395,31 +465,47 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
             _exec_out("err", label="失败"),
         ],
         params=[
+            # 1) 坐标参考系（第一位）
+            ParamDef(name="coord_mode", editor=EDITOR_ENUM, default="relative",
+                     options=["relative", "absolute"],
+                     option_labels={"relative": "相对绑定窗口", "absolute": "绝对屏幕坐标"},
+                     label="坐标参考系",
+                     help="相对绑定窗口(relative)：坐标基于绑定窗口左上角，拾取时自动扣除窗口偏移；\n绝对屏幕坐标(absolute)：坐标基于屏幕左上角。"),
+            # 2) 动作类型（第二位）
             ParamDef(name="action", editor=EDITOR_ENUM, default="click",
                      options=["click", "press", "release", "move", "drag", "scroll"],
-                     label="【动作类型】",
-                     help='Inspector根据本值动态显示对应分组参数'),
-            ParamDef(name="bind_mode", editor=EDITOR_ENUM, default="current_win",
-                     options=["current_win", "screen_abs", "foreground_win"],
-                     label="坐标参考系",
-                     help='current_win=绑定窗口(默认)；screen_abs=屏幕绝对；foreground_win=前景窗口'),
+                     option_labels={
+                         "click": "点击", "press": "按住", "release": "释放",
+                         "move": "移动", "drag": "拖拽", "scroll": "滚动",
+                     },
+                     label="动作类型",
+                     help="切换动作后，下方仅显示该动作用得上的参数。"),
 
-            ParamDef(name="pos_x", editor=EDITOR_INT, default=0, label="目标点 X"),
-            ParamDef(name="pos_y", editor=EDITOR_INT, default=0, label="目标点 Y"),
-            ParamDef(name="click_rel", editor=EDITOR_STRING, default="[0.5, 0.5]",
-                     label="相对点击位置[rx,ry]"),
-            ParamDef(name="offset_x", editor=EDITOR_INT, default=0, min=-500, max=500, label="X 偏移像素"),
-            ParamDef(name="offset_y", editor=EDITOR_INT, default=0, min=-500, max=500, label="Y 偏移像素"),
+            # --- 目标点（click/press/move/scroll 用）---
+            ParamDef(name="pos", editor=EDITOR_TUPLE2, default=(0, 0), label="目标点",
+                     pick_coord=True,
+                     help="鼠标操作的目标坐标 (X, Y)。点 📍 按钮可在屏幕上拾取坐标。"),
 
-            ParamDef(name="from_x", editor=EDITOR_INT, default=0, label="起点 X"),
-            ParamDef(name="from_y", editor=EDITOR_INT, default=0, label="起点 Y"),
-            ParamDef(name="to_x", editor=EDITOR_INT, default=0, label="终点 X"),
-            ParamDef(name="to_y", editor=EDITOR_INT, default=0, label="终点 Y"),
+            # --- 拖拽起点/终点（drag 独有）---
+            ParamDef(name="from_pos", editor=EDITOR_TUPLE2, default=(0, 0), label="起点",
+                     pick_coord=True,
+                     help="拖拽起点坐标 (X, Y)。点 📍 按钮可在屏幕上拾取坐标。"),
+            ParamDef(name="to_pos", editor=EDITOR_TUPLE2, default=(0, 0), label="终点",
+                     pick_coord=True,
+                     help="拖拽终点坐标 (X, Y)。点 📍 按钮可在屏幕上拾取坐标。"),
+            # --- 偏移量（click/press/move/scroll/drag 用）---
+            ParamDef(name="offset", editor=EDITOR_TUPLE2, default=(0, 0), label="偏移量",
+                     help="对目标点的像素偏移 (X, Y)。X 负数=向左，Y 负数=向下。"),
             ParamDef(name="drag_duration_ms", editor=EDITOR_INT, default=300, min=0, max=10000,
                      label="拖拽时长(ms)", help='0=瞬间；越大越平滑'),
 
+            # --- 按钮/时长相关 ---
             ParamDef(name="button", editor=EDITOR_ENUM, default="left",
                      options=["left", "middle", "right", "x1", "x2"],
+                     option_labels={
+                         "left": "左键", "middle": "中键", "right": "右键",
+                         "x1": "侧键1", "x2": "侧键2",
+                     },
                      label="鼠标按键"),
             ParamDef(name="click_count", editor=EDITOR_INT, default=1, min=1, max=3,
                      label="点击次数", help='1=单击 2=双击 3=三击'),
@@ -430,6 +516,7 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
             ParamDef(name="move_speed_ms", editor=EDITOR_INT, default=0, min=0, max=20000,
                      label="移动时长(ms)", help='0=瞬移'),
 
+            # --- scroll 独有 ---
             ParamDef(name="scroll_dy", editor=EDITOR_INT, default=3, min=-100, max=100,
                      label="垂直滚动(格)", help='正=上 负=下'),
             ParamDef(name="scroll_dx", editor=EDITOR_INT, default=0, min=-100, max=100,
@@ -444,7 +531,7 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         type="SetVariable",
         category=CATEGORY_LOGIC,
         title="设置变量",
-        description="批量设置变量：每行 name=value。value 支持 {var}/${var}/{= expr} 插值；兼容旧蓝图的 name + in_value 单变量模式。",
+        description="存变量用的小盒子~每行写 名字=值，还能塞别的变量进去算一算，存好了后面所有节点都能拿来用哟。",
         color="#2D333B",
         accent="#F778BA",
         inputs=[
@@ -452,8 +539,8 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         ],
         outputs=[_exec_out()],
         params=[
-            ParamDef(name="batch_text", editor=EDITOR_MULTILINE, default="", label="批量设置（每行 name=value）"),
-            ParamDef(name="name", editor=EDITOR_STRING, default="", label="变量名（兼容旧单变量模式）"),
+            ParamDef(name="batch_text", editor=EDITOR_MULTILINE, default="", label="批量设置",
+                     help="每行 name=value。value 支持 {var}/${var}/{= expr} 插值。\n示例：\nuser = Alice\nport = 8080\nresult = {= {port} * 2}"),
         ],
         qflow_name="set_var",
     ),
@@ -462,22 +549,31 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         type="Notify",
         category=CATEGORY_LOGIC,
         title="通知",
-        description="日志/弹窗通知：title+message 支持 {var}/${var}/{= expr} 插值；{ALL_VARS} 仅在 message 最后一步单独替换（避免与其他变量占位提前冲突）。",
+        description="想提醒点啥就用咱~要么写在日志里，要么弹系统小窗口，还能放提示音，内容里塞变量也没问题哟。",
         color="#0B3A5C",
         accent="#58A6FF",
         inputs=[_exec_in()],
         outputs=[_exec_out()],
         params=[
-            ParamDef(name="title", editor=EDITOR_STRING, default="通知", label="标题"),
-            ParamDef(name="message", editor=EDITOR_MULTILINE, default="", label="内容（{ALL_VARS} 展开所有变量）"),
+            ParamDef(name="title", editor=EDITOR_STRING, default="通知", label="标题",
+                     help="通知标题，支持 {var} 插值"),
+            ParamDef(name="message", editor=EDITOR_MULTILINE, default="", label="内容",
+                     help="通知正文，支持 {var}/${var}/{= expr} 插值；{ALL_VARS} 展开所有变量"),
             ParamDef(
                 name="level",
                 editor=EDITOR_ENUM,
                 default="INFO",
                 label="级别",
                 options=["INFO", "WARN", "ERROR", "DEBUG"],
+                option_labels={"INFO": "信息", "WARN": "警告", "ERROR": "错误", "DEBUG": "调试"},
             ),
-            ParamDef(name="show_popup", editor=EDITOR_BOOL, default=False, label="系统弹窗"),
+            ParamDef(name="duration_sec", editor=EDITOR_FLOAT, default=3.0, label="持续(s)",
+                     min=0.5, max=3600.0, step=0.5,
+                     help="系统弹窗/通知显示持续时间（秒）"),
+            ParamDef(name="show_popup", editor=EDITOR_BOOL, default=False, label="系统弹窗",
+                     help="勾选后弹出系统原生弹窗（阻塞），否则只写日志"),
+            ParamDef(name="play_sound", editor=EDITOR_BOOL, default=False, label="提示音",
+                     help="勾选后播放系统提示音"),
         ],
         qflow_name="notify",
     ),
@@ -486,7 +582,7 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         type="Clipboard",
         category=CATEGORY_LOGIC,
         title="剪贴板",
-        description="读取系统剪贴板文本到变量；或把变量值写入剪贴板；或清空剪贴板。",
+        description="管系统剪贴板的小助手~要么读出来存变量还顺带给下游数据线；要么把汝写的（或上游传进来的）内容写进去；也能一键清空剪贴板哟。",
         color="#4527a0",
         accent="#7e57c2",
         inputs=[_exec_in(), _data_in("in_text", "str", label="写入文本")],
@@ -498,14 +594,15 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         params=[
             ParamDef(name="mode", editor=EDITOR_ENUM, default="read",
                      options=["read", "write", "clear"],
-                     label="操作模式",
+                     option_labels={"read": "读取", "write": "写入", "clear": "清空"},
+                     label="模式",
                      help='read=读剪贴板→out_text；write=写剪贴板→in_text或下面value；clear=清空剪贴板'),
             ParamDef(name="value", editor=EDITOR_MULTILINE, default="",
-                     label="写入内容（支持{var}插值）",
-                     help='仅mode=write生效；若in_text有线则用连线值优先，空则用本参数值'),
+                     label="写入内容",
+                     help='仅 mode=write 生效；支持 {var} 插值。若 in_text 有连线则用连线值优先，空则用本参数值'),
             ParamDef(name="output_var_name", editor=EDITOR_STRING, default="clip_text",
-                     label="读到的内容存到变量名（仅read）",
-                     help='mode=read时，读到的文本同时塞进ctx.variables，后续节点{clip_text}直接用'),
+                     label="输出变量名",
+                     help='仅 mode=read 生效：读到的文本同时存到 ctx.variables，后续节点 {clip_text} 直接用'),
         ],
         qflow_name="clipboard",
     ),
@@ -513,7 +610,7 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         type="Command",
         category=CATEGORY_APP,
         title="执行命令",
-        description="执行Windows shell命令或外部程序，支持 {变量} 插值。支持 stdout/stderr/exit_code 3数据线输出。",
+        description="跑Windows命令或者外部程序用哒~命令里能塞变量，三种shell模式随便挑；不想等程序关掉就往下跑可以关了捕获；命令报错退出码非零也可以当失败处理；标准输出、错误、退出码都会捡回来给下游用哟。",
         color="#bf360c",
         accent="#f4511e",
         inputs=[_exec_in()],
@@ -526,20 +623,21 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         ],
         params=[
             ParamDef(name="command", editor=EDITOR_MULTILINE, default="echo hello {name}",
-                     label="命令（支持{变量}）", help='例：dir C:\\；python script.py {arg1}；start notepad'),
-            ParamDef(name="working_dir", editor=EDITOR_STRING, default="",
-                     label="工作目录（可空）",
+                     label="命令",
+                     help='支持 {变量} 插值。例：dir C:\\；python script.py {arg1}；start notepad'),
+            ParamDef(name="working_dir", editor=EDITOR_PATH, default="",
+                     label="工作目录",
                      help='空=当前项目目录；支持特殊占位符 {blueprint_dir} = 当前蓝图所在文件夹'),
             ParamDef(name="timeout_ms", editor=EDITOR_INT, default=10000, min=0, max=3600000,
                      label="超时(ms)", help='0=永不超时（慎用）'),
             ParamDef(name="capture_streams", editor=EDITOR_BOOL, default=True,
-                     label="捕获stdout/stderr",
+                     label="捕获输出",
                      help='关掉后不会等待程序结束立刻out_done；适合打开notepad.exe这类GUI程序'),
             ParamDef(name="shell_mode", editor=EDITOR_ENUM, default="cmd_c",
                      options=["cmd_c", "powershell", "no_shell"],
                      label="shell模式"),
             ParamDef(name="fail_on_nonzero", editor=EDITOR_BOOL, default=False,
-                     label="非零退出码走err",
+                     label="非零退出走err",
                      help='不勾（默认）：不论exit_code是几都走out_done，用户自己用if判断exit_code；勾了：exit_code!=0就走err分支'),
         ],
         qflow_name="cmd",
@@ -547,8 +645,8 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
     "WebBrowser": NodeMeta(
         type="WebBrowser",
         category=CATEGORY_APP,
-        title="网页",
-        description="【应用控制#4】浏览器操作：用系统默认浏览器（或选Chrome/Edge/Firefox）打开URL/刷新/回退/前进。仅负责用户界面操作，不返回响应内容（需要接口数据请用 HTTP 请求节点）。",
+        title="网页操作",
+        description="帮汝开浏览器~打开指定网址，或者刷新、后退、前进都行，默认浏览器或者Chrome/Edge/Firefox随便汝选。",
         color="#01579b",
         accent="#29b6f6",
         inputs=[_exec_in()],
@@ -557,25 +655,26 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
             _exec_out("err", label="失败/超时"),
         ],
         params=[
-            ParamDef(name="action", editor=EDITOR_ENUM, default="open",
-                     options=["open", "refresh", "back", "forward"],
+            ParamDef(name="action", editor=EDITOR_ENUM, default="打开",
+                     options=["打开", "刷新", "后退", "前进"],
                      label="动作",
-                     help='open=新打开URL；refresh/back/forward=浏览器刷新/回退/前进（若系统无法控制当前浏览器，则降级为重新open该URL）'),
-            ParamDef(name="url", editor=EDITOR_STRING, default="https://www.baidu.com/s?wd={keyword}",
-                     label="URL（支持{var}）",
-                     help='open 时必填；refresh/back/forward 可为空（此时用上次打开过的URL兜底重开）'),
-            ParamDef(name="browser", editor=EDITOR_ENUM, default="default",
-                     options=["default", "chrome", "edge", "firefox"],
-                     label="使用浏览器",
-                     help='default=操作系统默认浏览器；chrome/edge/firefox=指定对应可执行程序（找不到则自动fallback到default）'),
+                     ),
+            ParamDef(name="url", editor=EDITOR_STRING,
+                     label="URL",
+                     default="https://www.baidu.com/s?wd={keyword}", required=True
+                     ),
+            ParamDef(name="browser", editor=EDITOR_ENUM, default="默认",
+                     options=["默认", "Chrome", "Edge", "Firefox"],
+                     label="浏览器"
+                     ),
         ],
         qflow_name="web_browser",
     ),
     "HttpRequest": NodeMeta(
         type="HttpRequest",
         category=CATEGORY_APP,
-        title="HTTP请求",
-        description="【应用控制#5】网络接口调用：发送 GET/POST/PUT/DELETE/PATCH 请求到服务器，返回响应文本、JSON和状态码。URL/请求头/请求体均支持 {var} 插值；响应 JSON 自动拆成 web_ 前缀变量（可选）。",
+        title="网络请求",
+        description="调网络接口用哒~GET/POST/PUT/DELETE/PATCH/HEAD/OPTIONS 七种方法随便选，URL、请求头、请求体里都能塞变量，响应字典还能自动拆成 web_ 开头的变量直接用。",
         color="#1a237e",
         accent="#5c6bc0",
         inputs=[_exec_in()],
@@ -589,25 +688,26 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         params=[
             ParamDef(name="method", editor=EDITOR_ENUM, default="GET",
                      options=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"],
-                     label="请求方法"),
+                     label="方法"),
             ParamDef(name="url", editor=EDITOR_STRING, default="https://example.com/api?name={name}",
-                     label="URL（支持{var}）", required=True),
+                     label="URL", required=True,
+                     help="支持 {var} 插值"),
             ParamDef(name="headers_json", editor=EDITOR_MULTILINE,
                      default='{\n  "Authorization": "Bearer {token}",\n  "User-Agent": "BA/1.0"\n}',
-                     label="请求头(JSON，支持{var})",
-                     help='空=不自定义头；key=header名，value=header值（字符串）'),
+                     label="请求头",
+                     help='JSON 格式，支持 {var} 插值。空=不自定义头'),
             ParamDef(name="body_text", editor=EDITOR_MULTILINE,
                      default='{"key": "{var}", "num": 123}',
-                     label="请求体原文（支持{var}）",
-                     help='GET/HEAD 自动忽略；JSON/Form/XML 都可填，原样发送；空=不发请求体'),
+                     label="请求体",
+                     help='支持 {var} 插值。GET/HEAD 自动忽略；JSON/Form/XML 都可填，原样发送；空=不发请求体'),
             ParamDef(name="content_type", editor=EDITOR_STRING, default="",
-                     label="Content-Type（空则自动）",
-                     help='空=有请求体且未自定义Content-Type时自动填 application/json; charset=utf-8；填入任意字符串会覆盖为该值'),
+                     label="Content-Type",
+                     help='空=有请求体且未自定义时自动填 application/json; charset=utf-8'),
             ParamDef(name="timeout_ms", editor=EDITOR_INT, default=10000, min=500, max=300000,
                      label="超时(ms)"),
             ParamDef(name="save_json_to_vars", editor=EDITOR_BOOL, default=True,
-                     label="JSON自动拆成 web_ 变量",
-                     help='勾了后响应JSON若是字典，每个 key 自动塞到 ctx.variables["web_"+key]，后续节点直接 {web_user_id} 用'),
+                     label="JSON拆成变量",
+                     help='勾了后响应JSON若是字典，每个 key 自动塞到 ctx.variables["web_"+key]'),
         ],
         qflow_name="http_request",
     ),
@@ -615,8 +715,8 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
     "IfImageDetect": NodeMeta(
         type="IfImageDetect",
         category=CATEGORY_VISION,
-        title="检测（多图AND）",
-        description="检测一组参考图是否全部同时出现在当前屏幕/窗口中。全部存在走yes，缺任何一张走no。",
+        title="检测",
+        description="当下就检查好几张图是不是全都在屏幕上~全部都出现才算是，缺任何一张就走否，只判断一次不会等太久；还能选全求值打印每张分数方便调试。",
         color="#ef6c00",
         accent="#ff9800",
         inputs=[_exec_in()],
@@ -626,11 +726,20 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         ],
         params=[
             ParamDef(
-                name="images_json",
-                editor=EDITOR_STRING,
-                default="[]",
-                label="参考图列表(JSON数组)",
-                help='[{"b64":"...","w":100,"h":80},...] Inspector中提供可视化增删UI',
+                name="match_strategy",
+                editor=EDITOR_ENUM,
+                default="hybrid",
+                options=["hybrid", "template", "feature"],
+                option_labels={
+                    "hybrid": "混合匹配",
+                    "template": "模板匹配",
+                    "feature": "特征点匹配",
+                },
+                label="匹配算法",
+                help='各算法优缺点：\n'
+                     '● 混合匹配(hybrid)【推荐】：先用模板匹配快速初筛，不通过再试特征点。速度较快，兼顾准确性和抗形变能力，适合大多数场景。\n'
+                     '● 模板匹配(template)：直接做像素归一化相关。速度最快，像素级精度最高；但参考图和屏幕只要有缩放、旋转、轻微形变或压缩失真就会匹配失败。适合尺寸固定、画面清晰的UI按钮/图标。\n'
+                     '● 特征点匹配(feature)：提取SIFT/ORB局部特征点做匹配。抗缩放、旋转、部分遮挡和光照变化；但对于大面积纯色、缺少纹理的图片（如纯色方块）会找不到特征点而失败，速度也稍慢。',
             ),
             ParamDef(
                 name="threshold",
@@ -640,13 +749,27 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
                 min=0.3,
                 max=1.0,
                 step=0.01,
+                help="模板匹配/混合下的相关系数阈值；特征匹配下为内点比例阈值。越大越严格，越小越宽松。",
             ),
             ParamDef(
-                name="match_strategy",
+                name="eval_mode",
                 editor=EDITOR_ENUM,
-                default="hybrid",
-                options=["hybrid", "template", "feature"],
-                label="匹配算法",
+                default="complete",
+                options=["complete", "short_circuit"],
+                option_labels={
+                    "complete": "完全求值",
+                    "short_circuit": "短路模式",
+                },
+                label="求值模式",
+                help="完全求值=不管中间是否失败，都会检测所有参考图并在日志输出每张分数，便于调试；\n"
+                     "短路模式=从左到右依次检测，只要有一张不匹配就立刻返回no，省时间。",
+            ),
+            ParamDef(
+                name="images_json",
+                editor=EDITOR_STRING,
+                default="[]",
+                label="参考图列表(JSON数组)",
+                help='[{"b64":"...","w":100,"h":80},...] Inspector中提供可视化增删UI',
             ),
         ],
         qflow_name="if_img",
@@ -655,7 +778,7 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         type="StillnessDetect",
         category=CATEGORY_VISION,
         title="静止检测",
-        description="截取一个屏幕矩形ROI，等待该区域内画面静止（帧差<阈值）后走yes，超时走no。",
+        description="盯着屏幕上一块区域看~画面安安静静不变就走yes，等太久还在动就超时走no，用来等加载结束最合适啦。",
         color="#d84315",
         accent="#ff7043",
         inputs=[_exec_in()],
@@ -665,16 +788,46 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         ],
         params=[
             ParamDef(
+                name="stillness_seconds",
+                editor=EDITOR_FLOAT,
+                default=5.0,
+                min=0.1,
+                max=600.0,
+                step=0.1,
+                label="静止持续时间(秒)",
+                help="画面需要保持静止的最小时间，默认 5 秒",
+            ),
+            ParamDef(
+                name="timeout_seconds",
+                editor=EDITOR_FLOAT,
+                default=20.0,
+                min=1.0,
+                max=3600.0,
+                step=0.5,
+                label="最大超时(秒)",
+                help="最长等待时间，超过后走no分支，默认 20 秒",
+            ),
+            ParamDef(
+                name="sample_interval_seconds",
+                editor=EDITOR_FLOAT,
+                default=1.0,
+                min=0.03,
+                max=60.0,
+                step=0.1,
+                label="采样间隔(秒)",
+                help="多久采样一次屏幕做帧差比较，默认 1 秒",
+            ),
+            ParamDef(
                 name="roi",
                 editor=EDITOR_STRING,
                 default="[0,0,0,0]",
-                label="ROI矩形 [x,y,w,h]（点右侧按钮框选）",
+                label="静止检测ROI",
             ),
             ParamDef(
                 name="roi_preview_b64",
                 editor=EDITOR_STRING,
                 default="",
-                label="ROI缩略图（只读）",
+                label="ROI缩略图",
                 help="Inspector里点框选时写入b64",
             ),
             ParamDef(
@@ -684,32 +837,8 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
                 min=0.0,
                 max=0.5,
                 step=0.001,
-                label="帧差阈值（越小越严格）",
+                label="帧差阈值",
                 help="两帧ROI像素差低于该值视为静止",
-            ),
-            ParamDef(
-                name="stable_frames",
-                editor=EDITOR_INT,
-                default=3,
-                min=1,
-                max=60,
-                label="连续多少帧都满足才算静止",
-            ),
-            ParamDef(
-                name="sample_interval_ms",
-                editor=EDITOR_INT,
-                default=200,
-                min=30,
-                max=5000,
-                label="采样间隔(ms)",
-            ),
-            ParamDef(
-                name="timeout_ms",
-                editor=EDITOR_INT,
-                default=5000,
-                min=0,
-                max=300000,
-                label="超时(ms)",
             ),
         ],
         qflow_name="if_static",
@@ -718,34 +847,37 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         type="SoundDetect",
         category=CATEGORY_VISION,
         title="声音检测",
-        description="监听系统声音（默认扬声器环回），采集指定毫秒时长判断振幅/频谱是否超阈值。是则走yes，超时走no。",
+        description="竖起耳朵听声音~要么等提示音响起来就满足，要么等环境彻底安静下来才算数，等太久就超时走no哟。",
         color="#00838f",
         accent="#00acc1",
         inputs=[_exec_in()],
         outputs=[
-            _exec_out("yes", label="有声"),
-            _exec_out("no", label="无声/超时"),
+            _exec_out("yes", label="满足"),
+            _exec_out("no", label="超时/不满足"),
         ],
         params=[
             ParamDef(name="device", editor=EDITOR_STRING, default="default_loopback",
                      label="音频设备ID",
-                     help='default_loopback=当前默认扬声器（录系统自己播放的声音，对齐Qflow默认）；可点"🎧 枚举设备"按钮选择，或直接填麦克风设备名/ID'),
+                     help='default_loopback=当前默认扬声器（录制系统播放的声音）；可从下拉框直接选择扬声器环回或麦克风设备'),
+            ParamDef(
+                name="judge_mode", editor=EDITOR_ENUM, default="detect_sound",
+                options=["detect_sound", "detect_silence"],
+                option_labels={
+                    "detect_sound": "检测声音",
+                    "detect_silence": "检测静音",
+                },
+                label="判断模式",
+                help='检测声音：只要采样期间出现一次超阈值声音就判定满足（适合等提示音）；\n'
+                     '检测静音：采样期间全部低于阈值才判定满足（适合等环境安静下来）。',
+            ),
             ParamDef(name="sample_ms", editor=EDITOR_INT, default=500, min=50, max=10000,
-                     label="单次采样时长(ms)", help="越长越准，但单次检测越慢"),
+                     label="单次采样时长(ms)", help="越长越准，但单次检测越慢；「检测静音」建议设 500~2000ms"),
             ParamDef(name="threshold_db", editor=EDITOR_FLOAT, default=-30.0, min=-90.0, max=0.0, step=0.5,
                      label="振幅阈值(dBFS)", help="默认 -30dB≈人耳清晰可闻；调大(如-10)必须很响才算；调小(如-60)轻微响声也触发"),
-            ParamDef(name="judge_mode", editor=EDITOR_ENUM, default="amplitude_max",
-                     options=["amplitude_max", "amplitude_mean", "spectral_band"],
-                     label="判断模式",
-                     help="amplitude_max=采样期间最高振幅超阈值即算(最常用)；amplitude_mean=平均振幅超阈值(抗瞬时噪声)；spectral_band=指定频段能量超阈值(只检测某频率的提示音)"),
-            ParamDef(name="spectral_band_low_hz", editor=EDITOR_INT, default=500, min=20, max=20000,
-                     label="频段下限(Hz)"),
-            ParamDef(name="spectral_band_high_hz", editor=EDITOR_INT, default=2000, min=20, max=20000,
-                     label="频段上限(Hz)"),
-            ParamDef(name="timeout_ms", editor=EDITOR_INT, default=5000, min=0, max=300000,
-                     label="超时(ms)", help="0=永不超时(慎用)；默认5秒内没检测到超阈值就走no"),
+            ParamDef(name="timeout_seconds", editor=EDITOR_FLOAT, default=5.0, min=0.0, max=600.0, step=0.5,
+                     label="超时(秒)", help="0=永不超时(慎用)；默认5秒内一直不满足条件就走 no"),
             ParamDef(name="debug_visual", editor=EDITOR_BOOL, default=False,
-                     label="调试可视化(Log面板ASCII波形)",
+                     label="调试可视化",
                      help="仅debug时勾；会在日志用ASCII字符画绘制采样波形+阈值线"),
         ],
         qflow_name="if_sound",
@@ -785,6 +917,123 @@ for _ba_name, _meta in NODE_LIBRARY.items():
         QFLOW2BA.setdefault(_qn, _ba_name)
 
 
+def parse_varswitch_conditions(raw: str) -> List[Dict[str, Any]]:
+    """解析 VarSwitch（条件判断）AND 批量条件文本：
+    每行格式：变量名 运算符 值（空格可选，与 SetVariable 的 gg=1 一样紧凑写也合法）
+    支持运算符：==  !=  >  <  >=  <=
+    空行、以 # 或 // 开头的整行视为注释，跳过。
+    返回：[{"label": str(该条件可读文本), "var": str, "op": str, "value": Any, "raw_line": str, "line_no": int, "error": str}]
+    解析失败的行 error 非空。
+    """
+    import re
+    results: List[Dict[str, Any]] = []
+    if not raw or not isinstance(raw, str):
+        return results
+    # 整行正则：^\s* (合法变量名) \s* (双字符运算符优先 == != >= <= | 单字符 > <) \s* (值) \s*$
+    # 注意：运算符顺序必须双字符在前，否则 "==" 会被错拆成 "=" + "="
+    line_re = re.compile(
+        r'^\s*([A-Za-z_][A-Za-z0-9_]*)\s*(==|!=|>=|<=|>|<)\s*(.+?)\s*$',
+        re.DOTALL,
+    )
+    for idx, line in enumerate(raw.split("\n"), 1):
+        ln = line.rstrip()
+        s = ln.strip()
+        if not s or s.startswith("#") or s.startswith("//"):
+            continue
+        m = line_re.match(ln)
+        if not m:
+            # 给更精确的错误提示：判断是哪一部分缺失
+            head_re = re.compile(r'^\s*([A-Za-z_][A-Za-z0-9_]*)')
+            hm = head_re.match(ln)
+            if not hm:
+                results.append({
+                    "error": "条件开头不合法：变量名必须是字母/下划线开头，后接字母数字下划线",
+                    "raw_line": ln, "line_no": idx,
+                })
+                continue
+            var_part = hm.group(1)
+            tail = ln[hm.end():]
+            # 检查运算符
+            op_check = re.match(r'^\s*(==|!=|>=|<=|>|<)', tail)
+            if not op_check:
+                results.append({
+                    "error": f"缺少合法运算符（支持 == != > < >= <=），变量 '{var_part}' 后面内容为: '{tail.strip()[:20]}'",
+                    "raw_line": ln, "line_no": idx,
+                })
+                continue
+            op = op_check.group(1)
+            after_op = tail[op_check.end():]
+            if not after_op.strip():
+                results.append({
+                    "error": f"运算符 '{op}' 后面缺少比较值",
+                    "raw_line": ln, "line_no": idx,
+                })
+                continue
+            results.append({
+                "error": f"值部分不合法（字符串请加引号，数字直接写）: '{after_op.strip()[:30]}'",
+                "raw_line": ln, "line_no": idx,
+            })
+            continue
+        var_name = m.group(1)
+        op = m.group(2)
+        val_raw = m.group(3)
+        if not val_raw:
+            results.append({
+                "error": f"运算符 '{op}' 后面缺少比较值",
+                "raw_line": ln, "line_no": idx,
+            })
+            continue
+        parsed_val, val_err = _parse_condition_value(val_raw)
+        if val_err:
+            results.append({"error": val_err, "raw_line": ln, "line_no": idx})
+            continue
+        # label 用于显示：直接是完整的条件字符串（加空格美化）
+        label = f"{var_name} {op} {val_raw}"
+        results.append({
+            "label": label,
+            "var": var_name,
+            "op": op,
+            "value": parsed_val,
+            "value_raw": val_raw,
+            "raw_line": ln,
+            "line_no": idx,
+            "error": "",
+        })
+    return results
+
+
+def _parse_condition_value(s: str) -> Tuple[Any, str]:
+    """解析条件右边的值：字符串""或'' / 数字 / 布尔true/false / None / 含{}插值表达式（原样返回字符串，执行时再算）。"""
+    # 含 {} 插值或 ${} → 原样返回字符串，执行时再算
+    if "{" in s or "${" in s:
+        return s, ""
+    s2 = s.strip()
+    if (s2.startswith('"') and s2.endswith('"')) or (s2.startswith("'") and s2.endswith("'")):
+        if len(s2) < 2:
+            return None, "字符串引号不闭合"
+        return s2[1:-1], ""
+    if s2.lower() in ("true", "false"):
+        return s2.lower() == "true", ""
+    if s2.lower() in ("none", "null"):
+        return None, ""
+    # int
+    try:
+        if s2.startswith(("+", "-")) and s2[1:].isdigit():
+            return int(s2), ""
+        if s2.isdigit():
+            return int(s2), ""
+        if s2.lower().startswith("0x"):
+            return int(s2, 16), ""
+    except Exception:
+        pass
+    try:
+        if ("." in s2) or ("e" in s2.lower()):
+            return float(s2), ""
+    except Exception:
+        pass
+    return None, f"无法识别的值格式（字符串需加引号）：'{s2[:30]}'"
+
+
 def _resolve_output_ports_default(node_type: str, params: Optional[Dict[str, Any]] = None) -> List[Port]:
     """返回给定节点类型的默认输出端口列表（VarSwitch/Sequence后续动态扩展，当前先返回 NodeMeta.outputs 静态定义）。
 
@@ -794,32 +1043,20 @@ def _resolve_output_ports_default(node_type: str, params: Optional[Dict[str, Any
     if meta is None:
         return []
     params = params or {}
-    # -------- 动态端口节点的默认输出（后续P0-1-3/P1-4实现完会精细化）--------
+    # -------- 动态端口节点的默认输出 --------
     if node_type == "VarSwitch":
-        var_name = str(params.get("var_name", "") or "").strip()
-        if var_name:
-            names = ["yes", "no"]
-        else:
-            cases = params.get("cases", []) or []
-            case_ids = [str(c.get("id", "")).strip() for c in cases if str(c.get("id", "")).strip()]
-            names = case_ids + ["else"]
-        return [Port(name=n, type=PortType.EXEC, direction=PortDirection.OUT, label=n) for n in names]
+        # 条件判断：AND 语义，固定输出 yes（全满足）/ no（任一不满足）
+        return [
+            Port(name="yes", type=PortType.EXEC, direction=PortDirection.OUT, label="满足"),
+            Port(name="no", type=PortType.EXEC, direction=PortDirection.OUT, label="不满足"),
+        ]
     if node_type == "Sequence":
         n = max(1, int(params.get("num_paths", 3) or 3))
-        names = [str(i) for i in range(1, n + 1)] + ["else", "out_done"]
-        return [Port(name=x, type=PortType.EXEC, direction=PortDirection.OUT, label=x) for x in names]
-    # FindAnyImage 动态端口：out_found_0/1/... + out_not_found + 数据线输出（根据 templates 数量推算）
-    if node_type == "FindAnyImage":
-        raw = str(params.get("templates", "") or "")
-        parts = [p.strip() for p in raw.split(",") if p.strip()]
-        count = max(1, len(parts))
         outs: List[Port] = []
-        for i in range(count):
-            outs.append(_exec_out(f"out_found_{i}", label=f"#{i+1}"))
-        outs.append(_exec_out("out_not_found", label="都没找到"))
-        outs.append(_data_out("out_found_index", "int", label="命中序号"))
-        outs.append(_data_out("out_pos", "tuple2", label="命中位置"))
-        outs.append(_data_out("out_found", "bool", label="是否命中"))
+        for i in range(1, n + 1):
+            outs.append(Port(name=str(i), type=PortType.EXEC, direction=PortDirection.OUT, label=f"#{i}"))
+        outs.append(Port(name="else", type=PortType.EXEC, direction=PortDirection.OUT, label="失败"))
+        outs.append(Port(name="out_done", type=PortType.EXEC, direction=PortDirection.OUT, label="完成"))
         return outs
     # -------- 默认：返回 NodeMeta 静态 outputs --------
     return list(meta.outputs)

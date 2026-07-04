@@ -103,17 +103,35 @@ def _check_required_params(n: Node, issues: List[ValidationIssue]):
     if t == "FindImage":
         if not _not_empty(n.params.get("template")):
             issues.append(ValidationIssue("ERROR", "FIND_NO_TEMPLATE", "FindImage.template 不能为空（需要一个模板路径）。", n.id))
-    elif t == "FindAnyImage":
-        if not _not_empty(n.params.get("templates")):
-            issues.append(ValidationIssue("ERROR", "ANY_NO_TEMPLATES", f"{t}.templates 不能为空（逗号分隔多个模板）。", n.id))
     elif t == "PressKey":
-        if not _not_empty(n.params.get("key")):
-            issues.append(ValidationIssue("ERROR", "PRESS_NO_KEY", "PressKey.key 不能为空。", n.id))
+        kb_mode = str(n.params.get("kb_mode", "text") or "text")
+        if kb_mode == "text":
+            if not _not_empty(n.params.get("text")):
+                issues.append(ValidationIssue("WARN", "PRESS_NO_TEXT", "PressKey.text 为空（输入文本模式）。", n.id))
+        else:
+            if not _not_empty(n.params.get("key_name")):
+                issues.append(ValidationIssue("ERROR", "PRESS_NO_KEY", "PressKey.key_name 不能为空（按键组合模式）。", n.id))
     elif t == "SetVariable":
         has_batch = bool(str(n.params.get("batch_text", "") or "").strip())
-        has_legacy_name = bool(str(n.params.get("name", "") or "").strip())
-        if not has_batch and not has_legacy_name:
-            issues.append(ValidationIssue("WARN", "SET_EMPTY", "SetVariable 未设置任何变量：batch_text 与 name 均为空。", n.id))
+        if not has_batch:
+            issues.append(ValidationIssue("WARN", "SET_EMPTY", "SetVariable 未设置任何变量：batch_text 为空。", n.id))
+    elif t == "VarSwitch":
+        from ..core.node_library import parse_varswitch_conditions
+        raw = n.params.get("cases", "") or ""
+        if isinstance(raw, str) and raw.strip():
+            conds = parse_varswitch_conditions(raw)
+            valid = [c for c in conds if not c.get("error")]
+            errors = [c for c in conds if c.get("error")]
+            if not valid and errors:
+                head = "; ".join([f"第{c['line_no']}行:{c['error']}" for c in errors[:3]])
+                issues.append(ValidationIssue("ERROR", "VSWITCH_SYNTAX",
+                    f"VarSwitch 条件语法错误（{len(errors)}处）：{head}", n.id))
+            elif not valid:
+                issues.append(ValidationIssue("WARN", "VSWITCH_EMPTY",
+                    "VarSwitch 未识别到任何合法条件分支，运行时会直接走 else。", n.id))
+        elif not (isinstance(raw, list) and raw):
+            issues.append(ValidationIssue("WARN", "VSWITCH_EMPTY",
+                "VarSwitch 未设置任何条件，运行时会直接走 else。", n.id))
 
 
 def has_errors(issues: List[ValidationIssue]) -> bool:

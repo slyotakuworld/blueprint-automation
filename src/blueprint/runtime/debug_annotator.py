@@ -4,11 +4,11 @@ import time
 
 import cv2
 
-from ...config.app_paths import APP_DIR
+from ...config.app_paths import debug_dir
 
 
 def _safe_dirs(run_id: str) -> str:
-    out_dir = os.path.join(APP_DIR, "debug", "runs", run_id)
+    out_dir = os.path.join(debug_dir(), "runs", run_id)
     os.makedirs(out_dir, exist_ok=True)
     return out_dir
 

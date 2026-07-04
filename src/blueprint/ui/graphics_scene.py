@@ -171,12 +171,27 @@ class NodeScene(QGraphicsScene):
         self._node_items[node.id] = ni
         ni.node_position_changed.connect(lambda nid, p, s=self: s._on_node_moved(nid))
         ni.node_selected_changed.connect(self._on_node_sel)
-        for pi in ni.all_port_items():
-            pi.port_pressed.connect(self._on_port_pressed)
-            pi.port_right_clicked.connect(self._on_port_right_clicked)
+        # 给所有 PortItem 连接交互信号（端口拖动连线 + 右键菜单）
+        self._connect_port_signals_for_node(node.id)
         if emit:
             self.node_created.emit(node.id)
             self.graph_changed.emit()
+
+    def _connect_port_signals_for_node(self, node_id: str):
+        """给指定节点当前所有的 PortItem 连接交互信号。
+        注意：每次 sync_from_node 重建端口后，必须重新调用这个函数，否则新创建的 PortItem 是没有交互能力的，拖不出线、右键不出菜单、也进不了落点命中。"""
+        ni = self._node_items.get(node_id)
+        if ni is None:
+            return
+        for pi in ni.all_port_items():
+            try:
+                pi.port_pressed.connect(self._on_port_pressed)
+            except Exception:
+                pass
+            try:
+                pi.port_right_clicked.connect(self._on_port_right_clicked)
+            except Exception:
+                pass
 
     # ---------------- 右键端口：QMenu 上下文菜单（方案C） ----------------
     def disconnect_all_from_port(self, pi: PortItem) -> int:
@@ -350,7 +365,45 @@ class NodeScene(QGraphicsScene):
         self.edge_removed.emit(edge_id)
         self.graph_changed.emit()
 
+    def reconnect_node_edges(self, node_id: str) -> int:
+        """当某节点的 PortItem 被全量重建后（例如 sync_from_node），
+        ①把与该节点关联的所有 EdgeItem 重新挂到新的同名 PortItem 上并刷新路径；
+        ②重新给新建的 PortItem 连接交互信号（拖线/右键菜单）。
+        返回被成功重连的边数。"""
+        if self.graph is None or node_id not in self._node_items:
+            return 0
+        ni = self._node_items[node_id]
+        # 先连信号：新 PortItem 如果没连信号，哪怕线条重连对了也拖不出线、右键没菜单
+        self._connect_port_signals_for_node(node_id)
+        count = 0
+        for ei in self._edge_items.values():
+            if ei.edge is None:
+                continue
+            e = ei.edge
+            need_refresh = False
+            if e.from_node == node_id:
+                pi = ni.port_item(e.from_port)
+                if pi is not None:
+                    ei.set_from_port(pi)
+                    need_refresh = True
+            if e.to_node == node_id:
+                pi = ni.port_item(e.to_port)
+                if pi is not None:
+                    ei.set_to_port(pi)
+                    need_refresh = True
+            if need_refresh:
+                ei.update_path_from_ports()
+                count += 1
+        # 触发节点/场景刷新，保证线条位置立即更新
+        ni.update()
+        self.invalidate(self.sceneRect(), QGraphicsScene.ItemLayer | QGraphicsScene.ForegroundLayer)
+        return count
+
     def refresh_all_edges(self):
+        # 兜底：refresh 前先重连所有节点，避免某些节点重建端口后 EdgeItem 仍挂在旧 PortItem 上
+        if self.graph is not None:
+            for nid in list(self._node_items.keys()):
+                self.reconnect_node_edges(nid)
         for ei in self._edge_items.values():
             ei.update_path_from_ports()
 

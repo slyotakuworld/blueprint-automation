@@ -1,7 +1,7 @@
 from typing import Any, Optional, Tuple
 
 from PySide6.QtCore import QPoint, QRect, Qt
-from PySide6.QtGui import QColor, QFont, QPainter, QPen
+from PySide6.QtGui import QColor, QFont, QPainter, QPen, QPixmap
 
 from .fullscreen_overlay import FullscreenOverlayBase
 
@@ -97,13 +97,14 @@ class CoordOverlay(FullscreenOverlayBase):
         try:
             # 1. 默认半透明黑背景
             painter.fillRect(self.rect(), QColor(0, 0, 0, 77))
-            # 2. 绑定模式：画蓝色虚线窗口框 + 挖空该区域
+            # 2. 绑定模式：画蓝色虚线窗口框 + 低 alpha 覆盖（不挖空，避免鼠标穿透）
             if self.is_bound_mode:
                 r = self._bound_rect
-                # 挖空（让用户看清真实窗口）
-                painter.setCompositionMode(QPainter.CompositionMode_Clear)
-                painter.fillRect(r, Qt.transparent)
-                painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
+                # 注意：不能用 CompositionMode_Clear 挖空为完全透明！
+                # WA_TranslucentBackground 下 alpha=0 的区域会让鼠标事件穿透到下层窗口，
+                # 导致用户无法在绑定窗口区域内点击拾取。
+                # 改用极低 alpha（5/255 ≈ 2%）覆盖：视觉上几乎透明能看清窗口，但鼠标不穿透。
+                painter.fillRect(r, QColor(0, 0, 0, 5))
                 # 蓝色虚线 3px
                 pen = QPen(QColor(33, 150, 243), 3, Qt.DashLine)
                 pen.setDashPattern([4, 4])
@@ -183,3 +184,135 @@ class CoordOverlay(FullscreenOverlayBase):
         painter.fillRect(bx, by, tw + pad * 2, th + pad * 2, QColor(0, 0, 0, 210))
         painter.setPen(color)
         painter.drawText(bx + pad, by + pad + fm.ascent(), text)
+
+
+class VisualOffsetOverlay(FullscreenOverlayBase):
+    """视觉偏移拾取全屏遮罩（对齐 Qflow open_visual_offset_picker）。
+
+    显示截屏背景 + 模板匹配位置标记（绿色框 + 红色十字中心），
+    鼠标移动时实时显示 offset = (鼠标位置 - 模板中心)，
+    左键确认保存 offset，右键/ESC 取消。
+
+    Args:
+        screenshot: 全屏截图 QPixmap
+        template_rect: 模板在屏幕上的匹配位置 QRect(left, top, w, h)
+    """
+
+    def __init__(
+        self,
+        screenshot: QPixmap,
+        template_rect: QRect,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self._screenshot = screenshot
+        self._template_rect = template_rect
+        self._hover_pos: Optional[QPoint] = None
+        # 模板中心点
+        self._cx = template_rect.left() + template_rect.width() // 2
+        self._cy = template_rect.top() + template_rect.height() // 2
+
+    def mouseMoveEvent(self, event):
+        self._hover_pos = event.pos()
+        self.update()
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.LeftButton:
+            if event.button() == Qt.RightButton:
+                self.finished.emit(None)
+                self._restore_app_window()
+            return
+        # offset = 点击位置 - 模板中心
+        ox = event.pos().x() - self._cx
+        oy = event.pos().y() - self._cy
+        self.finished.emit((ox, oy))
+        self._restore_app_window()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        try:
+            # 1. 画截屏背景
+            painter.drawPixmap(0, 0, self._screenshot)
+
+            # 2. 模板位置标记：绿色框 3px
+            r = self._template_rect
+            pen = QPen(QColor(0, 255, 0), 3)
+            painter.setPen(pen)
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRect(r)
+
+            # 红色十字中心
+            pen = QPen(QColor(255, 0, 0), 2)
+            painter.setPen(pen)
+            cx, cy = self._cx, self._cy
+            painter.drawLine(cx - 15, cy, cx + 15, cy)
+            painter.drawLine(cx, cy - 15, cx, cy + 15)
+
+            # 模板中心标签
+            painter.setPen(QColor(0, 255, 0))
+            font_lbl = QFont("Microsoft YaHei", 9)
+            painter.setFont(font_lbl)
+            painter.drawText(cx + 18, cy - 8, "模板中心(基准)")
+
+            # 3. 鼠标移动时画蓝色虚线 + offset 实时显示
+            if self._hover_pos is not None:
+                px = self._hover_pos.x()
+                py = self._hover_pos.y()
+                ox = px - self._cx
+                oy = py - self._cy
+
+                # 蓝色虚线从模板中心到鼠标
+                pen = QPen(QColor(33, 150, 243), 2, Qt.DashLine)
+                pen.setDashPattern([6, 4])
+                painter.setPen(pen)
+                painter.drawLine(self._cx, self._cy, px, py)
+
+                # 鼠标位置十字标记
+                pen = QPen(QColor(33, 150, 243), 2)
+                painter.setPen(pen)
+                painter.drawLine(px - 12, py, px + 12, py)
+                painter.drawLine(px, py - 12, px, py + 12)
+
+                # offset 文本气泡
+                offset_txt = f"Offset: ({ox:+d}, {oy:+d})"
+                painter.setPen(QColor(255, 255, 255))
+                font = QFont("Consolas", 12, QFont.Bold)
+                painter.setFont(font)
+                fm = painter.fontMetrics()
+                tw = fm.horizontalAdvance(offset_txt)
+                th = fm.height()
+                pad = 8
+                bx = px + 20
+                by = py + 20
+                if bx + tw + pad * 2 > self.width():
+                    bx = px - tw - pad * 2 - 20
+                if by + th + pad > self.height():
+                    by = py - th - pad - 20
+                painter.fillRect(bx, by, tw + pad * 2, th + pad, QColor(0, 0, 0, 220))
+                painter.setPen(QColor(33, 150, 243))
+                painter.drawText(bx + pad, by + pad + fm.ascent(), offset_txt)
+
+            # 4. 顶部提示
+            painter.setPen(QColor(255, 255, 255))
+            font = QFont("Microsoft YaHei", 14, QFont.Bold)
+            painter.setFont(font)
+            tip_top = "[偏移拾取] 点击目标位置 → 自动计算相对模板中心的偏移量"
+            fm = painter.fontMetrics()
+            tw = fm.horizontalAdvance(tip_top)
+            tx = (self.width() - tw) // 2
+            painter.fillRect(tx - 20, 20, tw + 40, 36, QColor(0, 0, 0, 200))
+            painter.drawText(tx, 44, tip_top)
+
+            # 5. 底部操作提示
+            painter.setPen(QColor(255, 255, 255))
+            font = QFont("Microsoft YaHei", 11)
+            painter.setFont(font)
+            tip = "左键确认偏移  |  绿色框=模板位置  红色十字=模板中心(基准)  |  ESC/右键取消"
+            fm = painter.fontMetrics()
+            tw = fm.horizontalAdvance(tip)
+            tx = (self.width() - tw) // 2
+            ty = self.height() - 30
+            painter.fillRect(tx - 20, ty - 10, tw + 40, 30, QColor(0, 0, 0, 180))
+            painter.drawText(tx, ty + 10, tip)
+        finally:
+            painter.end()

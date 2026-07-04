@@ -64,7 +64,7 @@ class NodePalette(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumWidth(220)
-        self.setMaximumWidth(320)
+        self.setMaximumWidth(220)
         self._build_ui()
 
     def _build_ui(self):

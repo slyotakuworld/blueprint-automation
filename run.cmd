@@ -4,6 +4,9 @@ REM Blueprint Automation - Launch script
 REM Priority: .venv\Scripts\python.exe, else PATH python
 REM ------------------------------------------------------------
 
+REM Force UTF-8 code page to avoid garbled Chinese characters
+chcp 65001 >nul 2>&1
+
 setlocal EnableExtensions
 set "SCRIPT_DIR=%~dp0"
 cd /d "%SCRIPT_DIR%"
@@ -25,6 +28,17 @@ if exist ".venv\Scripts\python.exe" (
         pause
         exit /b 1
     )
+)
+
+REM ------------------------------------------------------------
+REM Auto install missing dependencies from requirements.txt
+REM   - Already-satisfied packages are skipped automatically
+REM ------------------------------------------------------------
+echo [BOOT] Checking dependencies (requirements.txt) ...
+"%PYTHON%" -m pip install -r requirements.txt --quiet
+if not "%ERRORLEVEL%"=="0" (
+    echo [WARN] pip install exited with code %ERRORLEVEL%, some dependencies may be missing.
+    echo        Try manually: "%PYTHON%" -m pip install -r requirements.txt
 )
 
 echo.

@@ -485,7 +485,7 @@ class BlueprintMainWindow(QMainWindow):
             "QDockWidget::close-button, QDockWidget::float-button { background: transparent; padding: 2px; }"
         )
 
-        # 左：📚节点库（和Qflow toolbox对等，240宽+最小160）
+        # 左：📚节点库（固定最小宽度220，不可调节宽度）
         self._palette = NodePalette()
         dock_left = QDockWidget("📚 节点库", self)
         dock_left.setObjectName("dockPalette")
@@ -493,17 +493,14 @@ class BlueprintMainWindow(QMainWindow):
         dock_left.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
         # 只允许移动停靠位置，禁止关闭&禁止单独浮窗（防止用户误关后显示不出来）
         dock_left.setFeatures(QDockWidget.DockWidgetMovable)
-        dock_left.setMinimumWidth(180)
+        dock_left.setMinimumWidth(220)
+        dock_left.setMaximumWidth(220)
         self.addDockWidget(Qt.LeftDockWidgetArea, dock_left)
-        try:
-            self.resizeDocks([dock_left], [260], Qt.Horizontal)
-        except Exception:
-            pass
         dock_left.setStyleSheet(_dock_stylesheet)
         dock_left.show()
         self._dock_palette = dock_left
 
-        # 右：🎛 属性面板（和Qflow PropertyPanel对等，340宽+最小280）
+        # 右：🎛 属性面板（固定最大宽度460，不可调节宽度）
         self._inspector = InspectorPanel()
         dock_right = QDockWidget("🎛 属性面板", self)
         dock_right.setObjectName("dockInspector")
@@ -511,12 +508,9 @@ class BlueprintMainWindow(QMainWindow):
         dock_right.setAllowedAreas(Qt.RightDockWidgetArea | Qt.LeftDockWidgetArea)
         # 只允许移动停靠位置，禁止关闭&禁止单独浮窗
         dock_right.setFeatures(QDockWidget.DockWidgetMovable)
-        dock_right.setMinimumWidth(300)
+        dock_right.setMinimumWidth(460)
+        dock_right.setMaximumWidth(460)
         self.addDockWidget(Qt.RightDockWidgetArea, dock_right)
-        try:
-            self.resizeDocks([dock_right], [360], Qt.Horizontal)
-        except Exception:
-            pass
         dock_right.setStyleSheet(_dock_stylesheet)
         dock_right.show()
         self._dock_inspector = dock_right
@@ -716,8 +710,9 @@ class BlueprintMainWindow(QMainWindow):
         tb.addWidget(target_hint)
 
         self._target_combo = NoWheelComboBox()
-        self._target_combo.setMinimumWidth(360)
-        self._target_combo.setStyleSheet("QComboBox { background:#161B22; color:#C9D1D9; padding:3px 8px; border:1px solid #30363D; border-radius:4px; } QComboBox:hover { border-color:#484F58; } QComboBox::drop-down { border:none; width:20px; }")
+        self._target_combo.setMinimumWidth(280)
+        self._target_combo.setMaximumWidth(280)
+        self._target_combo.setStyleSheet("QComboBox { background:#161B22; color:#C9D1D9; padding:3px 8px; border:1px solid #30363D; border-radius:4px; } QComboBox:hover { border-color:#484F58; } QComboBox::drop-down { border:none; width:20px; } QComboBox QAbstractItemView { min-width: 480px; }")
         self._target_combo.currentIndexChanged.connect(self._on_target_window_changed)
         tb.addWidget(self._target_combo)
 
@@ -981,6 +976,7 @@ class BlueprintMainWindow(QMainWindow):
         self._inspector.request_fill_from_main_target.connect(self._on_fill_target_from_main)
         self._inspector.request_launch_exe_for_node.connect(self._on_launch_exe_for_node)
         self._inspector.request_snip_for_node.connect(self._on_snip_for_node)
+        self._inspector.request_pick_coord.connect(self._on_pick_coord)
         self._palette.info_message.connect(lambda m, l: self._log.append_log(m, l))
         # 注意：全局热键已由 GlobalHotkeyManager.set_callback 直接绑定到主线程 QTimer.singleShot，
         # 无需额外 bridge.connect
@@ -1391,41 +1387,120 @@ class BlueprintMainWindow(QMainWindow):
     def _on_param_changed(self, node_id: str, param_name: str, value):
         if self._graph is None or node_id not in self._graph.nodes:
             return
+        # ================================================================
+        # 变更入栈：Inspector 参数修改 → Ctrl+Z / Ctrl+Y 可撤销重做
+        # ================================================================
+        # 值相等的情况不做任何事（避免 textChanged 高频刷栈或递归入栈）
+        # 这里用「字符串 repr 比较」做浅比较，兼容 dict/list 这类 Python 可变对象
+        applying_undo = bool(getattr(self, "_applying_undo_redo", False))
+        cur = self._graph.nodes[node_id].params.get(param_name, None)
+        def _param_eq(a, b):
+            try:
+                return a == b
+            except Exception:
+                return repr(a) == repr(b)
+        same = _param_eq(cur, value)
+        if not applying_undo and not same:
+            import time
+            ts = time.time()
+            MERGE_WINDOW_SEC = 2.0
+            # 先深拷贝一份快照，避免用户继续编辑同一个 list/dict 时把 undo/redo 里的值给改掉
+            import copy as _copy
+            try:
+                old_snap = _copy.deepcopy(cur)
+                new_snap = _copy.deepcopy(value)
+            except Exception:
+                old_snap = cur
+                new_snap = value
+            # 合并窗口内：同一 (node_id, param_name) 的连续编辑 → 只保留一条（合并 new_value）
+            merged = False
+            if self._undo_stack:
+                top = self._undo_stack[-1]
+                if isinstance(top, dict) and top.get("kind") == "change_param" and \
+                   top.get("node_id") == node_id and top.get("param_name") == param_name and \
+                   (ts - float(top.get("ts", 0.0))) < MERGE_WINDOW_SEC:
+                    top["new_value"] = new_snap
+                    top["ts"] = ts
+                    merged = True
+            if not merged:
+                self._undo_stack.append({
+                    "kind": "change_param",
+                    "node_id": node_id,
+                    "param_name": param_name,
+                    "old_value": old_snap,
+                    "new_value": new_snap,
+                    "ts": ts,
+                })
+                # 有新的入栈 → 清空 redo 栈（标准编辑器行为：新操作会截断 redo 历史）
+                try:
+                    self._redo_stack.clear()
+                except Exception:
+                    pass
+        # ================================================================
+        # 实际应用修改
+        # ================================================================
         node = self._graph.nodes[node_id]
         node.params[param_name] = value
         ni = self._scene.node_item(node_id)
         if ni is not None:
-            # 额外名称 / 任何参数变化 → 强制节点卡重绘（刷新标题三段式显示）
-            ni.update()
-            # 动态端口节点（FindAnyImage / VarSwitch / Sequence）：关键参数变化时，重建端口集
+            # 动态端口节点（仅 Sequence，它端口数会变）：关键参数变化时，重建端口集
+            # 注意：VarSwitch 现在 has_dynamic_ports=False，yes/no 端口固定，不能进这里！
+            #       否则每次打字 set_node 会把正在发 textChanged 信号的 QPlainTextEdit 删掉，
+            #       导致 0xC0000005 ACCESS_VIOLATION 闪退。
             try:
-                if node.type in ("FindAnyImage", "VarSwitch", "Sequence") and param_name in (
-                    "templates", "num_paths", "cases", "var_name", "var_expr"
+                if node.type in ("Sequence",) and param_name in (
+                    "num_paths"
                 ):
-                    from src.blueprint.core.node_library import (
-                        _resolve_input_ports_default,
-                        _resolve_output_ports_default,
-                    )
+                    from src.blueprint.core.node_library import _resolve_output_ports_default
                     p = dict(node.params or {})
-                    new_in = _resolve_input_ports_default(node.type, p)
                     new_out = _resolve_output_ports_default(node.type, p)
-                    cur_in_names = [p.name for p in node.inputs]
-                    cur_out_names = [p.name for p in node.outputs]
-                    new_in_names = [p.name for p in new_in]
-                    new_out_names = [p.name for p in new_out]
-                    if cur_in_names != new_in_names or cur_out_names != new_out_names:
-                        node.inputs = list(new_in)
+                    cur_out_names = [pp.name for pp in node.outputs]
+                    new_out_names = [pp.name for pp in new_out]
+                    if cur_out_names != new_out_names:
+                        # Sequence：端口增减前，先删除「被移除端口」上的关联边
+                        # 注意：Edge 的字段名是 from_node/from_port/to_node/to_port，不要写成 target_* 或 source_*
+                        removed_out_set = set(cur_out_names) - set(new_out_names)
+                        removed_in_set = set()
+                        # 目前只有输出端口会变（输入端口保持不变），输入兼容判断只是兜底
+                        new_in_names = [pp.name for pp in _resolve_output_ports_default
+                                        and []]  # placeholder，实际输入没变化
+                        if removed_out_set or removed_in_set:
+                            edges_to_remove = []
+                            for edge in list(self._graph.edges.values()):
+                                if (edge.to_node == node_id and edge.to_port in removed_in_set) or \
+                                   (edge.from_node == node_id and edge.from_port in removed_out_set):
+                                    edges_to_remove.append(edge.id)
+                            for eid in edges_to_remove:
+                                if self._scene is not None:
+                                    self._scene.remove_edge(eid, _emit_will=False)
                         node.outputs = list(new_out)
+                        # 重建 PortItem（会全删旧的、新建同名的）
                         ni.sync_from_node()
-                        # 端口变了 → 重新 set_node 刷新 inspector 的"当前输出端口列表"Label
+                        # 重建后：所有关联的 EdgeItem 的 _from_port/_to_port 还指向旧的已删除 PortItem
+                        # 必须按端口名重新挂到新 PortItem，并刷新路径，否则看起来就像"保留连线反而断了找不到端口"
+                        if self._scene is not None:
+                            self._scene.reconnect_node_edges(node_id)
+                        # 端口变了 → 延迟刷新 inspector（必须退出当前信号栈再重建 UI，防止 sender 控件被中途删除闪退）
                         if (
                             getattr(self, "_inspector", None) is not None
                             and self._inspector._current_node is not None
                             and self._inspector._current_node.id == node.id
                         ):
-                            self._inspector.set_node(node)
-            except Exception:
-                pass
+                            nid_refresh = node.id
+                            def _deferred_setnode(nid=nid_refresh):
+                                try:
+                                    if self._graph and nid in self._graph.nodes and \
+                                       self._inspector._current_node and \
+                                       self._inspector._current_node.id == nid:
+                                        self._inspector.set_node(self._graph.nodes[nid])
+                                except Exception as e:
+                                    print(f"[WARN] _deferred_setnode 异常: {e}")
+                            QTimer.singleShot(0, _deferred_setnode)
+            except Exception as e:
+                print(f"[WARN] _on_param_changed 端口刷新异常: {e}")
+                import traceback; traceback.print_exc()
+            # 任何参数变化 → 强制节点卡重绘（刷新标题三段式显示 + 摘要文本）
+            ni.update()
         self._scene.graph_changed.emit()
 
     def _on_pick_template(self, node_id: str, param_name: str):
@@ -1468,6 +1543,7 @@ class BlueprintMainWindow(QMainWindow):
             "if_img_add",           # IfImageDetect 追加一张
             "if_img_replace_<idx>", # IfImageDetect 替换第 idx 张
             "if_static_roi",        # StillnessDetect 框选 ROI
+            "findimg_target",       # FindImage 截取目标（保存PNG到templates）
         }
         """
         if not self._graph or node_id not in self._graph.nodes:
@@ -1504,11 +1580,17 @@ class BlueprintMainWindow(QMainWindow):
                 node = self._graph.nodes.get(nid)
                 if node is None:
                     return
-                # --- 转 b64 ---
+                # --- 转 b64（先压缩成缩略图，避免b64过大导致UI卡顿）---
                 try:
                     import base64, io
+                    # 原图保存用于 FindImage 模板实际匹配；预览 b64 用缩略图
+                    preview_pil = pil.copy()
+                    try:
+                        preview_pil.thumbnail((220, 220))
+                    except Exception:
+                        pass
                     buf = io.BytesIO()
-                    pil.save(buf, format="PNG")
+                    preview_pil.save(buf, format="PNG")
                     b64 = base64.b64encode(buf.getvalue()).decode("ascii")
                 except Exception as e:
                     self._log.append_log(f"[Snip] b64编码失败: {e}", "ERROR")
@@ -1522,6 +1604,35 @@ class BlueprintMainWindow(QMainWindow):
                     )
                     self._inspector.set_node(node)
                     return
+                # FindImage：findimg_target - 保存PNG到templates，回填template路径 + b64预览
+                if m == "findimg_target":
+                    try:
+                        import uuid
+                        # templates 目录：工程根/templates （不存在则创建）
+                        proj_root = os.path.abspath(os.path.join(os.path.dirname(__file__)))
+                        tpl_dir = os.path.join(proj_root, "templates")
+                        os.makedirs(tpl_dir, exist_ok=True)
+                        fname = f"findimg_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}.png"
+                        fpath = os.path.join(tpl_dir, fname)
+                        pil.save(fpath, format="PNG")
+                        # 同时写入PIL runtime_attrs缓存
+                        try:
+                            if not hasattr(node, "runtime_attrs") or node.runtime_attrs is None:
+                                node.runtime_attrs = {}
+                            node.runtime_attrs["_pil_template"] = pil.copy()
+                        except Exception:
+                            pass
+                        self._on_param_changed(nid, "template", fpath)
+                        self._on_param_changed(nid, "template_b64", b64)
+                        self._log.append_log(
+                            f"[FindImage] 截取目标完成: {w}×{h} 已保存到 {fpath}", "SUCCESS"
+                        )
+                        self._inspector.set_node(node)
+                    except Exception as e_fe:
+                        self._log.append_log(f"[FindImage] 保存模板失败: {e_fe}", "ERROR")
+                        traceback.print_exc()
+                    return
+                # FindImage：findimg_target 已在上面处理；不再支持 findimg_region（搜索区域功能已移除）
                 # IfImageDetect：if_img_add / if_img_replace_<N>
                 import uuid
                 raw = node.params.get("images_json", "[]")
@@ -1571,6 +1682,236 @@ class BlueprintMainWindow(QMainWindow):
         except Exception as e:
             self._log.append_log(f"[Snip] 启动失败: {e}", "ERROR")
             traceback.print_exc()
+
+    # ---------- Mouse 点属性 📍 坐标拾取 ----------
+    def _on_pick_coord(self, node_id: str, param_name: str):
+        """启动 CoordOverlay 全屏遮罩拾取坐标，根据节点 coord_mode 决定保存相对/绝对坐标。"""
+        if not self._graph or node_id not in self._graph.nodes:
+            return
+        node = self._graph.nodes[node_id]
+
+        # FindImage 的 offset 参数：走视觉偏移拾取（以模板中心为基准），不走 CoordOverlay
+        if node.type == "FindImage" and param_name == "offset":
+            self._start_findimg_offset_pick(node_id)
+            return
+
+        coord_mode = str(node.params.get("coord_mode", "relative") or "relative")
+
+        # 尝试获取当前绑定窗口 hwnd + rect（用于相对坐标模式）
+        hwnd = self.get_active_hwnd()
+        window_rect = None
+        exe_name = ""
+        if hwnd:
+            try:
+                import win32gui
+                l, t, r, b = win32gui.GetWindowRect(hwnd)
+                window_rect = (int(l), int(t), int(r - l), int(b - t))
+                try:
+                    from src.tools.window_utils import get_exe_name_by_hwnd
+                    exe_name = get_exe_name_by_hwnd(hwnd) or ""
+                except Exception:
+                    pass
+            except Exception:
+                hwnd = None
+
+        # 若 coord_mode=absolute，强制不传 hwnd（让 overlay 走绝对模式）
+        if coord_mode == "absolute":
+            hwnd = None
+            window_rect = None
+
+        try:
+            from src.blueprint.ui.coord_overlay import CoordOverlay
+        except Exception as e:
+            self._log.append_log(f"CoordOverlay 加载失败: {e}", "ERROR")
+            return
+
+        self._log.append_log(
+            f"[📍] 坐标拾取启动（{ '相对绑定窗口' if hwnd else '绝对屏幕坐标'}模式），请在屏幕上点击目标位置...",
+            "INFO",
+        )
+
+        try:
+            overlay = CoordOverlay.prepare_and_run(
+                self,
+                hwnd=hwnd,
+                window_rect=window_rect,
+                exe_name=exe_name,
+                delay_ms=300,
+            )
+            overlay.finished.connect(
+                lambda result, nid=node_id, pn=param_name, cm=coord_mode: self._on_coord_picked(nid, pn, cm, result)
+            )
+        except Exception as e:
+            self._log.append_log(f"[📍] CoordOverlay 启动失败: {e}", "ERROR")
+            traceback.print_exc()
+
+    def _on_coord_picked(self, node_id: str, param_name: str, coord_mode: str, result):
+        """CoordOverlay 拾取完成回调：根据 coord_mode 保存 rel 或 abs 坐标。"""
+        try:
+            self.show()
+            self.raise_()
+            self.activateWindow()
+        except Exception:
+            pass
+        if result is None:
+            self._log.append_log("[📍] 坐标拾取已取消", "INFO")
+            return
+        # result 包含 abs 和 rel 两个坐标
+        # coord_mode=relative 且有绑定窗口 → 保存 rel；否则保存 abs
+        if coord_mode == "relative" and result.get("mode") == "bound":
+            x, y = result.get("rel", (0, 0))
+            self._log.append_log(
+                f"[📍] 拾取完成：相对坐标 ({x}, {y})  [绝对: {result.get('abs')}]",
+                "SUCCESS",
+            )
+        else:
+            x, y = result.get("abs", (0, 0))
+            self._log.append_log(
+                f"[📍] 拾取完成：绝对坐标 ({x}, {y})", "SUCCESS",
+            )
+        # 写入 tuple 参数
+        self._on_param_changed(node_id, param_name, (int(x), int(y)))
+        # 刷新 inspector
+        if self._graph and node_id in self._graph.nodes:
+            self._inspector.set_node(self._graph.nodes[node_id])
+
+    # ---------- FindImage 偏移视觉拾取（以模板中心为基准） ----------
+    def _start_findimg_offset_pick(self, node_id: str):
+        """找图节点 offset 偏移视觉拾取（对齐 Qflow open_visual_offset_picker）：
+        隐藏主窗口 → 截全屏 → 用模板做一次匹配 → 显示截图+模板标记 →
+        用户点目标位置 → 计算 offset = 目标点 - 模板中心 → 写入 offset 参数
+        """
+        if not self._graph or node_id not in self._graph.nodes:
+            return
+        node = self._graph.nodes[node_id]
+
+        # 1) 获取模板 PIL Image
+        tpl_b64 = str(node.params.get("template_b64", "") or "")
+        tpl_path = str(node.params.get("template", "") or "")
+        tpl_pil = None
+        if tpl_b64:
+            try:
+                import base64 as _b64, io as _io
+                from PIL import Image as _PILImg
+                tpl_pil = _PILImg.open(_io.BytesIO(_b64.b64decode(tpl_b64)))
+            except Exception:
+                tpl_pil = None
+        if tpl_pil is None and tpl_path and os.path.exists(tpl_path):
+            try:
+                from PIL import Image as _PILImg
+                tpl_pil = _PILImg.open(tpl_path)
+            except Exception:
+                tpl_pil = None
+        if tpl_pil is None:
+            QMessageBox.information(self, "提示", "还没有模板图片，请先点「📸 截取目标」或「📂 导入图片」设置模板。")
+            return
+
+        # 2) 隐藏主窗口 → 截全屏
+        self._log.append_log("[📍偏移拾取] 正在截取屏幕并匹配模板...", "INFO")
+        self.hide()
+        from PySide6.QtCore import QCoreApplication
+        for _ in range(5):
+            QCoreApplication.processEvents()
+        import time as _t
+        _t.sleep(0.3)
+
+        screen_pil = None
+        try:
+            from PIL import ImageGrab
+            screen_pil = ImageGrab.grab(all_screens=True)
+        except Exception as e:
+            self.show()
+            QMessageBox.warning(self, "截图失败", f"截屏失败: {e}")
+            return
+
+        # 3) 用 OpenCV matchTemplate 在截屏上定位模板
+        template_rect = None  # (left, top, w, h)
+        try:
+            import cv2
+            import numpy as np
+            screen_cv = cv2.cvtColor(np.array(screen_pil), cv2.COLOR_RGB2BGR)
+            tpl_cv = cv2.cvtColor(np.array(tpl_pil), cv2.COLOR_RGB2BGR)
+            # 模板不能大于截图
+            th, tw = tpl_cv.shape[:2]
+            sh, sw = screen_cv.shape[:2]
+            if th > sh or tw > sw:
+                raise ValueError("模板比屏幕大")
+            result = cv2.matchTemplate(screen_cv, tpl_cv, cv2.TM_CCOEFF_NORMED)
+            _, max_val, _, max_loc = cv2.minMaxLoc(result)
+            if max_val >= 0.7:
+                template_rect = (int(max_loc[0]), int(max_loc[1]), int(tw), int(th))
+                self._log.append_log(
+                    f"[📍偏移拾取] 模板匹配成功: 位置=({template_rect[0]},{template_rect[1]}) "
+                    f"尺寸={template_rect[2]}×{template_rect[3]} 匹配度={max_val:.2f}",
+                    "SUCCESS",
+                )
+        except Exception as e:
+            self._log.append_log(f"[📍偏移拾取] 模板匹配失败: {e}", "WARN")
+
+        if template_rect is None:
+            self.show()
+            QMessageBox.information(
+                self,
+                "未找到模板",
+                "在当前屏幕上未找到模板图像（匹配度 < 0.7），无法进行偏移拾取。\n"
+                "请确保：\n"
+                "1. 模板图片在当前屏幕上可见\n"
+                "2. 蓝图工具已最小化，未遮挡目标画面\n"
+                "3. 模板图片清晰且有明显特征",
+            )
+            return
+
+        # 4) 将 screen_pil → QPixmap
+        try:
+            from PySide6.QtGui import QImage
+            if screen_pil.mode != "RGBA":
+                screen_pil = screen_pil.convert("RGBA")
+            data = screen_pil.tobytes("raw", "RGBA")
+            qimg = QImage(data, screen_pil.width, screen_pil.height,
+                          screen_pil.width * 4, QImage.Format_RGBA8888)
+            screenshot_pix = QPixmap.fromImage(qimg)
+        except Exception as e:
+            self.show()
+            QMessageBox.warning(self, "图像转换失败", f"截屏转 QPixmap 失败: {e}")
+            return
+
+        # 5) 启动 VisualOffsetOverlay
+        from PySide6.QtCore import QRect
+        from src.blueprint.ui.coord_overlay import VisualOffsetOverlay
+        l, t, w, h = template_rect
+        tpl_qrect = QRect(l, t, w, h)
+
+        self._log.append_log("[📍偏移拾取] 请在屏幕上点击目标位置（offset = 目标点 - 模板中心）", "INFO")
+
+        overlay = VisualOffsetOverlay.prepare_and_run(
+            self,
+            screenshot=screenshot_pix,
+            template_rect=tpl_qrect,
+            delay_ms=100,
+        )
+        overlay.finished.connect(
+            lambda result, nid=node_id: self._on_findimg_offset_picked(nid, result)
+        )
+
+    def _on_findimg_offset_picked(self, node_id: str, result):
+        """VisualOffsetOverlay 拾取完成回调：result = (offset_x, offset_y) 或 None"""
+        try:
+            self.show()
+            self.raise_()
+            self.activateWindow()
+        except Exception:
+            pass
+        if result is None:
+            self._log.append_log("[📍偏移拾取] 已取消", "INFO")
+            return
+        ox, oy = int(result[0]), int(result[1])
+        self._on_param_changed(node_id, "offset", (ox, oy))
+        self._log.append_log(
+            f"[📍偏移拾取] 完成：offset = ({ox:+d}, {oy:+d})  [相对模板中心]",
+            "SUCCESS",
+        )
+        if self._graph and node_id in self._graph.nodes:
+            self._inspector.set_node(self._graph.nodes[node_id])
 
     # ---------- TargetSetup 快捷填充（Inspector面板动作条） ----------
     def _on_fill_target_from_main(self, node_id: str):
@@ -2112,6 +2453,25 @@ class BlueprintMainWindow(QMainWindow):
                         removed += 1
                 self._redo_stack.append(action)
                 self._log.append_log(f"[撤销] 撤销新增连线：删除 {removed} 条（Ctrl+Y 重做）", "INFO")
+            elif kind == "change_param":
+                # 撤销"参数修改"：恢复 old_value
+                nid = action.get("node_id")
+                pname = action.get("param_name")
+                old_v = action.get("old_value")
+                if nid and (self._graph is None or nid not in self._graph.nodes):
+                    # 节点不存在了（比如之后被删除）→ 把 action 塞回栈，提示不支持
+                    self._undo_stack.append(action)
+                    self._log.append_log(f"[撤销] 节点 {nid} 已不存在，无法撤销它的参数 {pname}", "WARN")
+                    return
+                # 应用 old_value：走 _on_param_changed 全流程（端口重建、边清理、inspector 刷新、画布重绘等）
+                # _applying_undo_redo=True 会让它跳过压栈的部分，避免递归
+                if self._applying_undo_redo:
+                    self._on_param_changed(nid, pname, old_v)
+                self._redo_stack.append(action)
+                self._log.append_log(
+                    f"[撤销] 恢复参数：节点 {nid} 的 {pname}",
+                    "INFO",
+                )
             else:
                 # 不认识的操作：把 action 塞回栈
                 self._undo_stack.append(action)
@@ -2177,6 +2537,22 @@ class BlueprintMainWindow(QMainWindow):
                         restored += 1
                 self._undo_stack.append(action)
                 self._log.append_log(f"[重做] 重新新增 {restored} 条连线", "INFO")
+            elif kind == "change_param":
+                # 重做"参数修改"：恢复 new_value
+                nid = action.get("node_id")
+                pname = action.get("param_name")
+                new_v = action.get("new_value")
+                if nid and (self._graph is None or nid not in self._graph.nodes):
+                    self._redo_stack.append(action)
+                    self._log.append_log(f"[重做] 节点 {nid} 已不存在，无法重做它的参数 {pname}", "WARN")
+                    return
+                if self._applying_undo_redo:
+                    self._on_param_changed(nid, pname, new_v)
+                self._undo_stack.append(action)
+                self._log.append_log(
+                    f"[重做] 重新修改参数：节点 {nid} 的 {pname}",
+                    "INFO",
+                )
             else:
                 self._redo_stack.append(action)
                 self._log.append_log(f"[重做] 暂不支持重做「{kind}」，后续版本会补齐。", "WARN")

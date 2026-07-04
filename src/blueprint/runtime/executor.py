@@ -25,6 +25,7 @@ from .hotkey_manager import HotkeyManager
 from .input_actions import InputActions
 from .screen_capture import ScreenCapture
 from .template_matcher import TemplateMatcher
+from ...config.app_paths import debug_dir
 
 
 # ============================================================
@@ -205,12 +206,30 @@ def execute_End(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
 
 
 def execute_Loop(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
-    max_it = int(node.params.get("max_iterations", 9999) or 9999)
-    interval = float(node.params.get("interval_sec", 0.0) or 0.0)
+    infinite = bool(node.params.get("infinite", False))
+    max_it = int(node.params.get("max_iterations", 5) or 5)
+    interval = float(node.params.get("interval_sec", 1.0) or 1.0)
     counter = ctx.loop_counters.get(node.id, 0)
     if max_it <= 0:
-        max_it = 9999
-    if counter < max_it:
+        max_it = 5
+    if infinite:
+        # 无限循环：不受 max_iterations 限制
+        ctx.loop_counters[node.id] = counter + 1
+        if interval > 0 and ctx.is_running:
+            t0 = time.time()
+            while ctx.is_running and (time.time() - t0) < interval:
+                wait_if_paused(ctx)
+                time.sleep(0.05)
+        wait_if_paused(ctx)
+        note = f"Loop ∞ i={counter+1} -> loop_body"
+        annotate_step(ctx, node, "loop", note=note)
+        ctx.log(f"[Loop] {node.id[:6]}  ∞ i={counter+1} -> loop_body", "DEBUG")
+        return (
+            {"out_iteration": counter + 1, "out_max": -1},
+            ["loop_body"],
+            "",
+        )
+    elif counter < max_it:
         ctx.loop_counters[node.id] = counter + 1
         if interval > 0 and ctx.is_running:
             t0 = time.time()
@@ -241,12 +260,27 @@ def execute_Loop(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
 
 
 def execute_Wait(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
-    sec = inputs.get("in_seconds")
-    if sec is None:
-        sec = float(node.params.get("default_sec", 1.0) or 1.0)
-    sec = max(0.0, min(float(sec), 3600.0))
-    note = f"等待 {sec:.3f}s"
-    ctx.log(f"[Wait] sleep {sec:.3f}s", "INFO")
+    """【对齐Qflow】双模式延时：固定延时 / 随机延时。优先走 in_seconds 数据线。"""
+    import random
+    p = dict(node.params or {})
+    delay_type = str(p.get("delay_type", "fixed") or "fixed")
+
+    # 优先用 in_seconds 连线值（兼容旧蓝图）
+    in_sec = inputs.get("in_seconds")
+    if in_sec is not None:
+        sec = max(0.0, min(float(in_sec), 3600.0))
+        mode_txt = "连线"
+    elif delay_type == "random":
+        min_s = max(0.0, float(p.get("min_seconds", 1.0) or 1.0))
+        max_s = max(min_s, float(p.get("max_seconds", 3.0) or 3.0))
+        sec = random.uniform(min_s, max_s)
+        mode_txt = f"随机[{min_s:g}~{max_s:g}]"
+    else:
+        sec = max(0.0, min(float(p.get("seconds", 1.0) or 1.0), 3600.0))
+        mode_txt = "固定"
+
+    note = f"{mode_txt} 等待 {sec:.3f}s"
+    ctx.log(f"[Wait] {mode_txt} sleep {sec:.3f}s", "INFO")
     t0 = time.time()
     while ctx.is_running and (time.time() - t0) < sec:
         wait_if_paused(ctx)
@@ -413,17 +447,12 @@ def _pid_to_exe_name(pid: int) -> str:
 
 def _find_window_3d(
     title: str,
-    use_title: bool,
     exe_name: str,
-    use_exe: bool,
     class_name: str,
-    use_class: bool,
     prefer_visible: bool = True,
 ) -> Optional[int]:
     """三维搜索：title子串 / exe文件名(小写含) / class_name 精确等于（不区分大小写）。
-
-    退化兜底：如果 3 个开关全为 False → 强制开启 use_title 搜索；
-             如果 3 个开关全开但 3 个关键字段全空 → 同样退化强制用 title（空title也允许，返回None）。
+    三个维度全部启用：仅当对应字段非空时才参与匹配评分。
     """
     title_s = str(title or "").strip()
     exe_s = str(exe_name or "").strip().lower()
@@ -431,13 +460,6 @@ def _find_window_3d(
     has_any_keyword = bool(title_s) or bool(exe_s) or bool(cls_s)
     if not has_any_keyword:
         return None
-    all_off = (not use_title) and (not use_exe) and (not use_class)
-    all_on = use_title and use_exe and use_class
-    if all_off or (all_on and not has_any_keyword):
-        # 退化兜底：强制开启 title
-        use_title = True
-        use_exe = bool(exe_s)
-        use_class = bool(cls_s)
 
     wins = _enum_windows_win32()
     if not wins:
@@ -455,44 +477,34 @@ def _find_window_3d(
         score = 0
         dim_ok = 0
         dim_checked = 0
-        # title
-        if use_title:
+        # title（非空才参与匹配）
+        if title_s:
             dim_checked += 1
-            if title_s and (title_s.lower() in (w_title or "").lower()):
+            if title_s.lower() in (w_title or "").lower():
                 score += 10
                 dim_ok += 1
-            elif not title_s:
-                # 没填title的维度不算"不合格"，不影响但不加分
-                pass
             else:
                 score -= 1000
-        # exe_name
-        if use_exe:
+        # exe_name（非空才参与匹配）
+        if exe_s:
             dim_checked += 1
             w_exe = _pid_to_exe_name(w_pid) if w_pid else ""
-            if exe_s:
-                if w_exe and (exe_s in w_exe or w_exe.endswith(exe_s)):
-                    score += 10
-                    dim_ok += 1
-                else:
-                    score -= 1000
+            if w_exe and (exe_s in w_exe or w_exe.endswith(exe_s)):
+                score += 10
+                dim_ok += 1
             else:
-                # 关键字段空：维度跳过
-                pass
-        # class_name
-        if use_class:
+                score -= 1000
+        # class_name（非空才参与匹配）
+        if cls_s:
             dim_checked += 1
-            if cls_s:
-                if (w_cls or "").lower() == cls_s.lower():
-                    score += 10
-                    dim_ok += 1
-                else:
-                    score -= 1000
+            if (w_cls or "").lower() == cls_s.lower():
+                score += 10
+                dim_ok += 1
             else:
-                pass
+                score -= 1000
         if dim_checked == 0:
             continue
-        # 维度必须全满足（只要用户填了对应值的维度必须命中；维度没填值的不要求）
+        # 维度必须全满足（只要用户填了对应值的维度必须命中）
         if score < 0:
             continue
         # 可见加分
@@ -509,11 +521,8 @@ def _find_window_3d(
 
 def execute_BindWindow(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
     title = str(node.params.get("title", "") or "")
-    use_title = bool(node.params.get("use_title", True))
     exe_name = str(node.params.get("exe_name", "") or "")
-    use_exe = bool(node.params.get("use_exe_name", True))
     class_name = str(node.params.get("class_name", "") or "")
-    use_class = bool(node.params.get("use_class_name", False))
     res_w = int(node.params.get("resolution_w", 1920) or 1920)
     res_h = int(node.params.get("resolution_h", 1080) or 1080)
 
@@ -532,16 +541,14 @@ def execute_BindWindow(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]
         pass
 
     hwnd = _find_window_3d(
-        title=title, use_title=use_title,
-        exe_name=exe_name, use_exe=use_exe,
-        class_name=class_name, use_class=use_class,
+        title=title,
+        exe_name=exe_name,
+        class_name=class_name,
     )
     if hwnd is None:
         msg = (
             f"[BindWindow] 未找到匹配窗口。"
-            f"title(use={use_title})='{title}'  "
-            f"exe(use={use_exe})='{exe_name}'  "
-            f"class(use={use_class})='{class_name}'"
+            f"title='{title}'  exe='{exe_name}'  class='{class_name}'"
         )
         ctx.log(msg, "WARN")
         annotate_step(ctx, node, "bind_win", note="FAIL 未找到窗口")
@@ -623,84 +630,219 @@ def execute_BindWindow(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]
 # ---------------- 动作/识别节点 ----------------
 def execute_FindImage(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
     """
-    找图节点：
-      - 失败策略 on_fail: stop | continue | retry_then_skip
-      - 重试 retry_count + retry_interval_ms
-      - 命中：out_pos / out_found=True / out_score
-      - 未命中：根据 on_fail 决定是否终止
+    找图节点（对齐Qflow image节点）：
+      - 匹配策略 match_strategy: hybrid(智能混合) / template(模板匹配) / feature(特征匹配)
+      - 超时 timeout_seconds：在此时间内循环重试
+      - 未找到时尝试滚动 auto_scroll：把鼠标移到搜索区/屏幕中心后，先垂直滚动 scroll_dy，再水平滚动 scroll_dx
+      - 找到后执行 after_action: none / click / double_click / right_click / move_to，带 offset_x/offset_y
+      - 命中：out_pos(中心坐标) / out_found=True / out_score；未命中：out_found=False 但照常走 out_exec（不再有失败策略终止全局）
     """
+    wait_if_paused(ctx)
+    # 1) 读参数
     template = inputs.get("in_template") or node.params.get("template", "")
-    region = inputs.get("in_region") or node.params.get("region")
+    # 支持临时PIL/缓存：优先 runtime_attrs["_pil_template"]
+    pil_tpl: Optional[Image.Image] = None
+    try:
+        pil_tpl = getattr(node, "runtime_attrs", {}).get("_pil_template")  # type: ignore[union-attr]
+    except Exception:
+        pil_tpl = None
+    # 搜索区域功能已移除（用户反馈效果差且有bug），始终全屏搜索
+    region = None
     threshold = inputs.get("in_threshold")
     if threshold is None:
         threshold = float(node.params.get("threshold", 0.75) or 0.75)
-    fast_mode = bool(node.params.get("fast_mode", True))
-    use_gray = bool(node.params.get("use_gray", True))
-    on_fail = str(node.params.get("on_fail", "stop") or "stop")
-    retry_count = max(0, int(node.params.get("retry_count", 3) or 0))
-    retry_interval_ms = max(10.0, float(node.params.get("retry_interval_ms", 500.0) or 500.0))
-
-    if not template:
-        ctx.log("[FindImage] template 为空，失败。", "ERROR")
-        annotate_step(ctx, node, "find", note="ERROR: template empty")
-        return _find_fail(ctx, node, on_fail, "NO_TEMPLATE")
-
-    pos = None
-    score = 0.0
-    attempts = retry_count + 1
-    last_err = ""
-    for i in range(attempts):
-        if not ctx.is_running:
-            break
-        wait_if_paused(ctx)
+    strategy = str(node.params.get("match_strategy", "hybrid") or "hybrid")
+    timeout_s = max(0.1, float(node.params.get("timeout_seconds", 10.0) or 10.0))
+    auto_scroll = bool(node.params.get("auto_scroll", False))
+    # 新旧参数兼容：优先 scroll_dy / scroll_dx，否则回退老的 scroll_amount
+    try:
+        scroll_dy = int(node.params.get("scroll_dy", -500) or -500)
+    except Exception:
+        scroll_dy = int(node.params.get("scroll_amount", -500) or -500)
+    scroll_dx = int(node.params.get("scroll_dx", 0) or 0)
+    after_action = str(node.params.get("after_action", "none") or "none")
+    # 偏移优先级：offset(tuple2，新) > offset_x/offset_y(两个int，旧兼容)
+    _tpl_off = node.params.get("offset")
+    if isinstance(_tpl_off, (list, tuple)) and len(_tpl_off) >= 2:
         try:
-            if ctx.matcher is not None:
-                if use_gray:
-                    pos = ctx.matcher.find_image_gray(
-                        str(template), region=region,
-                        threshold=threshold, fast_mode=fast_mode,
-                    )
-                else:
-                    pos = ctx.matcher.find_image(
-                        str(template), region=region,
-                        threshold=threshold, fast_mode=fast_mode,
-                    )
-                if pos is not None:
-                    score = 1.0
-            else:
-                pos = None
-        except Exception as e:
-            last_err = str(e)
-            ctx.log(f"[FindImage] 异常: {e}", "WARN")
-        if pos is not None:
-            break
-        if i < attempts - 1 and ctx.is_running:
-            t0 = time.time()
-            dt_s = retry_interval_ms / 1000.0
-            while ctx.is_running and (time.time() - t0) < dt_s:
-                wait_if_paused(ctx)
-                time.sleep(0.05)
+            offset_x = int(_tpl_off[0])
+            offset_y = int(_tpl_off[1])
+        except Exception:
+            offset_x = int(node.params.get("offset_x", 0) or 0)
+            offset_y = int(node.params.get("offset_y", 0) or 0)
+    else:
+        offset_x = int(node.params.get("offset_x", 0) or 0)
+        offset_y = int(node.params.get("offset_y", 0) or 0)
 
-    if pos is not None:
-        ctx.log(f"[FindImage] 命中 {template}  pos={pos}", "SUCCESS")
-        annotate_step(
-            ctx, node, "find",
-            pos=pos, region=region,
-            note=f"OK: {os.path.basename(str(template))}@{pos}",
-        )
+    # 2) 模板有效性检查
+    use_path: Optional[str] = None
+    tmp_path = ""
+    if isinstance(template, str) and template and os.path.exists(template):
+        use_path = template
+    elif pil_tpl is not None:
+        # 写临时文件给 matcher
+        fd, tmp_path = tempfile.mkstemp(suffix=".png", prefix="ba_findimg_tpl_")
+        os.close(fd)
+        try:
+            pil_tpl.save(tmp_path, format="PNG")
+            use_path = tmp_path
+        except Exception:
+            use_path = None
+    if not use_path:
+        ctx.log("[FindImage] 模板无效（路径不存在 & 无PIL缓存） -> out_found=False", "WARN")
+        annotate_step(ctx, node, "find", note="ERROR: invalid template")
         return (
-            {"out_pos": tuple(pos), "out_found": True, "out_score": float(score)},
+            {"out_pos": None, "out_found": False, "out_score": 0.0},
             ["out_exec"], "",
         )
-    else:
-        msg = f"未找到: {os.path.basename(str(template))} threshold={threshold}"
-        if last_err:
-            msg += f" err={last_err}"
-        ctx.log(f"[FindImage] {msg} (策略={on_fail})", "WARN")
-        return _find_fail(ctx, node, on_fail, msg, region=region)
+
+    # 3) 超时空转 + 滚动重试 循环
+    t0 = time.time()
+    pos = None
+    score = 0.0
+    last_err = ""
+    # fast_mode / use_gray 从 strategy 推导
+    if strategy == "template":
+        do_gray, do_fast = True, True
+    elif strategy == "feature":
+        do_gray, do_fast = False, False
+    else:  # hybrid
+        do_gray, do_fast = True, True
+
+    try:
+        while (time.time() - t0) < timeout_s and ctx.is_running:
+            wait_if_paused(ctx)
+            if not ctx.is_running:
+                break
+            # 尝试匹配
+            try:
+                if ctx.matcher is not None:
+                    if strategy == "template":
+                        pos = ctx.matcher.find_image_gray(
+                            str(use_path), region=region, threshold=threshold, fast_mode=True
+                        )
+                    elif strategy == "feature":
+                        pos = ctx.matcher.find_image(
+                            str(use_path), region=region, threshold=threshold, fast_mode=False
+                        )
+                    else:  # hybrid：灰度模板快筛，失败再试特征
+                        pos = ctx.matcher.find_image_gray(
+                            str(use_path), region=region, threshold=threshold, fast_mode=True
+                        )
+                        if pos is None:
+                            pos = ctx.matcher.find_image(
+                                str(use_path), region=region, threshold=threshold, fast_mode=False
+                            )
+                    if pos is not None:
+                        score = 1.0
+            except Exception as e:
+                last_err = str(e)
+                ctx.log(f"[FindImage] 匹配异常: {e}", "WARN")
+
+            if pos is not None:
+                break
+
+            # 未命中：是否需要滚动
+            if auto_scroll and ctx.is_running and (time.time() - t0) < timeout_s:
+                try:
+                    import pyautogui
+                    # 鼠标移到屏幕中心（搜索区域功能已移除）
+                    sz = pyautogui.size()
+                    cx, cy = sz.width // 2, sz.height // 2
+                    pyautogui.moveTo(cx, cy)
+                    # 先垂直滚动（y方向），再水平滚动（x方向）
+                    if scroll_dy != 0:
+                        pyautogui.scroll(scroll_dy)
+                    if scroll_dx != 0:
+                        # pyautogui 在 Windows 支持 hscroll（水平滚动，右=正，左=负）
+                        try:
+                            pyautogui.hscroll(scroll_dx)
+                        except Exception:
+                            pass
+                except Exception as e2:
+                    ctx.log(f"[FindImage] 自动滚动失败: {e2}", "WARN")
+                # 滚动后稍等
+                t_wait = time.time()
+                while (time.time() - t_wait) < 0.5 and ctx.is_running:
+                    wait_if_paused(ctx)
+                    time.sleep(0.05)
+                continue
+
+            # 普通短间隔避免CPU满载
+            time.sleep(0.15)
+
+        # 4) 找到后执行 动作
+        if pos is not None:
+            # 解析 pos：兼容 (left, top, w, h) / 字典 / tuple5
+            left, top, w, h = 0, 0, 0, 0
+            if isinstance(pos, dict):
+                left = int(pos.get("left", 0)); top = int(pos.get("top", 0))
+                w = int(pos.get("width", 0)); h = int(pos.get("height", 0))
+            elif isinstance(pos, (list, tuple)):
+                if len(pos) >= 4:
+                    left, top, w, h = int(pos[0]), int(pos[1]), int(pos[2]), int(pos[3])
+                elif len(pos) >= 2:
+                    left, top, w, h = int(pos[0]), int(pos[1]), 0, 0
+            cx = left + (w // 2) + offset_x
+            cy = top + (h // 2) + offset_y
+            out_pos = (cx, cy)
+            # 动作
+            if after_action != "none":
+                try:
+                    import pyautogui
+                    pyautogui.moveTo(cx, cy)
+                    if after_action == "click":
+                        pyautogui.click()
+                    elif after_action == "double_click":
+                        pyautogui.doubleClick()
+                    elif after_action == "right_click":
+                        pyautogui.rightClick()
+                except Exception as ea:
+                    ctx.log(f"[FindImage] 找到后执行动作失败: {ea}", "WARN")
+            # 日志
+            display = os.path.basename(str(use_path))
+            act_note = {
+                "none": "", "click": "|动作=单击", "double_click": "|动作=双击",
+                "right_click": "|动作=右键",
+            }.get(after_action, "")
+            ctx.log(f"[FindImage] 命中 {display} 命中矩形=({left},{top},{w},{h}) 中心=({cx},{cy}) {act_note}", "SUCCESS")
+            annotate_step(
+                ctx, node, "find",
+                pos=(left, top, w, h), region=region,
+                note=f"OK: {display} @({left},{top}) score={score:.2f} {act_note}",
+            )
+            return (
+                {"out_pos": out_pos, "out_found": True, "out_score": float(score)},
+                ["out_exec"], "",
+            )
+        else:
+            msg = f"未找到 {os.path.basename(str(use_path))} threshold={threshold} timeout={timeout_s}s"
+            if last_err:
+                msg += f" err={last_err}"
+            scroll_note = "（已启用自动滚动）" if auto_scroll else ""
+            ctx.log(f"[FindImage] {msg}{scroll_note} -> out_found=False", "WARN")
+            annotate_step(
+                ctx, node, "find", region=region,
+                note=f"FAIL: {msg}{scroll_note}",
+            )
+            return (
+                {"out_pos": None, "out_found": False, "out_score": 0.0},
+                ["out_exec"], "",
+            )
+    finally:
+        # 清理临时文件
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
 
 
 def _find_fail(ctx, node, on_fail: str, reason: str, region=None):
+    """
+    保留此函数仅用于兼容旧调用（如 WaitAnyImage 等）；
+    FindImage 已不再使用失败策略逻辑（on_fail已从节点参数中删除）。
+    """
     annotate_step(
         ctx, node, "find",
         region=region, note=f"FAIL: {reason} | on_fail={on_fail}",
@@ -717,59 +859,6 @@ def _find_fail(ctx, node, on_fail: str, reason: str, region=None):
     else:
         ctx.is_running = False
         return outputs, [], ""
-
-
-def execute_FindAnyImage(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
-    templates_raw = str(node.params.get("templates", "") or "")
-    templates = [t.strip() for t in templates_raw.split(",") if t.strip()]
-    threshold = float(node.params.get("threshold", 0.75) or 0.75)
-    fast_mode = bool(node.params.get("fast_mode", True))
-    timeout_ms = max(0.0, float(node.params.get("timeout_ms", 0.0) or 0.0))
-    interval_ms = max(50.0, float(node.params.get("interval_ms", 300.0) or 300.0))
-
-    if not templates:
-        ctx.log("[FindAnyImage] templates 为空", "ERROR")
-        annotate_step(ctx, node, "find", note="ERROR: templates empty")
-        return {"out_found_index": -1, "out_found": False, "out_pos": None}, ["out_not_found"], ""
-
-    t0 = time.time()
-    hit_idx = -1
-    hit_pos = None
-    while ctx.is_running:
-        wait_if_paused(ctx)
-        for i, tpl in enumerate(templates):
-            if not ctx.is_running:
-                break
-            try:
-                if ctx.matcher is not None:
-                    p = ctx.matcher.find_image(tpl, threshold=threshold, fast_mode=fast_mode)
-                else:
-                    p = None
-            except Exception:
-                p = None
-            if p is not None:
-                hit_idx, hit_pos = i, p
-                break
-        if hit_idx >= 0:
-            break
-        if timeout_ms <= 0:
-            break
-        if (time.time() - t0) * 1000.0 >= timeout_ms:
-            break
-        time.sleep(interval_ms / 1000.0)
-
-    if hit_idx >= 0 and hit_pos is not None:
-        out_port = f"out_found_{hit_idx}"
-        ctx.log(f"[FindAnyImage] 命中 #{hit_idx}: {templates[hit_idx]} @ {hit_pos}", "SUCCESS")
-        annotate_step(ctx, node, "find", pos=hit_pos, note=f"hit #{hit_idx}: {os.path.basename(templates[hit_idx])}")
-        return (
-            {"out_found_index": hit_idx, "out_found": True, "out_pos": tuple(hit_pos)},
-            [out_port], "",
-        )
-    else:
-        ctx.log(f"[FindAnyImage] 全部未命中({len(templates)}张) -> out_not_found", "WARN")
-        annotate_step(ctx, node, "find", note=f"ALL MISS ({len(templates)}张)")
-        return {"out_found_index": -1, "out_found": False, "out_pos": None}, ["out_not_found"], ""
 
 
 def execute_WaitAnyImage(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
@@ -885,39 +974,147 @@ def execute_Click(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
 
 
 def execute_PressKey(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
-    key = str(node.params.get("key", "") or "")
-    count = max(1, int(node.params.get("count", 1) or 1))
-    hold_ms = max(1, int(node.params.get("hold_ms", 50) or 50))
-    interval_ms = max(1, int(node.params.get("interval_ms", 100) or 100))
-    if not key:
-        ctx.log("[PressKey] key 为空，跳过。", "WARN")
-        annotate_step(ctx, node, "keypress", note="ERROR: key empty")
+    """【对齐Qflow】双模式键盘节点：
+    - text 模式：输入文本（粘贴或逐字符），可选末尾按回车
+    - key 模式：按下组合键（如 ctrl+c），支持多次重复
+    """
+    p = dict(node.params or {})
+    kb_mode = str(p.get("kb_mode", "text") or "text")
+
+    if kb_mode == "text":
+        # ---------- 输入文本模式 ----------
+        text = str(p.get("text", "") or "")
+        use_paste = bool(p.get("use_paste", True))
+        press_enter = bool(p.get("press_enter", False))
+
+        # 变量插值
+        try:
+            from src.blueprint.core.variable_engine import VariableEngine
+            engine = getattr(ctx, "var_engine", None) or VariableEngine(ctx.variables)
+            if engine.has_any_marker(text):
+                text = str(engine.interpolate(text))
+        except Exception:
+            pass
+
+        if not text:
+            ctx.log("[PressKey] text 模式但文本为空，跳过。", "WARN")
+            annotate_step(ctx, node, "keypress", note="text mode: empty text")
+            return {}, ["out_exec"], ""
+
+        ctx.log(f"[PressKey] text 模式 len={len(text)} paste={use_paste} enter={press_enter}", "INFO")
+        try:
+            if use_paste:
+                # 粘贴模式：写剪贴板 + Ctrl+V（防中文乱码，对齐 Qflow safe_write）
+                import pyperclip
+                pyperclip.copy(text)
+                time.sleep(0.05)
+                if ctx.input_actions is not None:
+                    # 用 SendInput 模拟 Ctrl+V
+                    ctx.input_actions.hw_press("lctrl", hold_ms=30)
+                    ctx.input_actions.hw_press("v", hold_ms=30)
+                    ctx.input_actions.hw_press("lctrl", hold_ms=30)  # 抬起
+                else:
+                    import pyautogui
+                    pyautogui.hotkey("ctrl", "v")
+                time.sleep(0.05)
+            else:
+                # 逐字符输入
+                if ctx.input_actions is not None:
+                    for ch in text:
+                        ctx.input_actions.hw_press(ch.lower() if ch.isalpha() else ch, hold_ms=20)
+                else:
+                    import pyautogui
+                    pyautogui.write(text)
+
+            if press_enter:
+                if ctx.input_actions is not None:
+                    ctx.input_actions.hw_press("enter", hold_ms=30)
+                else:
+                    import pyautogui
+                    pyautogui.press("enter")
+        except Exception as e:
+            ctx.log(f"[PressKey] text 模式异常: {e}", "ERROR")
+            annotate_step(ctx, node, "keypress", note=f"text ERROR: {e}")
+            return {}, ["out_exec"], ""
+
+        preview = text[:30] + ("…" if len(text) > 30 else "")
+        annotate_step(ctx, node, "keypress", note=f"text{'(paste)' if use_paste else ''}: {preview}{' +Enter' if press_enter else ''}")
         return {}, ["out_exec"], ""
-    ctx.log(f"[PressKey] {key} x{count} hold={hold_ms}ms", "INFO")
-    if ctx.input_actions is not None:
-        ctx.input_actions.press_with_pause(
-            key, count=count, hold_ms=hold_ms, interval_ms=interval_ms,
-        )
-    annotate_step(ctx, node, "keypress", note=f"{key} x{count}")
-    return {}, ["out_exec"], ""
+
+    else:
+        # ---------- 按键组合模式 ----------
+        key_name = str(p.get("key_name", "") or "").strip()
+        count = max(1, int(p.get("count", 1) or 1))
+        hold_ms = max(1, int(p.get("hold_ms", 50) or 50))
+        interval_ms = max(1, int(p.get("interval_ms", 100) or 100))
+
+        if not key_name:
+            ctx.log("[PressKey] key 模式但 key_name 为空，跳过。", "WARN")
+            annotate_step(ctx, node, "keypress", note="key mode: empty key_name")
+            return {}, ["out_exec"], ""
+
+        # 解析组合键：ctrl+c → ["ctrl", "c"]
+        keys = [k.strip().lower() for k in key_name.split("+") if k.strip()]
+        if not keys:
+            ctx.log("[PressKey] key_name 解析后为空，跳过。", "WARN")
+            annotate_step(ctx, node, "keypress", note="key_name parse empty")
+            return {}, ["out_exec"], ""
+
+        ctx.log(f"[PressKey] key 模式 {'+'.join(keys)} x{count} hold={hold_ms}ms", "INFO")
+        is_combo = len(keys) > 1
+
+        if is_combo:
+            # 组合键：用 hotkey 方式（按下所有键 → 释放）
+            for i in range(count):
+                if not ctx.is_running:
+                    break
+                if ctx.input_actions is not None:
+                    # 依次按下所有键
+                    for k in keys:
+                        ctx.input_actions.key_down(k)
+                    time.sleep(hold_ms / 1000.0)
+                    # 反序释放
+                    for k in reversed(keys):
+                        ctx.input_actions.key_up(k)
+                else:
+                    import pyautogui
+                    pyautogui.hotkey(*keys)
+                if i < count - 1:
+                    time.sleep(interval_ms / 1000.0)
+                    wait_if_paused(ctx)
+            annotate_step(ctx, node, "keypress", note=f"combo {'+'.join(keys)} x{count}")
+        else:
+            # 单键：复用原有 press_with_pause
+            single = keys[0]
+            if ctx.input_actions is not None:
+                ctx.input_actions.press_with_pause(
+                    single, count=count, hold_ms=hold_ms, interval_ms=interval_ms,
+                )
+            else:
+                import pyautogui
+                for i in range(count):
+                    pyautogui.press(single)
+                    if i < count - 1:
+                        time.sleep(interval_ms / 1000.0)
+            annotate_step(ctx, node, "keypress", note=f"{single} x{count}")
+
+        return {}, ["out_exec"], ""
 
 
 def _mouse_final_pos(ctx, params: Dict[str, Any], inputs: Dict[str, Any]):
-    """按 bind_mode 把 pos_x/y 转换为屏幕绝对坐标；若上游连了 in_pos 则优先用连线值。"""
+    """按 coord_mode 把 pos(tuple2) 转换为屏幕绝对坐标；若上游连了 in_pos 则优先用连线值。"""
     in_pos = inputs.get("in_pos")
     if in_pos is not None and isinstance(in_pos, (tuple, list)) and len(in_pos) == 2:
         x, y = int(in_pos[0]), int(in_pos[1])
-        ox = int(params.get("offset_x", 0) or 0)
-        oy = int(params.get("offset_y", 0) or 0)
+        ox, oy = _tuple2(params.get("offset", (0, 0)))
         return (x + ox, y + oy)
-    mode = str(params.get("bind_mode", "current_win") or "current_win")
-    x = int(params.get("pos_x", 0) or 0)
-    y = int(params.get("pos_y", 0) or 0)
-    ox = int(params.get("offset_x", 0) or 0)
-    oy = int(params.get("offset_y", 0) or 0)
-    if mode == "screen_abs":
+    mode = str(params.get("coord_mode", "relative") or "relative")
+    x, y = _tuple2(params.get("pos", (0, 0)))
+    ox, oy = _tuple2(params.get("offset", (0, 0)))
+    if mode == "absolute":
         return (x + ox, y + oy)
-    elif mode == "current_win":
+    elif mode == "relative":
+        # 相对绑定窗口：加上绑定窗口左上角偏移
         try:
             target = getattr(ctx, "target", None)
             if target is not None:
@@ -929,6 +1126,38 @@ def _mouse_final_pos(ctx, params: Dict[str, Any], inputs: Dict[str, Any]):
         except Exception:
             pass
     return (x + ox, y + oy)
+
+
+def _tuple2(val) -> Tuple[int, int]:
+    """安全把 val 转成 (int, int)；val 可以是 tuple/list/None。"""
+    if val is None:
+        return (0, 0)
+    if isinstance(val, (tuple, list)):
+        try:
+            return (int(val[0]) if len(val) > 0 else 0, int(val[1]) if len(val) > 1 else 0)
+        except Exception:
+            return (0, 0)
+    return (0, 0)
+
+
+def _mouse_final_pos_for(ctx, params: Dict[str, Any], point_param_name: str) -> Tuple[int, int]:
+    """按 coord_mode 把指定点参数（from_pos / to_pos）转换为屏幕绝对坐标。"""
+    mode = str(params.get("coord_mode", "relative") or "relative")
+    x, y = _tuple2(params.get(point_param_name, (0, 0)))
+    if mode == "absolute":
+        return (x, y)
+    elif mode == "relative":
+        try:
+            target = getattr(ctx, "target", None)
+            if target is not None:
+                rect = getattr(target, "window_rect", lambda: None)()
+                if rect is not None:
+                    rx = int(getattr(rect, "x", 0) or 0)
+                    ry = int(getattr(rect, "y", 0) or 0)
+                    return (rx + x, ry + y)
+        except Exception:
+            pass
+    return (x, y)
 
 
 def execute_Mouse(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
@@ -990,13 +1219,11 @@ def execute_Mouse(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
             ctx.log(f"[Mouse] move→{pos} speed={speed}ms", "SUCCESS")
 
         elif action == "drag":
-            from_x = int(p.get("from_x", 0) or 0)
-            from_y = int(p.get("from_y", 0) or 0)
-            to_x = int(p.get("to_x", 0) or 0)
-            to_y = int(p.get("to_y", 0) or 0)
+            from_pt = _mouse_final_pos_for(ctx, p, "from_pos")
+            to_pt = _mouse_final_pos_for(ctx, p, "to_pos")
             dur = max(0, int(p.get("drag_duration_ms", 300) or 300))
-            from_pt = (from_x, from_y)
-            to_pt = (to_x, to_y)
+            from_x, from_y = from_pt
+            to_x, to_y = to_pt
             if ia is not None:
                 try:
                     steps = max(2, dur // 20)
@@ -1319,9 +1546,24 @@ def execute_WebBrowser(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]
     import shutil as _shutil
 
     p = dict(node.params or {})
-    action = str(p.get("action", "open") or "open").strip().lower()
+    # 中英双语兼容：UI 现用中文，老蓝图可能存英文
+    _ACTION_MAP = {
+        "打开": "open", "open": "open",
+        "刷新": "refresh", "refresh": "refresh",
+        "后退": "back", "back": "back",
+        "前进": "forward", "forward": "forward",
+    }
+    _BROWSER_MAP = {
+        "默认": "default", "default": "default",
+        "chrome": "chrome",
+        "edge": "edge",
+        "firefox": "firefox",
+    }
+    action_raw = str(p.get("action", "open") or "open").strip().lower()
+    action = _ACTION_MAP.get(action_raw, "open")
     url_template = str(p.get("url", "") or "")
-    browser_name = str(p.get("browser", "default") or "default").strip().lower()
+    browser_raw = str(p.get("browser", "default") or "default").strip().lower()
+    browser_name = _BROWSER_MAP.get(browser_raw, "default")
 
     try:
         wait_if_paused(ctx)
@@ -1592,21 +1834,17 @@ def execute_SetVariable(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any
     first_err = ""
     note_parts: list = []
 
-    # ---- 1) 新批量模式：batch_text 多行 name=value ----
     batch_raw = node.params.get("batch_text") or ""
     if isinstance(batch_raw, str) and batch_raw.strip():
         kv_map, err_msg = parse_batch_var_lines(batch_raw)
         if err_msg:
             first_err = err_msg.splitlines()[0]
             ctx.log(f"[Var] SetVariable 解析警告: {err_msg}", "WARN")
-        # 按解析顺序 set，后写的可以引用前面同名变量（engine 内每一步更新 ctx.variables）
         for k, v in kv_map.items():
-            # 插值：先过 VariableEngine，支持 {a} / ${a} / {= 1+2 }
             if isinstance(v, str) and engine.has_any_marker(v):
                 interpolated = engine.interpolate(v)
             else:
                 interpolated = v
-            # 尝试自动数字解析（对 8080 → int，1.5 → float），避免都是字符串
             final_val = _auto_coerce(interpolated)
             ctx.set_var(k, final_val)
             engine.set(k, final_val)
@@ -1614,16 +1852,8 @@ def execute_SetVariable(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any
             if len(note_parts) < 6:
                 note_parts.append(f"{k}={repr(final_val)[:40]}")
 
-    # ---- 2) 旧兼容模式：name + in_value 单变量（旧蓝图连线到 in_value 的情况）----
-    legacy_name = str(node.params.get("name", "") or "").strip()
-    legacy_value = inputs.get("in_value") if "in_value" in inputs else None
-    if legacy_name and legacy_value is not None:
-        ctx.set_var(legacy_name, legacy_value)
-        set_count += 1
-        note_parts.append(f"{legacy_name}={repr(legacy_value)[:40]}")
-
-    if not set_count and legacy_name and "in_value" not in inputs and not batch_raw.strip():
-        first_err = first_err or "SetVariable 未设置任何变量：batch_text 为空且 name 无 in_value 连线"
+    if not set_count and not batch_raw.strip():
+        first_err = first_err or "SetVariable 未设置任何变量：batch_text 为空"
 
     if set_count:
         note = "SetVar(" + str(set_count) + ") " + "; ".join(note_parts)
@@ -1696,69 +1926,156 @@ def _varswitch_match(a, b) -> bool:
     return str(a).strip() == str(b).strip()
 
 
+def _varswitch_eval_condition(cond: Dict[str, Any], engine) -> Tuple[bool, str]:
+    """对解析后的单条条件做求值。返回 (命中, 可读说明)。"""
+    label = cond.get("label", "")
+    var = cond.get("var", "")
+    op = cond.get("op", "==")
+    target = cond.get("value")
+    # 先取值：变量不存在 → None（比较时当作 falsy）
+    try:
+        actual = engine.get(var)
+    except Exception:
+        actual = None
+    # target 如果含 {var} 插值 → 再算一遍
+    if isinstance(target, str) and ("{" in target or "${" in target):
+        try:
+            target = engine.interpolate(target)
+        except Exception:
+            pass
+    # 自动类型转换（两边都转数字试试）
+    a = actual
+    b = _auto_coerce(target)
+    def _num(x):
+        try:
+            return float(x), True
+        except Exception:
+            if isinstance(x, bool):
+                return float(x), True
+            return None, False
+    an, a_ok = _num(a)
+    bn, b_ok = _num(b)
+    try:
+        if op == "==":
+            # 宽松等于
+            hit = False
+            if a == b:
+                hit = True
+            elif a_ok and b_ok and abs(an - bn) < 1e-9:
+                hit = True
+            elif str(a).strip() == str(b).strip():
+                hit = True
+            return hit, f"{var}={a!r} == {b!r} → {hit}"
+        if op == "!=":
+            hit_eq, _ = _varswitch_eval_condition({**cond, "op": "=="}, engine)
+            return (not hit_eq), f"{var}={a!r} != {b!r} → {not hit_eq}"
+        if op in (">", "<", ">=", "<="):
+            # 必须双方都能转数字才合法，否则 False
+            if not a_ok or not b_ok:
+                return False, f"{var}={a!r} {op} {b!r} → 非数字无法比较"
+            if op == ">":
+                hit = an > bn
+            elif op == "<":
+                hit = an < bn
+            elif op == ">=":
+                hit = an >= bn
+            else:  # <=
+                hit = an <= bn
+            return hit, f"{var}={an} {op} {bn} → {hit}"
+    except Exception as e:
+        return False, f"求值异常 {e}"
+    return False, f"未知运算符 {op}"
+
+
 def execute_VarSwitch(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
     from src.blueprint.core.variable_engine import VariableEngine
+    from src.blueprint.core.node_library import parse_varswitch_conditions
 
+    engine = getattr(ctx, "var_engine", None) or VariableEngine(ctx.variables)
+    raw = node.params.get("cases", "") or ""
+    conditions = parse_varswitch_conditions(raw if isinstance(raw, str) else "")
+    valid_conditions = [c for c in conditions if not c.get("error")]
+
+    # 兼容旧蓝图：如果 cases 是旧格式（list 或 行式 id=value），解析失败没合法条件，尝试旧逻辑兜底
+    if not valid_conditions and (isinstance(raw, list) or (isinstance(raw, str) and ("=" in raw or raw.strip().startswith("[")))):
+        try:
+            return _execute_varswitch_legacy(ctx, node, inputs)
+        except Exception as e:
+            ctx.log(f"[VarSwitch] 旧格式兜底失败: {e}", "WARN")
+
+    notes = []
+    all_true = True
+    for c in valid_conditions:
+        hit, info = _varswitch_eval_condition(c, engine)
+        notes.append(info)
+        if not hit:
+            all_true = False
+    if valid_conditions:
+        port = "yes" if all_true else "no"
+    else:
+        # 没有任何条件，兜底走 no
+        port = "no"
+    note = f"VarSwitch → {port}  ({'; '.join(notes[:3])}{' …' if len(notes) > 3 else ''})"
+    ctx.log(f"[VarSwitch] {note}", "DEBUG")
+    annotate_step(ctx, node, "condition", note=f"→ {port} ({len(valid_conditions)} 条件 AND)")
+    return {}, [port], ""
+
+
+def _execute_varswitch_legacy(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
+    """旧 VarSwitch（switch-case 相等匹配）的兼容兜底，用于加载旧蓝图。"""
+    from src.blueprint.core.variable_engine import VariableEngine
     engine = getattr(ctx, "var_engine", None) or VariableEngine(ctx.variables)
 
     var_name = str(node.params.get("var_name", "") or "").strip()
-    in_value = inputs.get("in_value")
+    in_value = inputs.get("in_value") if "in_value" in inputs else None
     cases_raw = node.params.get("cases", "") or ""
+    has_in_value = "in_value" in inputs
 
-    has_in_value = "in_value" in inputs  # True 表示上游连了 DATA 线（即使 None 也是上游明确给的 None）
-
-    # ---------------- 简单模式：var_name 非空（或上游 in_value 连线 + var_expr 表达式） ----------------
     if var_name or has_in_value:
-        # 比较对象：优先 in_value 连线；否则 engine 取 var_name；都没有 → 走 no / else
         compare_value = in_value if has_in_value else engine.get(var_name)
-        # var_expr：可选，若填了就把 compare_value 代入 {var} 表达式再算布尔（写 {in_value} 或 {变量名}都行）
         expr = str(node.params.get("var_expr", "") or "")
         if expr.strip():
-            # 临时把 in_value 塞进去便于表达式写 {in_value}
-            tmp_inject = {"in_value": compare_value}
-            for k, v in tmp_inject.items():
-                engine.set(k, v)
+            engine.set("in_value", compare_value)
             try:
                 result_val = engine.interpolate(expr)
-            finally:
-                pass
-            # result_val → bool
-            cond = bool(result_val) if not isinstance(result_val, str) else (result_val.strip().lower() not in ("", "0", "false", "none", "null", "no"))
+            except Exception:
+                result_val = None
+            if isinstance(result_val, str):
+                cond = result_val.strip().lower() not in ("", "0", "false", "none", "null", "no")
+            else:
+                cond = bool(result_val)
             port = "yes" if cond else "no"
-            note = f"VarSwitch expr={cond} -> {port}"
-            annotate_step(ctx, node, "switch", note=note)
+            # 如果节点输出没有 yes/no（已经切换到新格式输出端口了），走 else
+            out_names = [p.name for p in node.outputs]
+            if port not in out_names:
+                port = "else"
             return {"out_value": compare_value}, [port], ""
-        # 无表达式：按 compare_value 真值判断
         if isinstance(compare_value, str):
             cond = compare_value.strip().lower() not in ("", "0", "false", "none", "null", "no")
         else:
             cond = bool(compare_value)
         port = "yes" if cond else "no"
-        note = f"VarSwitch {var_name or 'in_value'}={repr(compare_value)[:40]} -> {port}"
-        ctx.log(f"[VarSwitch] {note}", "DEBUG")
-        annotate_step(ctx, node, "switch", note=note)
+        out_names = [p.name for p in node.outputs]
+        if port not in out_names:
+            port = "else"
         return {"out_value": compare_value}, [port], ""
 
-    # ---------------- 多分支模式：cases 数组 ----------------
+    # 多分支旧格式兜底：旧解析 id=value
     cases = _parse_varswitch_cases(cases_raw if isinstance(cases_raw, str) else "")
-    # 多分支下 in_value 必须有（或者 cases.value 已经是表达式？这里保守：in_value 连线有就用，没连线要求用户通过 var_name 传——但多分支模式 var_name 空，所以只能用 in_value 或 cases.value 里直接写插值表达式（引擎算完再比）
     base = in_value if has_in_value else None
-    # 如果没 in_value，但 cases.value 里有 {var} 插值表达式：也能按每个case自己算
     matched_id = None
+    out_names = [p.name for p in node.outputs]
     for case in cases:
         cid = case.get("id")
         cval = case.get("value")
-        # cval 允许写 {some_var}，这样每个 case 可以匹配不同变量（进阶用法）
         if isinstance(cval, str) and engine.has_any_marker(cval):
             cval = engine.interpolate(cval)
         cval_coerced = _auto_coerce(cval)
-        # base 有值 vs cval 比较；base 没值时，判断 cval 真/假（类似 VarSwitch 多分支写"布尔匹配"：case_true=true, case_false=false）
         if has_in_value or base is not None:
             if _varswitch_match(base, cval_coerced):
                 matched_id = cid
                 break
         else:
-            # 没基准值：把 cval 当布尔，真的第一个命中
             if isinstance(cval_coerced, str):
                 truth = cval_coerced.strip().lower() not in ("", "0", "false", "none", "null", "no")
             else:
@@ -1766,16 +2083,14 @@ def execute_VarSwitch(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any])
             if truth:
                 matched_id = cid
                 break
-    port = matched_id if matched_id else "else"
-    note = f"VarSwitch multi -> {port}"
-    ctx.log(f"[VarSwitch] {note}  base={repr(base)[:40]}", "DEBUG")
-    annotate_step(ctx, node, "switch", note=note)
+    port = matched_id if (matched_id and matched_id in out_names) else "else"
     return {"out_value": base}, [port], ""
 
 
 def execute_Sequence(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
     num_paths = max(1, int(node.params.get("num_paths", 3) or 3))
-    interval = float(node.params.get("interval_sec", 0.0) or 0.0)
+    interval = float(node.params.get("interval_sec", 1.0) or 1.0)
+    mode = str(node.params.get("mode", "short_circuit") or "short_circuit")
 
     graph = getattr(ctx, "_graph_ref", None)
     runner = getattr(ctx, "_runner_ref", None)
@@ -1785,40 +2100,69 @@ def execute_Sequence(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
         annotate_step(ctx, node, "seq", note="FAIL: 缺少graph_ref/runner_ref")
         return {"out_done_path": None, "out_num_paths": num_paths}, ["else"], msg
 
-    path_ok: Optional[int] = None
-    last_reason = ""
-    for path_i in range(1, num_paths + 1):
-        if not ctx.is_running:
-            break
-        # 路径间间隔（第一条路径前不sleep）
-        if path_i > 1 and interval > 0 and ctx.is_running:
-            t0 = time.time()
-            while ctx.is_running and (time.time() - t0) < interval:
-                wait_if_paused(ctx)
-                time.sleep(0.05)
-
-        port_name = str(path_i)
-        ctx.log(f"[Sequence] {node.id[:6]} 尝试路径 #{path_i}/{num_paths}  (出口端口={port_name})", "DEBUG")
-        annotate_step(ctx, node, "seq", note=f"try #{path_i}/{num_paths} -> {port_name}")
-
-        success, reason = _walk_branch_until_end(ctx, graph, runner, node.id, port_name)
-        last_reason = reason
-        if success:
-            path_ok = path_i
-            break
+    if mode == "complete":
+        # 完全求值模式：所有分支都必须成功才走 out_done，任一失败走 else
+        all_success = True
+        last_reason = ""
+        for path_i in range(1, num_paths + 1):
+            if not ctx.is_running:
+                break
+            if path_i > 1 and interval > 0 and ctx.is_running:
+                t0 = time.time()
+                while ctx.is_running and (time.time() - t0) < interval:
+                    wait_if_paused(ctx)
+                    time.sleep(0.05)
+            port_name = str(path_i)
+            ctx.log(f"[Sequence] {node.id[:6]} 完全模式 尝试路径 #{path_i}/{num_paths}", "DEBUG")
+            annotate_step(ctx, node, "seq", note=f"complete #{path_i}/{num_paths}")
+            success, reason = _walk_branch_until_end(ctx, graph, runner, node.id, port_name)
+            last_reason = reason
+            if not success:
+                all_success = False
+                ctx.log(f"[Sequence] 路径#{path_i} 失败：{reason}，完全模式→else", "DEBUG")
+                break
+        if all_success and ctx.is_running:
+            note = f"完全模式：全部 {num_paths} 条路径成功 → out_done"
+            ctx.log(f"[Sequence] {node.id[:6]} {note}", "INFO")
+            annotate_step(ctx, node, "seq", note=f"✓完全{num_paths}→out_done")
+            return {"out_done_path": num_paths, "out_num_paths": num_paths}, ["out_done"], ""
         else:
-            ctx.log(f"[Sequence] 路径#{path_i} 失败：{reason}，继续尝试下一条。", "DEBUG")
-
-    if path_ok is not None:
-        note = f"短路成功：路径#{path_ok}/{num_paths} 命中 → out_done；原因：{last_reason}"
-        ctx.log(f"[Sequence] {node.id[:6]} {note}", "INFO")
-        annotate_step(ctx, node, "seq", note=f"✓短路#{path_ok}→out_done")
-        return {"out_done_path": path_ok, "out_num_paths": num_paths}, ["out_done"], ""
+            note = f"完全模式：路径失败 → else；原因：{last_reason}"
+            ctx.log(f"[Sequence] {node.id[:6]} {note}", "WARN")
+            annotate_step(ctx, node, "seq", note=f"✗完全失败→else；{last_reason[:40]}")
+            return {"out_done_path": None, "out_num_paths": num_paths}, ["else"], ""
     else:
-        note = f"全部失败：{num_paths} 条路径无命中 → else；最后原因：{last_reason}"
-        ctx.log(f"[Sequence] {node.id[:6]} {note}", "WARN")
-        annotate_step(ctx, node, "seq", note=f"✗全失败→else；末因：{last_reason[:40]}")
-        return {"out_done_path": None, "out_num_paths": num_paths}, ["else"], ""
+        # 短路模式：任一分支成功即完成
+        path_ok: Optional[int] = None
+        last_reason = ""
+        for path_i in range(1, num_paths + 1):
+            if not ctx.is_running:
+                break
+            if path_i > 1 and interval > 0 and ctx.is_running:
+                t0 = time.time()
+                while ctx.is_running and (time.time() - t0) < interval:
+                    wait_if_paused(ctx)
+                    time.sleep(0.05)
+            port_name = str(path_i)
+            ctx.log(f"[Sequence] {node.id[:6]} 尝试路径 #{path_i}/{num_paths}  (出口端口={port_name})", "DEBUG")
+            annotate_step(ctx, node, "seq", note=f"try #{path_i}/{num_paths} -> {port_name}")
+            success, reason = _walk_branch_until_end(ctx, graph, runner, node.id, port_name)
+            last_reason = reason
+            if success:
+                path_ok = path_i
+                break
+            else:
+                ctx.log(f"[Sequence] 路径#{path_i} 失败：{reason}，继续尝试下一条。", "DEBUG")
+        if path_ok is not None:
+            note = f"短路成功：路径#{path_ok}/{num_paths} 命中 → out_done；原因：{last_reason}"
+            ctx.log(f"[Sequence] {node.id[:6]} {note}", "INFO")
+            annotate_step(ctx, node, "seq", note=f"✓短路#{path_ok}→out_done")
+            return {"out_done_path": path_ok, "out_num_paths": num_paths}, ["out_done"], ""
+        else:
+            note = f"全部失败：{num_paths} 条路径无命中 → else；最后原因：{last_reason}"
+            ctx.log(f"[Sequence] {node.id[:6]} {note}", "WARN")
+            annotate_step(ctx, node, "seq", note=f"✗全失败→else；末因：{last_reason[:40]}")
+            return {"out_done_path": None, "out_num_paths": num_paths}, ["else"], ""
 
 
 def _win32_popup(title: str, message: str, level: str) -> int:
@@ -1850,16 +2194,17 @@ def execute_Notify(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
     msg_raw = str(node.params.get("message", "") or "")
     level_raw = str(node.params.get("level", "INFO") or "INFO").upper()
     show_popup = bool(node.params.get("show_popup", False))
+    play_sound = bool(node.params.get("play_sound", False))
+    duration_sec = float(node.params.get("duration_sec", 3.0) or 3.0)
 
     # --- 第一阶段：普通插值（title/message 都走，但 message 先 disable ALL_VARS 留着最后一步替换） ---
     title = engine.interpolate(title_raw) if engine.has_any_marker(title_raw) else title_raw
-    # message 先做插值，但 {ALL_VARS} 不替换
     msg_without_allvars = (
         engine.interpolate(msg_raw, disable_all_vars=True)
         if engine.has_any_marker(msg_raw)
         else msg_raw
     )
-    # --- 第二阶段：message 单独替换 {ALL_VARS} / ${ALL_VARS}（最后一步，避免与其他变量占位冲突） ---
+    # --- 第二阶段：message 单独替换 {ALL_VARS} / ${ALL_VARS} ---
     all_vars_rendered = engine._render_all_vars() if isinstance(engine, VariableEngine) else VariableEngine(ctx.variables)._render_all_vars()
 
     def _replace_all_vars(text: str) -> str:
@@ -1872,26 +2217,39 @@ def execute_Notify(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
     msg_final = _replace_all_vars(msg_without_allvars)
     title_final = _replace_all_vars(str(title) if not isinstance(title, str) else title)
 
-    # 级别归一：INFO/WARN/ERROR/DEBUG（未知默认 INFO）
     if level_raw not in ("INFO", "WARN", "ERROR", "DEBUG"):
         level_final = "INFO"
     else:
         level_final = level_raw
 
-    # 日志输出（truncate 过大的 msg，防止主窗口日志卡）
+    # 日志输出
     log_body = str(msg_final)
     if len(log_body) > 4000:
         log_body = log_body[:4000] + "\n...（截断，完整内容看系统弹窗）"
     ctx.log(f"[{level_final}] {title_final}\n{log_body}" if log_body else f"[{level_final}] {title_final}", level_final)
 
-    # 系统弹窗：show_popup=True 才弹；ERROR/WARN 级别默认强制弹？— 文档默认4参数里 show_popup 只是开关，不额外强制
+    # 提示音
+    if play_sound:
+        try:
+            import ctypes
+            MB_ICONINFORMATION = 0x00000040
+            MB_ICONWARNING = 0x00000030
+            MB_ICONERROR = 0x00000010
+            icon = MB_ICONERROR if level_final == "ERROR" else (MB_ICONWARNING if level_final == "WARN" else MB_ICONINFORMATION)
+            # MessageBeep 只播放声音不弹窗
+            ctypes.windll.user32.MessageBeep(icon)
+        except Exception as e:
+            ctx.log(f"[Notify] 提示音失败: {e}", "DEBUG")
+
+    # 系统弹窗
     if show_popup:
         try:
             _win32_popup(str(title_final), str(msg_final), level_final)
         except Exception as e:
             ctx.log(f"[Notify] 弹窗失败: {e}", "WARN")
 
-    annotate_step(ctx, node, "notify", note=f"Notify {level_final}: {str(title_final)[:60]}")
+    note = f"Notify {level_final} {duration_sec:g}s: {str(title_final)[:50]}"
+    annotate_step(ctx, node, "notify", note=note)
     return {}, ["out_exec"], ""
 
 
@@ -1906,6 +2264,7 @@ def execute_IfImageDetect(ctx: ExecutionContext, node: Node, inputs: Dict[str, A
     - 无 timeout（只查一次，与 FindImage 区分）
     - 全部命中 -> yes；缺任何一张 -> no
     - images_json 每项：{path, b64}，优先用 runtime_attrs["_pil_images"] 缓存
+    - eval_mode: complete（完全求值，每张都测并输出分数）/ short_circuit（短路，遇到缺的立即返回）
     """
     wait_if_paused(ctx)
     data = node.params
@@ -1921,6 +2280,7 @@ def execute_IfImageDetect(ctx: ExecutionContext, node: Node, inputs: Dict[str, A
         imgs = []
     threshold = float(data.get("threshold", 0.9) or 0.9)
     strategy = str(data.get("match_strategy", "hybrid") or "hybrid")
+    eval_mode = str(data.get("eval_mode", "complete") or "complete")
 
     if not imgs:
         ctx.log("[IfImg] 没有配置参考图 -> no", "WARN")
@@ -1936,6 +2296,7 @@ def execute_IfImageDetect(ctx: ExecutionContext, node: Node, inputs: Dict[str, A
     tmp_paths: List[str] = []
     miss_name: Optional[str] = None
     hit_all = True
+    scores: List[str] = []  # 每张分数日志，完全求值时用
 
     try:
         for i, item in enumerate(imgs):
@@ -1944,8 +2305,12 @@ def execute_IfImageDetect(ctx: ExecutionContext, node: Node, inputs: Dict[str, A
                 break
             if not isinstance(item, dict):
                 miss_name = f"[{i}]无效项"
+                scores.append(f"[{i}] 无效=0.00")
                 hit_all = False
-                break
+                if eval_mode == "short_circuit":
+                    break
+                else:
+                    continue
             path = item.get("path", "") or ""
             pil = cached_pils[i] if i < len(cached_pils) else None
 
@@ -1964,10 +2329,15 @@ def execute_IfImageDetect(ctx: ExecutionContext, node: Node, inputs: Dict[str, A
 
             if not use_path:
                 miss_name = f"[{i}]无路径/无图"
+                scores.append(f"[{i}] 无图=0.00")
                 hit_all = False
-                break
+                if eval_mode == "short_circuit":
+                    break
+                else:
+                    continue
 
             pos = None
+            score_val = 0.0
             try:
                 if ctx.matcher is not None:
                     if strategy == "template":
@@ -1980,21 +2350,47 @@ def execute_IfImageDetect(ctx: ExecutionContext, node: Node, inputs: Dict[str, A
                             pos = ctx.matcher.find_image(use_path, threshold=threshold, fast_mode=False)
             except Exception as e:
                 ctx.log(f"[IfImg] 匹配异常[{i}]: {e}", "WARN")
+            # 尝试从返回对象拿分数（如果有）
+            try:
+                if pos is not None and isinstance(pos, (tuple, list)) and len(pos) >= 5:
+                    score_val = float(pos[4])
+                elif pos is not None and isinstance(pos, dict):
+                    score_val = float(pos.get("score") or pos.get("similarity") or threshold)
+                else:
+                    score_val = float(threshold) if pos is not None else 0.0
+            except Exception:
+                score_val = float(threshold) if pos is not None else 0.0
+
+            display = os.path.basename(str(path)) if path else f"image[{i}]"
+            scores.append(f"[{i}] {display} 分数={score_val:.2f} {'✓' if pos is not None else '✗'}")
 
             if pos is None:
-                display = os.path.basename(str(path)) if path else f"image[{i}]"
                 miss_name = display
-                ctx.log(f"[IfImg] 缺少: {display} -> no", "DEBUG")
+                ctx.log(f"[IfImg] 缺少: {display} (score={score_val:.2f}) -> no", "DEBUG")
                 hit_all = False
-                break
+                if eval_mode == "short_circuit":
+                    break
+            else:
+                ctx.log(f"[IfImg] 命中: {display} score={score_val:.2f}", "DEBUG")
+
+        # 完全求值时统一汇总输出
+        if eval_mode == "complete" and scores:
+            ctx.log("[IfImg] 匹配结果汇总(完全求值):\n  " + "\n  ".join(scores), "DEBUG")
 
         if hit_all and ctx.is_running:
             ctx.log(f"[IfImg] 全部{len(imgs)}张都存在 -> yes", "DEBUG")
-            annotate_step(ctx, node, "find", note=f"ALL PRESENT x{len(imgs)}")
+            annotate_step(ctx, node, "find", note=f"ALL PRESENT x{len(imgs)} [{eval_mode}]")
             return {}, ["yes"], ""
         else:
-            note = f"MISS: {miss_name}" if miss_name else f"仅命中 {i}/{len(imgs)}"
-            annotate_step(ctx, node, "find", note=note)
+            note_parts = []
+            if miss_name:
+                note_parts.append(f"MISS: {miss_name}")
+            note_parts.append(f"mode={eval_mode}")
+            # 完全求值可附带命中计数
+            if eval_mode == "complete":
+                hit_cnt = sum(1 for s in scores if "✓" in s)
+                note_parts.insert(0, f"{hit_cnt}/{len(imgs)}")
+            annotate_step(ctx, node, "find", note=" | ".join(note_parts))
             return {}, ["no"], ""
     finally:
         for p in tmp_paths:
@@ -2007,9 +2403,9 @@ def execute_IfImageDetect(ctx: ExecutionContext, node: Node, inputs: Dict[str, A
 # ---------------- 检测：静止（if_static） ----------------
 def execute_StillnessDetect(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
     """
-    对齐 Qflow if_static：指定 ROI 内连续 N 帧像素差 < 阈值即判定静止。
+    对齐 Qflow if_static：指定 ROI 内，在「静止持续时间」内像素差 < 阈值即判定静止。
     - roi: [x, y, w, h]
-    - 超时 ms 内不满足 -> no；满足 -> yes
+    - 超过「最大超时」仍不满足 -> no；满足 -> yes
     - 暂停检查：循环开头 + sleep 内
     """
     wait_if_paused(ctx)
@@ -2029,9 +2425,9 @@ def execute_StillnessDetect(ctx: ExecutionContext, node: Node, inputs: Dict[str,
     x, y, w, h = int(roi[0]), int(roi[1]), int(roi[2]), int(roi[3])
 
     dt = float(p.get("diff_threshold", 0.01) or 0.01)
-    need_stable = max(1, int(p.get("stable_frames", 3) or 3))
-    interval_ms = max(30, int(p.get("sample_interval_ms", 200) or 200))
-    timeout_ms = max(0, int(p.get("timeout_ms", 5000) or 5000))
+    stillness_seconds = max(0.1, float(p.get("stillness_seconds", 5.0) or 5.0))
+    sample_interval_seconds = max(0.03, float(p.get("sample_interval_seconds", 1.0) or 1.0))
+    timeout_seconds = max(1.0, float(p.get("timeout_seconds", 20.0) or 20.0))
 
     if w <= 0 or h <= 0:
         ctx.log("[if_static] 未设置ROI，先点右侧按钮框选区域 -> no", "WARN")
@@ -2039,10 +2435,10 @@ def execute_StillnessDetect(ctx: ExecutionContext, node: Node, inputs: Dict[str,
         return {}, ["no"], ""
 
     prev_roi: Optional[np.ndarray] = None
-    stable_cnt = 0
+    stable_since_ts: Optional[float] = None
     t0 = time.time()
-    timeout_s = timeout_ms / 1000.0 if timeout_ms > 0 else float("inf")
-    interval_s = interval_ms / 1000.0
+    timeout_s = timeout_seconds
+    interval_s = sample_interval_seconds
     last_diff = 0.0
 
     while (time.time() - t0) < timeout_s and ctx.is_running:
@@ -2064,20 +2460,22 @@ def execute_StillnessDetect(ctx: ExecutionContext, node: Node, inputs: Dict[str,
             )
             last_diff = diff
             if diff < dt:
-                stable_cnt += 1
-                if stable_cnt >= need_stable:
+                if stable_since_ts is None:
+                    stable_since_ts = time.time()
+                elapsed_s = time.time() - stable_since_ts
+                if elapsed_s >= stillness_seconds:
                     ctx.log(
-                        f"[if_static] 达到静止 stable_cnt={stable_cnt}, diff={diff:.4f} < {dt:.4f} -> yes",
+                        f"[if_static] 达到静止 持续={elapsed_s:.1f}s (要求>={stillness_seconds:.1f}s), diff={diff:.4f} < {dt:.4f} -> yes",
                         "DEBUG",
                     )
                     annotate_step(
                         ctx, node, "static",
-                        note=f"OK stable={stable_cnt} diff={diff:.3f}",
+                        note=f"OK stable={elapsed_s:.1f}s diff={diff:.3f}",
                         region=(x, y, w, h),
                     )
                     return {}, ["yes"], ""
             else:
-                stable_cnt = 0
+                stable_since_ts = None
                 annotate_step(
                     ctx, node, "moving",
                     note=f"diff={diff:.4f} >= {dt:.4f}",
@@ -2091,12 +2489,12 @@ def execute_StillnessDetect(ctx: ExecutionContext, node: Node, inputs: Dict[str,
             time.sleep(min(0.05, max(0.005, interval_s - (time.time() - t_sleep))))
 
     ctx.log(
-        f"[if_static] 超时 {timeout_ms}ms 仍未静止 (last_diff={last_diff:.4f}, stable={stable_cnt}/{need_stable}) -> no",
+        f"[if_static] 超时 {timeout_seconds:.1f}s 仍未静止 (last_diff={last_diff:.4f}, stable_since={stable_since_ts}) -> no",
         "DEBUG",
     )
     annotate_step(
         ctx, node, "static",
-        note=f"TIMEOUT last_diff={last_diff:.3f} stable={stable_cnt}",
+        note=f"TIMEOUT last_diff={last_diff:.3f}",
         region=(x, y, w, h),
     )
     return {}, ["no"], ""
@@ -2195,94 +2593,106 @@ def _ascii_waveform(data, peak_marker_db: float = -30.0, width: int = 60, height
 
 def execute_SoundDetect(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
     """
-    对齐 Qflow if_sound：系统播放/麦克风声音超阈值判定。
-    - 三种模式：amplitude_max / amplitude_mean / spectral_band
+    对齐 Qflow if_sound：系统播放/麦克风声音检测。
+    - judge_mode: detect_sound(检测声音) / detect_silence(检测静音)
     - 失败兜底：soundcard → PyAudio，都不可用 WARN 走 no
     """
     import numpy as np
 
     wait_if_paused(ctx)
     p = node.params
-    mode = str(p.get("judge_mode", "amplitude_max") or "amplitude_max")
+    mode_raw = str(p.get("judge_mode", "detect_sound") or "detect_sound")
+    # 兼容旧值（与旧版本 amplitude_max/mean/spectral_band 都映射为 detect_sound）
+    if mode_raw in ("detect_silence", "is_silent", "silence", "detect_mute"):
+        mode = "detect_silence"
+    else:
+        mode = "detect_sound"
     thr_db = float(p.get("threshold_db", -30.0) or -30.0)
     sample_ms = max(50, int(p.get("sample_ms", 500) or 500))
-    timeout_ms = max(0, int(p.get("timeout_ms", 5000) or 5000))
+    # 新 timeout_seconds 优先，旧 timeout_ms 兜底
+    if "timeout_seconds" in p and p.get("timeout_seconds") is not None:
+        timeout_s = max(0.0, float(p.get("timeout_seconds", 5.0) or 0.0))
+    else:
+        timeout_s = max(0.0, float(int(p.get("timeout_ms", 5000) or 0) / 1000.0))
     device = str(p.get("device", "default_loopback") or "default_loopback")
-    band_low = int(p.get("spectral_band_low_hz", 500) or 500)
-    band_high = int(p.get("spectral_band_high_hz", 2000) or 2000)
     debug_viz = bool(p.get("debug_visual", False))
     sr = 44100
 
     t0 = time.time()
-    timeout_cap_s = (timeout_ms / 1000.0) if timeout_ms > 0 else 86400.0 * 365
+    timeout_cap_s = timeout_s if timeout_s > 0 else (86400.0 * 365)
     sample_s = sample_ms / 1000.0
     note = ""
+    # 检测静音：需要累计稳定静音时长，这里简化为「单次采样期间全程静音」即判定；否则一直轮询
+    silence_consec_s = 0.0  # detect_silence 专用累计
+    last_sample_end = t0
+
     while (time.time() - t0) < timeout_cap_s and ctx.is_running:
         wait_if_paused(ctx)
         chunk = _capture_sound_blocking(device, sample_s, sr)
         if chunk is None:
             ctx.log(
-                "[if_sound] 音频采集库未安装或设备不可用，自动走 no。请 pip install soundcard PyAudio。"
-                " (PyAudio 安装失败可尝试：pip install pipwin && pipwin install pyaudio)",
+                "[if_sound] 音频采集库未安装或设备不可用，自动走 no。请先执行："
+                " pip install soundcard pyaudio "
+                "（PyAudio 安装失败可尝试： pip install pipwin && pipwin install pyaudio ）",
                 "WARN",
             )
             annotate_step(ctx, node, "sound", note="采集库不可用→no")
             return {"out_level_db": None}, ["no"], ""
 
+        # 计算峰值dB和均值dB
+        peak = float(np.max(np.abs(chunk)) + 1e-8)
+        mean = float(np.mean(np.abs(chunk)) + 1e-8)
+        peak_db = float(20.0 * np.log10(peak))
+        mean_db = float(20.0 * np.log10(mean))
+        out_db = peak_db
+
         yes = False
-        if mode == "amplitude_max":
-            peak = float(np.max(np.abs(chunk)) + 1e-8)
-            peak_db = 20.0 * np.log10(peak)
-            yes = peak_db >= thr_db
-            note = f"peak={peak_db:.1f}dB thr={thr_db:.0f}dB"
-        elif mode == "amplitude_mean":
-            mean = float(np.mean(np.abs(chunk)) + 1e-8)
-            mean_db = 20.0 * np.log10(mean)
-            yes = mean_db >= thr_db
-            note = f"mean={mean_db:.1f}dB thr={thr_db:.0f}dB"
-        else:  # spectral_band
-            n = len(chunk)
-            if n < 4:
-                yes = False
-                note = "chunk过短→no"
+        if mode == "detect_sound":
+            # 检测声音：只要出现一次峰值/均值超过阈值就算满足
+            yes = (peak_db >= thr_db) or (mean_db >= thr_db)
+            note = f"[{mode}] peak={peak_db:.1f}dB mean={mean_db:.1f}dB thr={thr_db:.0f}dB"
+        else:  # detect_silence
+            # 检测静音：整个采样期间 peak 必须低于阈值
+            sample_is_silent = (peak_db < thr_db) and (mean_db < thr_db)
+            now = time.time()
+            dt_last = max(0.0, now - last_sample_end)
+            last_sample_end = now
+            if sample_is_silent:
+                silence_consec_s += sample_s
             else:
-                win = np.hanning(n).astype(np.float32)
-                spec = np.abs(np.fft.rfft(chunk * win))
-                freqs = np.fft.rfftfreq(n, 1.0 / sr)
-                low, high = sorted([band_low, band_high])
-                mask = (freqs >= low) & (freqs <= high)
-                if not np.any(mask):
-                    band_energy = 0.0
-                else:
-                    band_energy = float(np.mean(spec[mask]) + 1e-8)
-                # thr_amp：阈值dB转振幅基准；经验公式：band_energy >= 10^(thr_db/20) * k
-                thr_amp = (10.0 ** (thr_db / 20.0)) * 0.05
-                yes = band_energy >= thr_amp
-                note = f"band[{low}-{high}Hz]energy={band_energy:.4f}(thr={thr_amp:.4f})"
+                silence_consec_s = 0.0
+            # 只要累计静音时长超过一次采样窗口就判定一次
+            yes = sample_is_silent and silence_consec_s >= sample_s
+            note = (
+                f"[{mode}] peak={peak_db:.1f}dB mean={mean_db:.1f}dB thr={thr_db:.0f}dB "
+                f"consec_silence={silence_consec_s:.2f}s"
+            )
+
         if debug_viz:
             wave = _ascii_waveform(chunk, peak_marker_db=thr_db)
             ctx.log(f"[if_sound waveform]\n{wave}\n判定={note} yes={yes}", "DEBUG")
+
         if yes:
-            ctx.log(f"[if_sound] ✅ 检测到声音：{note}", "DEBUG")
-            annotate_step(ctx, node, "sound", note=f"YES {note}")
-            out_db = float(thr_db)  # 简化：输出阈值供下游参考
-            try:
-                if mode == "amplitude_max":
-                    out_db = float(20.0 * np.log10(float(np.max(np.abs(chunk)) + 1e-8)))
-                elif mode == "amplitude_mean":
-                    out_db = float(20.0 * np.log10(float(np.mean(np.abs(chunk)) + 1e-8)))
-            except Exception:
-                pass
+            mode_cn = "检测声音" if mode == "detect_sound" else "检测静音"
+            ctx.log(f"[if_sound] ✅ {mode_cn} 满足条件：{note}", "DEBUG")
+            annotate_step(ctx, node, "sound", note=f"YES[{mode_cn}] peak={peak_db:.1f}dB")
             return {"out_level_db": round(out_db, 2)}, ["yes"], ""
-        # 轮询间隔
+
+        # 轮询间隔（避免死循环占CPU）
         t_slp = time.time()
         while (time.time() - t_slp) < 0.05 and ctx.is_running:
             wait_if_paused(ctx)
             time.sleep(0.01)
 
     # 超时
-    ctx.log(f"[if_sound] ⏱ 超时 {timeout_ms}ms，未检测到超阈值声音 → no（last={note}）", "DEBUG")
-    annotate_step(ctx, node, "sound", note=f"TIMEOUT({timeout_ms}ms) last={note[:50]}")
+    t_used_ms = int((time.time() - t0) * 1000)
+    mode_cn = "检测声音" if mode == "detect_sound" else "检测静音"
+    ctx.log(
+        f"[if_sound] ⏱ 超时 实际={t_used_ms}ms(要求≤{int(timeout_s*1000)}ms)，"
+        f"模式=[{mode_cn}]，条件未满足 → no（last={note}）",
+        "DEBUG",
+    )
+    annotate_step(ctx, node, "sound", note=f"TIMEOUT[{mode_cn}] last={note[:60]}")
     return {"out_level_db": None}, ["no"], ""
 
 
@@ -2300,7 +2710,6 @@ EXECUTORS = {
     "OpenApp": execute_OpenApp,
     "BindWindow": execute_BindWindow,
     "FindImage": execute_FindImage,
-    "FindAnyImage": execute_FindAnyImage,
     "Mouse": execute_Mouse,
     "PressKey": execute_PressKey,
     "SetVariable": execute_SetVariable,
@@ -2371,10 +2780,33 @@ class BlueprintRunner(QThread):
     # ---------------- 主循环 ----------------
     def run(self):
         run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.log_message.emit(f"[Runtime] 开始 run_id={run_id}", "INFO")
+
+        # ---------- 运行日志落盘：debug/runs/{id}/run_{id}.log ----------
+        run_dir = os.path.join(debug_dir(), "runs", run_id)
+        os.makedirs(run_dir, exist_ok=True)
+        log_path = os.path.join(run_dir, f"run_{run_id}.log")
+        log_fp = None
+        try:
+            log_fp = open(log_path, "a", encoding="utf-8")
+
+            def _write_log(msg: str, level: str = "INFO"):
+                ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                line = f"[{ts}] [{level}] {msg}\n"
+                if log_fp is not None:
+                    try:
+                        log_fp.write(line)
+                        log_fp.flush()
+                    except Exception:
+                        pass
+                self.log_message.emit(msg, level)
+
+            _write_log(f"[Runtime] 开始 run_id={run_id}", "INFO")
+        except Exception as _e:
+            _write_log = lambda m, l="INFO": self.log_message.emit(m, l)
+            self.log_message.emit(f"[Runtime] 创建运行日志文件失败: {_e}", "WARN")
 
         ctx = ExecutionContext(run_id=run_id)
-        ctx.log_fn = lambda m, l="INFO": self.log_message.emit(m, l)
+        ctx.log_fn = _write_log
         try:
             ctx.matcher = TemplateMatcher(
                 log_fn=ctx.log,
@@ -2394,13 +2826,13 @@ class BlueprintRunner(QThread):
         # 热键注册（硬约束 §3）
         self._hotkeys = HotkeyManager(
             on_stop=self.request_stop,
-            log_fn=lambda m, l="INFO": self.log_message.emit(m, l),
+            log_fn=lambda m, l="INFO": _write_log(m, l),
         )
         self._hotkeys.start()
 
         try:
             self._run_graph(ctx)
-            self.log_message.emit(
+            _write_log(
                 f"[Runtime] 完成：步骤 {ctx.step_counter} 个 | run_id={run_id}",
                 "SUCCESS" if ctx.is_running else "WARN",
             )
@@ -2408,13 +2840,18 @@ class BlueprintRunner(QThread):
             self.finished_ok.emit()
         except Exception as e:
             tb = traceback.format_exc()
-            self.log_message.emit(f"[Runtime] 执行异常: {e}\n{tb}", "ERROR")
+            _write_log(f"[Runtime] 执行异常: {e}\n{tb}", "ERROR")
             self.highlight_clear.emit()
             self.finished_err.emit(str(e))
         finally:
             try:
                 if self._hotkeys is not None:
                     self._hotkeys.stop()
+            except Exception:
+                pass
+            try:
+                if log_fp is not None:
+                    log_fp.close()
             except Exception:
                 pass
 

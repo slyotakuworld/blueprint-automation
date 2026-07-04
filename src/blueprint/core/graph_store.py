@@ -16,7 +16,6 @@ IMAGE_PARAM_NODES = {
     "FindImage",
     "IfImageDetect",
     "StillnessDetect",
-    "FindAnyImage",
 }
 
 
@@ -177,15 +176,12 @@ class BlueFormatUpgrader:
         data = nd.get("data", nd.get("params", {}) or {})
         mode = str(data.get("mode", "position") or "position")
         new_data: Dict[str, Any] = {
+            "coord_mode": "absolute",
             "action": "click",
-            "bind_mode": "screen_abs",
-            "pos_x": int(data.get("x", 0) or 0),
-            "pos_y": int(data.get("y", 0) or 0),
-            "click_rel": "[0.5, 0.5]",
-            "offset_x": 0,
-            "offset_y": 0,
-            "from_x": 0, "from_y": 0,
-            "to_x": 0, "to_y": 0,
+            "pos": [int(data.get("x", 0) or 0), int(data.get("y", 0) or 0)],
+            "offset": [0, 0],
+            "from_pos": [0, 0],
+            "to_pos": [0, 0],
             "drag_duration_ms": 300,
             "button": "left",
             "click_count": 2 if bool(data.get("double", False)) else 1,

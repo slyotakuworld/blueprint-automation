@@ -1,4 +1,5 @@
 import math
+import os
 import uuid
 from typing import Dict, List, Optional, Tuple
 
@@ -11,6 +12,7 @@ from PySide6.QtGui import (
     QPainterPath,
     QPainterPathStroker,
     QPen,
+    QPixmap,
     QPolygonF,
 )
 from PySide6.QtWidgets import (
@@ -54,6 +56,34 @@ COL_TUPLE4 = QColor("#F0B429")
 COL_PATH = QColor("#56D4DD")
 COL_STRING = QColor("#54AEFF")
 COL_ANY = QColor("#8B949E")
+
+
+# ============================================================
+# 辅助工具函数：b64 -> QPixmap（安全版，失败不抛异常）
+# ============================================================
+def _b64_to_qpixmap_safe(b64_text: str, size: int = 64) -> Optional[QPixmap]:
+    """将base64图片转为QPixmap，限定最大长宽为size；失败返回None。"""
+    if not b64_text:
+        return None
+    try:
+        import base64, io
+        from PIL import Image as PILImage
+        data = base64.b64decode(b64_text)
+        pil = PILImage.open(io.BytesIO(data))
+        pil.thumbnail((size, size), PILImage.LANCZOS)
+        if pil.mode not in ("RGBA", "RGB"):
+            pil = pil.convert("RGBA")
+        w, h = pil.size
+        # 转 QImage -> QPixmap
+        from PySide6.QtGui import QImage
+        if pil.mode == "RGBA":
+            qimg = QImage(pil.tobytes("raw", "RGBA"), w, h, QImage.Format_RGBA8888)
+        else:
+            qimg = QImage(pil.tobytes("raw", "RGB"), w, h, QImage.Format_RGB888)
+        pix = QPixmap.fromImage(qimg.copy())
+        return pix
+    except Exception:
+        return None
 
 
 def color_for_data(dt: str) -> QColor:
@@ -234,11 +264,427 @@ class NodeItem(QGraphicsObject):
     def _meta(self):
         return NODE_LIBRARY.get(self.node.type)
 
+    def _summary_text(self) -> str:
+        """返回节点关键参数摘要（显示在画布节点端口区域下方）。
+        各节点类型显示不同关键信息，便于用户直观识别节点用途。"""
+        n = self.node
+        p = n.params or {}
+        t = n.type
+        if t == "OpenApp":
+            path = str(p.get("path", "") or "").strip()
+            if not path:
+                return ""
+            name = os.path.basename(path)
+            args = str(p.get("args", "") or "").strip()
+            return f"▶ {name} {args}".strip()
+        if t == "BindWindow":
+            parts = []
+            title = str(p.get("title", "") or "").strip()
+            exe = str(p.get("exe_name", "") or "").strip()
+            cls = str(p.get("class_name", "") or "").strip()
+            if title:
+                parts.append(f"标题:{title}")
+            if exe:
+                parts.append(f"程序:{exe}")
+            if cls:
+                parts.append(f"类:{cls}")
+            return " | ".join(parts) if parts else ""
+        if t == "WebBrowser":
+            action = str(p.get("action", "") or "").strip()
+            url = str(p.get("url", "") or "").strip()
+            if not url:
+                return f"[{action}]" if action else ""
+            if len(url) > 38:
+                url = url[:36] + "…"
+            return f"[{action}] {url}" if action else url
+        if t == "Command":
+            mode = str(p.get("shell_mode", "") or "").strip()
+            cap = p.get("capture_streams", True)
+            cap_txt = "捕获输出" if cap else "不捕获"
+            mode_map = {"cmd_c": "CMD", "powershell": "PowerShell", "no_shell": "直执行"}
+            mode_txt = mode_map.get(mode, mode)
+            return f"[{mode_txt}] {cap_txt}"
+        if t == "HttpRequest":
+            method = str(p.get("method", "") or "").strip()
+            url = str(p.get("url", "") or "").strip()
+            if not url:
+                return f"[{method}]" if method else ""
+            if len(url) > 36:
+                url = url[:34] + "…"
+            return f"[{method}] {url}" if method else url
+        if t == "Loop":
+            infinite = bool(p.get("infinite", False))
+            interval = float(p.get("interval_sec", 1.0) or 1.0)
+            if infinite:
+                return f"∞ 无限循环  间隔{interval:g}s"
+            max_it = int(p.get("max_iterations", 5) or 5)
+            return f"循环{max_it}次  间隔{interval:g}s"
+        if t == "Sequence":
+            mode = str(p.get("mode", "short_circuit") or "short_circuit")
+            mode_txt = "完全求值" if mode == "complete" else "短路模式"
+            interval = float(p.get("interval_sec", 1.0) or 1.0)
+            num = int(p.get("num_paths", 3) or 3)
+            return f"[{mode_txt}] {num}路径  间隔{interval:g}s"
+        if t == "Notify":
+            msg = str(p.get("message", "") or "").strip()
+            duration = float(p.get("duration_sec", 3.0) or 3.0)
+            sound = bool(p.get("play_sound", False))
+            popup = bool(p.get("show_popup", False))
+            tags = []
+            if popup:
+                tags.append("弹窗")
+            if sound:
+                tags.append("🔊")
+            tag_txt = f" {' '.join(tags)}" if tags else ""
+            msg_preview = msg.replace("\n", " ")[:30]
+            if len(msg) > 30:
+                msg_preview += "…"
+            return f"{duration:g}s{tag_txt} {msg_preview}"
+        if t == "VarSwitch":
+            from ..core.node_library import parse_varswitch_conditions
+            raw = str(p.get("cases", "") or "")
+            # 新格式解析
+            conds = parse_varswitch_conditions(raw if isinstance(raw, str) else "")
+            valid = [c for c in conds if not c.get("error")]
+            if valid:
+                labels = [c["label"] for c in valid]
+                preview = " ".join(labels[:6])
+                if len(labels) > 6:
+                    preview += f"…+{len(labels)-6}"
+                return f"{len(valid)}条件: {preview}"
+            # 兼容旧格式简单显示
+            if isinstance(raw, list):
+                ids = [str(x.get("id", "")).strip() for x in raw if isinstance(x, dict) and str(x.get("id", "")).strip()]
+                return f"旧格式: {', '.join(ids[:5])}" if ids else ""
+            stripped = (raw if isinstance(raw, str) else "").strip()
+            if stripped:
+                # 旧格式行式 id=value
+                if "=" in stripped and not stripped.startswith("#"):
+                    ids = []
+                    for line in stripped.splitlines():
+                        if "=" in line and not line.strip().startswith("#"):
+                            ids.append(line.split("=", 1)[0].strip())
+                    if ids:
+                        return f"旧格式: {', '.join(ids[:5])}"
+            return "（未设置条件）"
+        if t == "Clipboard":
+            mode = str(p.get("mode", "read") or "read")
+            mode_map = {"read": "读取", "write": "写入", "clear": "清空"}
+            return f"[{mode_map.get(mode, mode)}]"
+        if t == "Mouse":
+            coord_mode = str(p.get("coord_mode", "relative") or "relative")
+            coord_txt = "相对" if coord_mode == "relative" else "绝对"
+            action = str(p.get("action", "click") or "click")
+            action_map = {
+                "click": "点击", "press": "按住", "release": "释放",
+                "move": "移动", "drag": "拖拽", "scroll": "滚动",
+            }
+            action_txt = action_map.get(action, action)
+            # 附加关键信息
+            extra = ""
+            if action in ("click", "press", "release", "drag"):
+                btn = str(p.get("button", "left") or "left")
+                btn_map = {"left": "左", "right": "右", "middle": "中", "x1": "侧1", "x2": "侧2"}
+                extra = btn_map.get(btn, btn)
+                if action == "click":
+                    cnt = int(p.get("click_count", 1) or 1)
+                    if cnt >= 2:
+                        extra += f"x{cnt}"
+            elif action == "scroll":
+                dy = int(p.get("scroll_dy", 0) or 0)
+                extra = f"{'上' if dy > 0 else '下'}{abs(dy)}格"
+            # 坐标点
+            pos_txt = ""
+            if action in ("click", "press", "move", "scroll"):
+                pos_val = p.get("pos", (0, 0))
+                if isinstance(pos_val, (tuple, list)) and len(pos_val) == 2:
+                    pos_txt = f" ({int(pos_val[0])},{int(pos_val[1])})"
+            elif action == "drag":
+                from_val = p.get("from_pos", (0, 0))
+                to_val = p.get("to_pos", (0, 0))
+                if isinstance(from_val, (tuple, list)) and isinstance(to_val, (tuple, list)):
+                    pos_txt = f" ({int(from_val[0])},{int(from_val[1])})→({int(to_val[0])},{int(to_val[1])})"
+            return f"[{coord_txt}][{action_txt}] {extra}{pos_txt}".strip()
+        if t == "PressKey":
+            kb_mode = str(p.get("kb_mode", "text") or "text")
+            if kb_mode == "text":
+                text = str(p.get("text", "") or "").strip()
+                use_paste = bool(p.get("use_paste", True))
+                press_enter = bool(p.get("press_enter", False))
+                tags = []
+                if use_paste:
+                    tags.append("粘贴")
+                if press_enter:
+                    tags.append("↵")
+                tag_txt = f" [{' '.join(tags)}]" if tags else ""
+                preview = text.replace("\n", " ")[:24]
+                if len(text) > 24:
+                    preview += "…"
+                return f"[输入文本]{tag_txt} {preview}".strip()
+            else:
+                key_name = str(p.get("key_name", "") or "").strip()
+                count = int(p.get("count", 1) or 1)
+                cnt_txt = f" x{count}" if count > 1 else ""
+                return f"[按键组合] {key_name}{cnt_txt}"
+        if t == "Wait":
+            delay_type = str(p.get("delay_type", "fixed") or "fixed")
+            if delay_type == "random":
+                min_s = float(p.get("min_seconds", 1.0) or 1.0)
+                max_s = float(p.get("max_seconds", 3.0) or 3.0)
+                return f"[随机] {min_s:g}~{max_s:g}s"
+            else:
+                sec = float(p.get("seconds", 1.0) or 1.0)
+                return f"[固定] {sec:g}s"
+        return ""
+
+    def _summary_lines(self) -> List[str]:
+        """返回多行摘要（用于 SetVariable / VarSwitch / StillnessDetect / IfImageDetect 等需要多行显示的节点）。
+        每行一个字符串，节点高度会根据行数自适应。"""
+        n = self.node
+        p = n.params or {}
+        t = n.type
+        if t == "StillnessDetect":
+            still_s = float(p.get("stillness_seconds", 5.0) or 5.0)
+            tout_s = float(p.get("timeout_seconds", 20.0) or 20.0)
+            samp_s = float(p.get("sample_interval_seconds", 1.0) or 1.0)
+            lines = [
+                f"⏱ 静止持续 {still_s:g}s  |  ⏰ 超时 {tout_s:g}s  |  📷 间隔 {samp_s:g}s",
+            ]
+            roi_raw = p.get("roi", "[0,0,0,0]")
+            try:
+                if isinstance(roi_raw, str) and roi_raw:
+                    import json as _json
+                    roi = [int(v) for v in _json.loads(roi_raw)]
+                elif isinstance(roi_raw, (list, tuple)) and len(roi_raw) >= 4:
+                    roi = [int(v) for v in list(roi_raw)[:4]]
+                else:
+                    roi = [0, 0, 0, 0]
+            except Exception:
+                roi = [0, 0, 0, 0]
+            if len(roi) >= 4 and roi[2] > 0 and roi[3] > 0:
+                x, y, w, h = roi[0], roi[1], roi[2], roi[3]
+                lines.append(f"🎯 ROI: ({x},{y}) {w}×{h}")
+            else:
+                lines.append("🎯 ROI: （未设置）")
+            # 如果有预览图，预留预览占位行（实际图像由paint方法绘制）
+            b64 = str(p.get("roi_preview_b64", "") or "")
+            if b64:
+                lines.append("[__PREVIEW__:stillness]")  # 仅用于高度计算
+            return lines
+        if t == "FindImage":
+            algo = str(p.get("match_strategy", "hybrid") or "hybrid")
+            algo_map = {"hybrid": "智能混合", "template": "模板匹配", "feature": "特征匹配"}
+            algo_txt = algo_map.get(algo, algo)
+            thr = float(p.get("threshold", 0.75) or 0.75)
+            tout = float(p.get("timeout_seconds", 10.0) or 10.0)
+            auto = bool(p.get("auto_scroll", False))
+            # 显示 scroll_dy / scroll_dx 具体数值
+            if auto:
+                try:
+                    sdy = int(p.get("scroll_dy", -500) or -500)
+                except Exception:
+                    sdy = int(p.get("scroll_amount", -500) or -500)
+                sdx = int(p.get("scroll_dx", 0) or 0)
+                scroll_parts = []
+                if sdy != 0:
+                    scroll_parts.append(f"Δy{sdy}")
+                if sdx != 0:
+                    scroll_parts.append(f"Δx{sdx}")
+                if not scroll_parts:
+                    scroll_parts.append("0")
+                scroll_note = "滚动:ON(" + ",".join(scroll_parts) + ")"
+            else:
+                scroll_note = "滚动:OFF"
+            act = str(p.get("after_action", "none") or "none")
+            act_map = {
+                "none": "动作:无", "click": "动作:单击", "double_click": "动作:双击",
+                "right_click": "动作:右键",
+            }
+            act_txt = act_map.get(act, act)
+            # 如果动作不为none，展示 offset 数值（优先 tuple2，其次 offset_x/offset_y）
+            if act != "none":
+                _o = p.get("offset")
+                if isinstance(_o, (list, tuple)) and len(_o) >= 2:
+                    try:
+                        ox, oy = int(_o[0]), int(_o[1])
+                    except Exception:
+                        ox, oy = int(p.get("offset_x", 0) or 0), int(p.get("offset_y", 0) or 0)
+                else:
+                    ox, oy = int(p.get("offset_x", 0) or 0), int(p.get("offset_y", 0) or 0)
+                if ox != 0 or oy != 0:
+                    act_txt += f"(+{ox},+{oy})"
+                else:
+                    act_txt += "(+0,+0)"
+            lines = [
+                f"算法:{algo_txt}  相似度≥{thr:.2f}  超时{tout:g}s",
+                f"{scroll_note}  {act_txt}",
+            ]
+            # 如果有模板b64预览，加预览占位
+            tb = str(p.get("template_b64", "") or "")
+            if tb:
+                lines.append("[__PREVIEW__:findimg]")
+            return lines
+        if t == "IfImageDetect":
+            mode = str(p.get("eval_mode", "complete") or "complete")
+            mode_txt = "完全求值" if mode == "complete" else "短路模式"
+            algo = str(p.get("match_strategy", "hybrid") or "hybrid")
+            algo_map = {"hybrid": "混合匹配", "template": "模板匹配", "feature": "特征匹配"}
+            algo_txt = algo_map.get(algo, algo)
+            thr = float(p.get("threshold", 0.9) or 0.9)
+            # 图片数
+            img_count = 0
+            images_raw = p.get("images_json", "[]")
+            try:
+                if isinstance(images_raw, str) and images_raw:
+                    import json as _json
+                    imgs = _json.loads(images_raw)
+                elif isinstance(images_raw, list):
+                    imgs = images_raw
+                else:
+                    imgs = []
+                img_count = len(imgs) if isinstance(imgs, list) else 0
+            except Exception:
+                img_count = 0
+            lines = [
+                f"[{mode_txt}]  算法:{algo_txt}  相似度≥{thr:.2f}",
+                f"🖼 参考图: {img_count}张",
+            ]
+            # 如果有图片，加预览标记行（用于高度计算；实际图像由paint绘制）
+            if img_count > 0:
+                lines.append("[__PREVIEW__:ifimg]")
+            return lines
+        if t == "SoundDetect":
+            mode = str(p.get("judge_mode", "detect_sound") or "detect_sound")
+            mode_cn = "检测声音" if mode in ("detect_sound", "sound") else "检测静音"
+            tout = float(p.get("timeout_seconds", 5.0) or 5.0)
+            sample_ms = int(p.get("sample_ms", 500) or 500)
+            thr = float(p.get("threshold_db", -30.0) or -30.0)
+            lines = [
+                f"🎧 {mode_cn}  |  ⏰ 超时{tout:g}s",
+                f"采样{sample_ms}ms  |  阈值{thr:g}dB",
+            ]
+            return lines
+        if t == "SetVariable":
+            batch = str(p.get("batch_text", "") or "").strip()
+            if not batch:
+                return ["（未设置变量）"]
+            lines = []
+            for line in batch.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" in line:
+                    name = line.split("=", 1)[0].strip()
+                    val = line.split("=", 1)[1].strip()
+                    if len(val) > 20:
+                        val = val[:18] + "…"
+                    lines.append(f"{name} = {val}")
+                else:
+                    lines.append(line)
+                if len(lines) >= 8:
+                    lines.append("…")
+                    break
+            return lines if lines else ["（未设置变量）"]
+        if t == "VarSwitch":
+            from ..core.node_library import parse_varswitch_conditions
+            raw = str(p.get("cases", "") or "")
+            conds = parse_varswitch_conditions(raw if isinstance(raw, str) else "")
+            lines: List[str] = []
+            err_count = 0
+            for c in conds:
+                if c.get("error"):
+                    err_count += 1
+                    continue
+                lab = str(c.get("label", ""))
+                if len(lab) > 40:
+                    lab = lab[:38] + "…"
+                lines.append(f"● {lab}")
+                if len(lines) >= 6:
+                    break
+            # 还有没显示的条件，追加计数
+            shown_ok = len([c for c in conds if not c.get("error")])
+            if shown_ok > len(lines):
+                lines.append(f"  …还有 {shown_ok - len(lines)} 条条件")
+            if err_count > 0:
+                lines.append(f"⚠ {err_count} 处格式错误（点「检查格式」查看）")
+            if not lines and not conds:
+                # 没任何条件，也没旧格式兜底，显示空提示
+                # 先看旧格式是否有内容，有就按旧格式提示
+                stripped = raw.strip()
+                if isinstance(raw, list) and raw:
+                    lines.append("（旧格式条件判断）")
+                elif stripped:
+                    lines.append("（条件待检查/格式错误）")
+                else:
+                    lines.append("（未设置条件）")
+            return lines
+        return []
+
+    def _has_summary(self) -> bool:
+        """是否支持摘要显示区域（用于固定节点高度，避免有/无内容时高度跳变）。"""
+        return self.node.type in (
+            "OpenApp", "BindWindow", "WebBrowser", "Command", "HttpRequest",
+            "Loop", "Sequence", "Notify", "VarSwitch", "Clipboard", "SetVariable",
+            "Mouse", "PressKey", "Wait",
+            "StillnessDetect", "IfImageDetect", "FindImage", "SoundDetect",
+        )
+
+    def _preview_extra_height(self) -> int:
+        """如果节点有预览图（StillnessDetect ROI预览 或 FindImage模板 或 IfImageDetect参考图缩略图），返回额外高度。"""
+        t = self.node.type
+        p = self.node.params or {}
+        if t == "StillnessDetect":
+            b64 = str(p.get("roi_preview_b64", "") or "")
+            if not b64:
+                return 0
+            return 92  # 单张预览图高度 + 上下padding
+        if t == "FindImage":
+            # 仅模板预览（搜索区域功能已移除）
+            tb64 = str(p.get("template_b64", "") or "")
+            has_tpl = bool(tb64)
+            if not has_tpl:
+                path = str(p.get("template", "") or "")
+                import os as _os
+                if isinstance(path, str) and path and _os.path.exists(path):
+                    has_tpl = True
+            return 92 if has_tpl else 0
+        if t == "IfImageDetect":
+            raw = p.get("images_json", "[]")
+            imgs = []
+            try:
+                if isinstance(raw, str) and raw:
+                    import json as _json
+                    imgs = _json.loads(raw)
+                elif isinstance(raw, list):
+                    imgs = raw
+            except Exception:
+                imgs = []
+            if not isinstance(imgs, list) or len(imgs) == 0:
+                return 0
+            # 每行最多显示4张，每张约60px高 + padding
+            cols = 4
+            rows = (len(imgs) + cols - 1) // cols
+            return 16 + rows * 64
+        return 0
+
     def node_height(self) -> int:
         n_in = max(1, len(self.node.inputs))
         n_out = max(1, len(self.node.outputs))
         rows = max(n_in, n_out)
-        return NODE_HEADER_H + rows * NODE_PORT_H + 10
+        h = NODE_HEADER_H + rows * NODE_PORT_H + 10
+        # 支持摘要的节点类型固定预留摘要区域高度，保持高度一致
+        if self._has_summary():
+            # 多行摘要：根据行数动态调整高度
+            multi = self._summary_lines()
+            # 过滤预览标记行（[__PREVIEW__:*]），这些行的高度由_preview_extra_height控制
+            text_lines = [l for l in multi if not (isinstance(l, str) and l.startswith("[__PREVIEW__:"))]
+            if text_lines:
+                h += 18 + len(text_lines) * 16
+            else:
+                h += 28
+            # 预览图额外高度
+            h += self._preview_extra_height()
+        return h
 
     def _build_ports(self):
         h = self.node_height()
@@ -337,7 +783,7 @@ class NodeItem(QGraphicsObject):
         painter.setPen(pen)
 
         for i, p in enumerate(self.node.inputs):
-            y = NODE_HEADER_H + 5 + i * NODE_PORT_H
+            y = NODE_HEADER_H + 5 + NODE_PORT_H / 2 + i * NODE_PORT_H
             label = p.label or p.name
             tx = PORT_MARGIN_X + PORT_RADIUS + 4
             painter.drawText(
@@ -346,7 +792,7 @@ class NodeItem(QGraphicsObject):
                 label,
             )
         for i, p in enumerate(self.node.outputs):
-            y = NODE_HEADER_H + 5 + i * NODE_PORT_H
+            y = NODE_HEADER_H + 5 + NODE_PORT_H / 2 + i * NODE_PORT_H
             label = p.label or p.name
             tx = NODE_WIDTH / 2
             painter.drawText(
@@ -355,6 +801,108 @@ class NodeItem(QGraphicsObject):
                 Qt.AlignVCenter | Qt.AlignRight,
                 label,
             )
+
+        # 关键参数摘要（端口区域下方，浅色小字）
+        summary = self._summary_text()
+        multi_lines = self._summary_lines()
+        # 过滤预览标记行，这些不是真的文本行
+        text_lines = [l for l in multi_lines if not (isinstance(l, str) and l.startswith("[__PREVIEW__:"))]
+        if summary or text_lines:
+            n_in = max(1, len(self.node.inputs))
+            n_out = max(1, len(self.node.outputs))
+            rows = max(n_in, n_out)
+            sy = NODE_HEADER_H + 5 + rows * NODE_PORT_H + 4
+            f3 = QFont()
+            f3.setPointSize(8)
+            painter.setFont(f3)
+            painter.setPen(QPen(QColor("#8B949E")))
+            cursor_y = sy
+            if text_lines:
+                # 多行摘要：逐行绘制
+                for i, line in enumerate(text_lines):
+                    painter.drawText(
+                        QRectF(8, cursor_y, NODE_WIDTH - 16, 16),
+                        Qt.AlignVCenter | Qt.AlignLeft,
+                        line,
+                    )
+                    cursor_y += 16
+            else:
+                painter.drawText(
+                    QRectF(8, cursor_y, NODE_WIDTH - 16, 22),
+                    Qt.AlignVCenter | Qt.AlignLeft,
+                    summary,
+                )
+                cursor_y += 22
+            # 预览图绘制（StillnessDetect / FindImage / IfImageDetect）
+            t = self.node.type
+            p = self.node.params or {}
+            if t == "StillnessDetect":
+                b64 = str(p.get("roi_preview_b64", "") or "")
+                if b64:
+                    cursor_y += 8
+                    pix = _b64_to_qpixmap_safe(b64, size=72)
+                    if pix is not None:
+                        px = (NODE_WIDTH - pix.width()) // 2
+                        painter.drawPixmap(px, cursor_y, pix)
+            elif t == "FindImage":
+                # 模板预览（template_b64 或有 template 路径）
+                tb64 = str(p.get("template_b64", "") or "")
+                # 没有b64但有路径，直接从路径读（慢一些，但兼容性好
+                pil_from_path = None
+                import os as _os
+                if not tb64:
+                    path = str(p.get("template", "") or "")
+                    if isinstance(path, str) and path and _os.path.exists(path):
+                        try:
+                            import base64 as _b64, io as _io
+                            from PIL import Image as _PILImg
+                            _tmp = _PILImg.open(path)
+                            _buf = _io.BytesIO()
+                            _tmp.save(_buf, format="PNG")
+                            tb64 = _b64.b64encode(_buf.getvalue()).decode("ascii")
+                        except Exception:
+                            tb64 = ""
+                if tb64:
+                    cursor_y += 8
+                    pix = _b64_to_qpixmap_safe(tb64, size=72)
+                    if pix is not None:
+                        painter.fillRect(12, cursor_y - 2, NODE_WIDTH - 24, 76, QColor("#0D1117"))
+                        px = (NODE_WIDTH - pix.width()) // 2
+                        painter.drawPixmap(px, cursor_y, pix)
+            elif t == "IfImageDetect":
+                raw = p.get("images_json", "[]")
+                imgs = []
+                try:
+                    if isinstance(raw, str) and raw:
+                        import json as _json
+                        imgs = _json.loads(raw)
+                    elif isinstance(raw, list):
+                        imgs = raw
+                except Exception:
+                    imgs = []
+                if isinstance(imgs, list) and len(imgs) > 0:
+                    cursor_y += 8
+                    cols = 4
+                    thumb_w = (NODE_WIDTH - 16 - (cols - 1) * 4) // cols
+                    thumb_h = 56
+                    for idx, img in enumerate(imgs):
+                        col = idx % cols
+                        row = idx // cols
+                        bx = 8 + col * (thumb_w + 4)
+                        by = cursor_y + row * (thumb_h + 4)
+                        b64_img = ""
+                        if isinstance(img, dict):
+                            b64_img = str(img.get("b64", "") or "")
+                        if b64_img:
+                            pix = _b64_to_qpixmap_safe(b64_img, size=min(thumb_w, thumb_h))
+                            if pix is not None:
+                                px = bx + (thumb_w - pix.width()) // 2
+                                py = by + (thumb_h - pix.height()) // 2
+                                painter.drawPixmap(px, py, pix)
+                            else:
+                                painter.fillRect(bx, by, thumb_w, thumb_h, QColor("#2D333B"))
+                        else:
+                            painter.fillRect(bx, by, thumb_w, thumb_h, QColor("#2D333B"))
 
         # 运行高亮
         if self._running:
