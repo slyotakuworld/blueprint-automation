@@ -290,13 +290,12 @@ class NodeItem(QGraphicsObject):
                 parts.append(f"类:{cls}")
             return " | ".join(parts) if parts else ""
         if t == "WebBrowser":
-            action = str(p.get("action", "") or "").strip()
             url = str(p.get("url", "") or "").strip()
             if not url:
-                return f"[{action}]" if action else ""
-            if len(url) > 38:
-                url = url[:36] + "…"
-            return f"[{action}] {url}" if action else url
+                return ""
+            if len(url) > 42:
+                url = url[:40] + "…"
+            return url
         if t == "Command":
             mode = str(p.get("shell_mode", "") or "").strip()
             cap = p.get("capture_streams", True)

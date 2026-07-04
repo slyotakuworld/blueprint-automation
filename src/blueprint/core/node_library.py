@@ -44,7 +44,7 @@ CATEGORY_NODE_ORDER: Dict[str, List[str]] = {
     CATEGORY_APP: [
         "OpenApp",       # 1、打开程序
         "BindWindow",    # 2、绑定窗口
-        "WebBrowser",    # 3、网页（浏览器操作：开URL/刷新/回退/前进）
+        "WebBrowser",    # 3、打开网页（浏览器打开URL）
         "Command",       # 4、系统命令
         "HttpRequest",   # 5、HTTP请求（接口调用：GET/POST/PUT/DELETE/Header/Body/超时）
     ],
@@ -650,8 +650,8 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
     "WebBrowser": NodeMeta(
         type="WebBrowser",
         category=CATEGORY_APP,
-        title="网页操作",
-        description="帮汝开浏览器~打开指定网址，或者刷新、后退、前进都行，默认浏览器或者Chrome/Edge/Firefox随便汝选。",
+        title="打开网页",
+        description="帮汝开浏览器访问指定网址，默认浏览器或者Chrome/Edge/Firefox随便汝选。",
         color="#01579b",
         accent="#29b6f6",
         inputs=[_exec_in()],
@@ -660,10 +660,6 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
             _exec_out("err", label="失败/超时"),
         ],
         params=[
-            ParamDef(name="action", editor=EDITOR_ENUM, default="打开",
-                     options=["打开", "刷新", "后退", "前进"],
-                     label="动作",
-                     ),
             ParamDef(name="url", editor=EDITOR_STRING,
                      label="URL",
                      default="https://www.baidu.com/s?wd={keyword}", required=True

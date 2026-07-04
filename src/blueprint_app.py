@@ -1981,7 +1981,7 @@ class BlueprintMainWindow(QMainWindow):
             else:
                 self._log.append_log("静态校验提示：\n" + msg, "WARN")
         # 2. 启动 runner（QThread 硬约束 §4）
-        runner = BlueprintRunner(self._graph, self)
+        runner = BlueprintRunner(self._graph, self, initial_hwnd=self.get_active_hwnd())
         runner.log_message.connect(self._log.append_log, Qt.QueuedConnection)
         runner.highlight_node.connect(
             lambda nid, s=self._scene: s.set_running_node(nid), Qt.QueuedConnection,

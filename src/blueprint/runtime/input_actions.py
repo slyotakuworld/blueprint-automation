@@ -219,6 +219,7 @@ class InputActions:
         random_offset_radius=8,
         hold_ms_range=(30, 80),
         post_delay_range=(80, 200),
+        repeat=1,
     ):
         if not self._running() or not pos:
             return None
@@ -226,33 +227,47 @@ class InputActions:
             x, y, w, h = pos
             cx = int(x) + int(w) // 2
             cy = int(y) + int(h) // 2
-            actual_pos = (cx, cy)
+            base_pos = (cx, cy)
         else:
-            actual_pos = (int(pos[0]), int(pos[1]))
-        actual_pos = self._apply_random_offset(actual_pos, random_offset_radius)
-        x, y = actual_pos
-        self._hw_mouse_move(x, y)
-        time.sleep(0.05)
-        click_count = 2 if double else 1
-        for i in range(click_count):
+            base_pos = (int(pos[0]), int(pos[1]))
+
+        repeat_n = max(1, int(repeat or 1))
+        last_actual = None
+        last_hold = 0
+        last_post = 0
+        for r in range(repeat_n):
             if not self._running():
                 return None
-            hold_ms = random.randint(int(hold_ms_range[0]), int(hold_ms_range[1]))
-            pydirectinput.mouseDown()
-            time.sleep(hold_ms / 1000.0)
-            pydirectinput.mouseUp()
-            if i < click_count - 1:
-                time.sleep(0.08)
-        post_delay_ms = random.randint(int(post_delay_range[0]), int(post_delay_range[1]))
-        time.sleep(post_delay_ms / 1000.0)
+            actual_pos = self._apply_random_offset(base_pos, random_offset_radius)
+            x, y = actual_pos
+            last_actual = actual_pos
+            self._hw_mouse_move(x, y)
+            time.sleep(0.05)
+            click_count = 2 if double else 1
+            for i in range(click_count):
+                if not self._running():
+                    return None
+                hold_ms = random.randint(int(hold_ms_range[0]), int(hold_ms_range[1]))
+                last_hold = hold_ms
+                pydirectinput.mouseDown()
+                time.sleep(hold_ms / 1000.0)
+                pydirectinput.mouseUp()
+                if i < click_count - 1:
+                    time.sleep(0.08)
+            post_delay_ms = random.randint(int(post_delay_range[0]), int(post_delay_range[1]))
+            last_post = post_delay_ms
+            if r < repeat_n - 1:
+                time.sleep(post_delay_ms / 1000.0)
+
         if self.safe_region and len(self.safe_region) == 4:
             gx, gy, _, _ = self.safe_region
             self._hw_mouse_move(gx + 5, gy + 5)
         else:
             self._hw_mouse_move(5, 5)
         time.sleep(0.05)
+        repeat_txt = f" x{repeat_n}" if repeat_n > 1 else ""
         self._log(
-            f"[Input] 点击 ({x},{y}) double={double} "
-            f"hold~{hold_ms}ms post~{post_delay_ms}ms"
+            f"[Input] 点击 ({base_pos[0]},{base_pos[1]}) double={double}{repeat_txt} "
+            f"hold~{last_hold}ms post~{last_post}ms"
         )
-        return actual_pos
+        return last_actual

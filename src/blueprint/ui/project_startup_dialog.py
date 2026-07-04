@@ -179,8 +179,7 @@ class ProjectStartupDialog(QDialog):
             "上次蓝图画到一半？没关系，咱帮汝把进度好好收在工程目录里了，<br>"
             "所有连线、节点、截图模板、切图缓存一个都不会少，连线都乖乖连在原来的位置哦！<br>"
             "<br>"
-            "开工小贴士（贤狼の智慧）：<b style='color:#58A6FF'>F5</b> 直接运行当前蓝图，<b style='color:#58A6FF'>F7</b> 随时喊停，<br>"
-            "<b style='color:#58A6FF'>F8</b> 一键截图切分，<b style='color:#58A6FF'>Ctrl+S/Z/C/V</b> 都给汝设好了，不用找按钮～<br>"
+            "开工小贴士（贤狼の智慧）：<b style='color:#58A6FF'>Ctrl+S/Z/Y/C/V</b> 都给汝设好了，不用找按钮～<br>"
             "要是跑蓝图出了小状况？别慌，debug 文件夹里有完整运行日志，<br>"
             "汝尽管折腾出花样来，咱帮汝兜着底！🍎（要不要干完这单，咱一起去吃苹果呀？）"
         )
@@ -259,7 +258,7 @@ class ProjectStartupDialog(QDialog):
         btn_bar = QHBoxLayout()
         btn_bar.addStretch(1)
 
-        btn_del_sel = QPushButton("🗑 删除选中的工程")
+        btn_del_sel = QPushButton("🗑 删除工程")
         btn_del_sel.setMinimumHeight(36)
         btn_del_sel.setStyleSheet(
             "QPushButton { background:#DA3633; color:white; border-radius:6px; font-weight:600; }"
@@ -269,7 +268,7 @@ class ProjectStartupDialog(QDialog):
         btn_del_sel.clicked.connect(lambda _=False: self._on_delete_selected_project(double_click=False))
         btn_bar.addWidget(btn_del_sel)
 
-        btn_open_sel = QPushButton("🗂 打开选中的最近工程")
+        btn_open_sel = QPushButton("🗂 打开工程")
         btn_open_sel.setMinimumHeight(36)
         btn_open_sel.setStyleSheet(
             "QPushButton { background:#0969DA; color:white; border-radius:6px; font-weight:600; }"

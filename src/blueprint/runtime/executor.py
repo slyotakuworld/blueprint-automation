@@ -29,6 +29,114 @@ from ...config.app_paths import debug_dir
 
 
 # ============================================================
+# 辅助：目标窗口(HWND) 应用到运行时所有服务
+# ============================================================
+def _apply_target_hwnd(ctx: ExecutionContext, hwnd, res_w=1920, res_h=1080):
+    """
+    把一个 HWND（目标窗口程序）应用到运行时所有下游服务和变量。
+    这就是「设置目标程序」的统一逻辑：可在蓝图启动时调用（初始下拉框选中的目标），
+    也可在 BindWindow 节点执行时调用（中途切换目标程序）。
+
+    参数:
+      hwnd   - 窗口句柄(int) 或 None（None=回退为全屏模式）
+      res_w / res_h - 分辨率参考，用于坐标归一化（0=使用窗口实际尺寸）
+    """
+    import win32gui  # type: ignore
+
+    # 1. 激活到前台（仅当 hwnd 有效时）
+    if hwnd:
+        try:
+            from src.tools.window_utils import bring_window_to_front
+
+            bring_window_to_front(hwnd, log_fn=ctx.log)
+        except Exception:
+            try:
+                win32gui.SetForegroundWindow(hwnd)
+            except Exception:
+                pass
+
+    # 2. 读实际窗口尺寸 + 标题
+    win_rect = None
+    win_title = ""
+    if hwnd:
+        try:
+            l, t, r, b = win32gui.GetWindowRect(hwnd)
+            win_rect = (l, t, r - l, b - t)
+            win_title = win32gui.GetWindowText(hwnd) or ""
+        except Exception:
+            win_rect = None
+            win_title = ""
+        # 分辨率参考：0=自动用窗口实际尺寸
+        try:
+            if int(res_w or 0) <= 0 and win_rect:
+                res_w = win_rect[2]
+            if int(res_h or 0) <= 0 and win_rect:
+                res_h = win_rect[3]
+        except Exception:
+            pass
+
+    # 3. 应用到 ScreenCapture（目标句柄）
+    if ctx.screen is not None:
+        try:
+            ctx.screen.hwnd = hwnd
+        except Exception:
+            pass
+
+    # 4. 应用到 TemplateMatcher（搜索 ROI + 分辨率参考）
+    if ctx.matcher is not None:
+        try:
+            ctx.matcher.config["resolution_ref"] = (int(res_w or 1920), int(res_h or 1080))
+        except Exception:
+            pass
+        if win_rect is not None:
+            try:
+                ctx.matcher.set_fullscreen_region(win_rect)
+            except Exception:
+                pass
+        else:
+            # None=全屏：删除「全界面」区域，让 matcher 回退全屏
+            try:
+                if "全界面" in getattr(ctx.matcher, "regions", {}):
+                    ctx.matcher.regions.pop("全界面", None)
+            except Exception:
+                pass
+
+    # 5. 应用到 InputActions（安全点击区域）
+    if ctx.input_actions is not None:
+        try:
+            ctx.input_actions.set_safe_region(win_rect)
+        except Exception:
+            pass
+
+    # 6. 保存到 ctx 上的全局变量（VarEngine / 下游逻辑直接用）
+    target_info = {
+        "hwnd": hwnd,
+        "title": win_title,
+        "rect": win_rect,
+        "resolution_ref": (int(res_w or 1920), int(res_h or 1080)),
+    }
+    try:
+        ctx.set_var("target", target_info)
+        ctx.set_var("target_hwnd", hwnd)
+        ctx.set_var("target_title", win_title)
+        if win_rect:
+            ctx.set_var("target_x", win_rect[0])
+            ctx.set_var("target_y", win_rect[1])
+            ctx.set_var("target_w", win_rect[2])
+            ctx.set_var("target_h", win_rect[3])
+        else:
+            for k in ("target_x", "target_y", "target_w", "target_h"):
+                try:
+                    ctx.variables.pop(k, None)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    return win_rect, win_title
+
+
+# ============================================================
 # 辅助：端口/连线 解析
 # ============================================================
 def _resolve_data_inputs(graph: BlueprintGraph, ctx: ExecutionContext, node: Node) -> Dict[str, Any]:
@@ -528,79 +636,22 @@ def execute_BindWindow(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]
         )
         ctx.log(msg, "WARN")
         annotate_step(ctx, node, "bind_win", note="FAIL 未找到窗口")
-        return {"out_hwnd": None, "out_resolution": (res_w, res_h)}, ["fail"], msg
+        return {}, ["fail"], msg
 
-    # ---------- 拿到 HWND：先激活前台 ----------
-    import win32gui  # type: ignore
-    try:
-        from src.tools.window_utils import bring_window_to_front
+    # ---------- 用统一函数应用目标窗口：切换目标程序 ----------
+    win_rect, win_title = _apply_target_hwnd(ctx, hwnd, res_w, res_h)
 
-        bring_window_to_front(hwnd, log_fn=ctx.log)
-    except Exception:
-        try:
-            win32gui.SetForegroundWindow(hwnd)
-        except Exception:
-            pass
-
-    # 读实际窗口尺寸（用于下游坐标缩放 & safe_region）
-    try:
-        l, t, r, b = win32gui.GetWindowRect(hwnd)
-        win_rect = (l, t, r - l, b - t)
-        win_title = win32gui.GetWindowText(hwnd) or ""
-    except Exception:
-        win_rect = None
-        win_title = ""
-
-    # ---------- 推给下游核心服务：screen.hwnd / matcher.set_fullscreen_region / input_actions.set_safe_region ----------
-    if ctx.screen is not None:
-        try:
-            ctx.screen.hwnd = hwnd
-        except Exception:
-            pass
-    if ctx.matcher is not None:
-        try:
-            ctx.matcher.config["resolution_ref"] = (res_w, res_h)
-        except Exception:
-            pass
-        if win_rect is not None:
-            try:
-                ctx.matcher.set_fullscreen_region(win_rect)
-            except Exception:
-                pass
-    if ctx.input_actions is not None and win_rect is not None:
-        try:
-            ctx.input_actions.set_safe_region(win_rect)
-        except Exception:
-            pass
-    # 保存到 ctx 上全局变量（VarEngine / 下游逻辑直接用）
-    target_info = {
-        "hwnd": hwnd,
-        "title": win_title,
-        "rect": win_rect,
-        "resolution_ref": (res_w, res_h),
-    }
-    ctx.set_var("target", target_info)
-    ctx.set_var("target_hwnd", hwnd)
-    ctx.set_var("target_title", win_title)
-    if win_rect:
-        ctx.set_var("target_x", win_rect[0])
-        ctx.set_var("target_y", win_rect[1])
-        ctx.set_var("target_w", win_rect[2])
-        ctx.set_var("target_h", win_rect[3])
-    note_parts = [f"HWND={hwnd}", f"res_ref={res_w}x{res_h}"]
+    eff_w = (res_w if int(res_w or 0) > 0 else (win_rect[2] if win_rect else 1920))
+    eff_h = (res_h if int(res_h or 0) > 0 else (win_rect[3] if win_rect else 1080))
+    note_parts = [f"HWND={hwnd}", f"res_ref={eff_w}x{eff_h}"]
     if win_title:
         note_parts.append(f"title='{win_title[:24]}'")
     if win_rect:
         note_parts.append(f"rect={win_rect}")
-    note = "BindWindow " + "  ".join(note_parts)
-    ctx.log(f"[BindWindow] {note}", "SUCCESS")
+    note = "BindWindow (切换目标程序) " + "  ".join(note_parts)
+    ctx.log(f"[BindWindow] ✅ {note}  后续截图/找图/点击均自动对准此窗口。", "SUCCESS")
     annotate_step(ctx, node, "bind_win", note=note)
-    return {
-        "out_hwnd": hwnd,
-        "out_resolution": (res_w, res_h),
-        "out_rect": win_rect,
-        "out_title": win_title,
-    }, ["success"], ""
+    return {}, ["success"], ""
 
 
 # ---------------- 动作/识别节点 ----------------
@@ -958,7 +1009,7 @@ def execute_PressKey(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
 
 
 def _mouse_final_pos(ctx, params: Dict[str, Any], inputs: Dict[str, Any]):
-    """按 coord_mode 把 pos(tuple2) 转换为屏幕绝对坐标；若上游连了 in_pos 则优先用连线值。"""
+    """按 coord_mode 把 pos(tuple2) 转换为屏幕绝对坐标；若上游连了 in_pos 则优先用连线值（已为绝对坐标）。"""
     in_pos = inputs.get("in_pos")
     if in_pos is not None and isinstance(in_pos, (tuple, list)) and len(in_pos) == 2:
         x, y = int(in_pos[0]), int(in_pos[1])
@@ -970,14 +1021,13 @@ def _mouse_final_pos(ctx, params: Dict[str, Any], inputs: Dict[str, Any]):
     if mode == "absolute":
         return (x + ox, y + oy)
     elif mode == "relative":
-        # 相对绑定窗口：加上绑定窗口左上角偏移
         try:
-            target = getattr(ctx, "target", None)
-            if target is not None:
-                rect = getattr(target, "window_rect", lambda: None)()
-                if rect is not None:
-                    rx = int(getattr(rect, "x", 0) or 0)
-                    ry = int(getattr(rect, "y", 0) or 0)
+            target = ctx.get_var("target") if hasattr(ctx, "get_var") else None
+            if isinstance(target, dict):
+                rect = target.get("rect")
+                if isinstance(rect, (tuple, list)) and len(rect) >= 2:
+                    rx = int(rect[0])
+                    ry = int(rect[1])
                     return (rx + x + ox, ry + y + oy)
         except Exception:
             pass
@@ -1004,12 +1054,12 @@ def _mouse_final_pos_for(ctx, params: Dict[str, Any], point_param_name: str) -> 
         return (x, y)
     elif mode == "relative":
         try:
-            target = getattr(ctx, "target", None)
-            if target is not None:
-                rect = getattr(target, "window_rect", lambda: None)()
-                if rect is not None:
-                    rx = int(getattr(rect, "x", 0) or 0)
-                    ry = int(getattr(rect, "y", 0) or 0)
+            target = ctx.get_var("target") if hasattr(ctx, "get_var") else None
+            if isinstance(target, dict):
+                rect = target.get("rect")
+                if isinstance(rect, (tuple, list)) and len(rect) >= 2:
+                    rx = int(rect[0])
+                    ry = int(rect[1])
                     return (rx + x, ry + y)
         except Exception:
             pass
@@ -1291,26 +1341,17 @@ def execute_Command(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
 
 
 def execute_WebBrowser(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
-    """【网页】浏览器操作：打开URL/刷新/回退/前进。支持 {var} 插值 + 选择 default/chrome/edge/firefox 浏览器。"""
+    """【打开网页】用浏览器打开指定 URL。支持 {var} 插值 + 选择 default/chrome/edge/firefox 浏览器。"""
     import webbrowser
     import shutil as _shutil
 
     p = dict(node.params or {})
-    # UI 现用中文
-    _ACTION_MAP = {
-        "打开": "open", "open": "open",
-        "刷新": "refresh", "refresh": "refresh",
-        "后退": "back", "back": "back",
-        "前进": "forward", "forward": "forward",
-    }
     _BROWSER_MAP = {
         "默认": "default", "default": "default",
         "chrome": "chrome",
         "edge": "edge",
         "firefox": "firefox",
     }
-    action_raw = str(p.get("action", "open") or "open").strip().lower()
-    action = _ACTION_MAP.get(action_raw, "open")
     url_template = str(p.get("url", "") or "")
     browser_raw = str(p.get("browser", "default") or "default").strip().lower()
     browser_name = _BROWSER_MAP.get(browser_raw, "default")
@@ -1323,16 +1364,8 @@ def execute_WebBrowser(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]
             url_template = str(engine.interpolate(url_template))
         url = url_template if url_template else ""
 
-        # refresh/back/forward：如果用户没填URL，不报错但降级为重开上次URL
-        if action in ("refresh", "back", "forward"):
-            if not url:
-                note_extra = f"{action} 未填URL，无法控制已有浏览器窗口，降级为跳过（请改用 open 模式主动打开URL以保证可控）。"
-                annotate_step(ctx, node, f"web_browser_{action}", note=note_extra)
-                ctx.log(f"[WebBrowser] {action} no-op（未填URL，无法驱动已打开的窗口）→ ok", "WARN")
-                return {}, ["out_done"], ""
-
         if not url:
-            err = "URL 为空（open 模式必须填 URL）"
+            err = "URL 为空（打开网页必须填 URL）"
             annotate_step(ctx, node, "web_browser_err", note=err)
             ctx.log(f"[WebBrowser] {err}", "ERROR")
             return {}, ["err"], err
@@ -1396,8 +1429,8 @@ def execute_WebBrowser(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]
             ctx.log(f"[WebBrowser] {err_msg}", "ERROR")
             return {}, ["err"], err_msg
 
-        note = f"[{browser_name}] {action} → {url[:100]}"
-        annotate_step(ctx, node, f"web_browser_{action}", note=note)
+        note = f"[{browser_name}] 打开 → {url[:100]}"
+        annotate_step(ctx, node, "web_browser_open", note=note)
         ctx.log(f"[WebBrowser] {note}", "SUCCESS")
         return {}, ["out_done"], ""
     except Exception as e:
@@ -2428,11 +2461,12 @@ class BlueprintRunner(QThread):
     progress_step = Signal(int, str)
     pause_changed = Signal(bool)
 
-    def __init__(self, graph: BlueprintGraph, parent=None):
+    def __init__(self, graph: BlueprintGraph, parent=None, initial_hwnd=None):
         super().__init__(parent)
         self._graph = graph
         self._ctx: Optional[ExecutionContext] = None
         self._hotkeys: Optional[HotkeyManager] = None
+        self._initial_hwnd = initial_hwnd
 
     def request_stop(self):
         if self._ctx is not None:
@@ -2500,6 +2534,23 @@ class BlueprintRunner(QThread):
 
         self._ctx = ctx
         ctx.last_progress_ts = time.time()
+
+        # 初始化目标程序（右上角下拉框选中的 HWND；None=全屏）
+        init_hwnd = getattr(self, "_initial_hwnd", None)
+        try:
+            if init_hwnd:
+                win_rect, win_title = _apply_target_hwnd(ctx, int(init_hwnd), 0, 0)
+                hwnd_hex = f"0x{int(init_hwnd):08X}" if int(init_hwnd) else "None"
+                _write_log(
+                    f"[Runtime] 初始目标程序来自主界面下拉框：HWND={hwnd_hex}  "
+                    f"title='{(win_title or '')[:32]}'  rect={win_rect}",
+                    "INFO",
+                )
+            else:
+                _apply_target_hwnd(ctx, None, 0, 0)
+                _write_log("[Runtime] 初始目标程序：未指定（全屏模式），请用 BindWindow 节点或主界面下拉框设置。", "INFO")
+        except Exception as _ie:
+            _write_log(f"[Runtime] 应用初始目标程序失败（不影响后续）: {_ie}", "WARN")
 
         # 热键注册（硬约束 §3）
         self._hotkeys = HotkeyManager(
