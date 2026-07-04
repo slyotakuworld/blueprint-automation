@@ -9,6 +9,7 @@ from PySide6.QtGui import (
     QFont,
     QPainter,
     QPainterPath,
+    QPainterPathStroker,
     QPen,
     QPolygonF,
 )
@@ -35,6 +36,14 @@ COL_BG_DARK = QColor("#1C2128")
 COL_GRID = QColor("#2D333B")
 COL_SELECTED = QColor("#58A6FF")
 COL_HIGHLIGHT_RUN = QColor("#3FB950")
+
+# ========== 线条高亮颜色方案 ==========
+# 临时连线（连线中）：暗淡灰，表示还没连上
+COL_TEMP_WIRE = QColor("#6E7681")
+# 选中节点时关联线条高亮：亮绿色，醒目识别
+COL_NODE_LINK_HL = QColor("#39FF14")
+# 选中线条本身高亮：橙色，和搜索高亮一致
+COL_EDGE_SELECTED_HL = QColor("#FF9800")
 
 COL_EXEC = QColor("#FFFFFF")
 COL_BOOL = QColor("#F778BA")
@@ -78,8 +87,8 @@ PORT_MARGIN_X = 8
 class PortItem(QGraphicsObject):
     """节点上的端口小圆圈/三角，被按下时开始画线，在另一端口释放则创建连线。"""
 
-    port_pressed = Signal(object)
-    port_released = Signal(object)
+    port_pressed = Signal(object)         # 左键按下端口（scene 据此记录"待连线起点"）
+    port_right_clicked = Signal(object)   # 右键点击端口（scene 弹上下文菜单）
 
     def __init__(self, port: Port, parent: "NodeItem"):
         super().__init__(parent)
@@ -180,14 +189,15 @@ class PortItem(QGraphicsObject):
             self.port_pressed.emit(self)
             event.accept()
             return
-        super().mousePressEvent(event)
-
-    def mouseReleaseEvent(self, event: QGraphicsSceneMouseEvent):
-        if event.button() == Qt.LeftButton:
-            self.port_released.emit(self)
+        if event.button() == Qt.RightButton:
+            self.port_right_clicked.emit(self)
             event.accept()
             return
-        super().mouseReleaseEvent(event)
+        super().mousePressEvent(event)
+
+    # 注：连线创建的释放判定统一由 NodeScene.mouseReleaseEvent 处理
+    # （Qt 鼠标抓取机制下，port_released 信号只会发给按下的端口，无法识别目标端口）
+    # 因此这里不再需要 mouseReleaseEvent 发射 port_released 信号。
 
 
 # ============================================================
@@ -205,7 +215,8 @@ class NodeItem(QGraphicsObject):
         self.node = node
         self._port_items: Dict[str, PortItem] = {}
         self._running: bool = False
-        self._highlighted: bool = False
+        self._highlighted: bool = False              # 搜索匹配高亮（橙色）
+        self._edge_link_highlighted: bool = False    # 关联边被选中时的联动高亮（蓝色虚线）
         self._flash_until_ms: int = 0
         self.setAcceptHoverEvents(True)
         self.setFlags(
@@ -262,6 +273,10 @@ class NodeItem(QGraphicsObject):
             NODE_WIDTH + pad * 2,
             self.node_height() + pad * 2,
         )
+
+    def global_center(self) -> QPointF:
+        """返回节点在场景坐标下的中心点（用于搜索跳转居中）。"""
+        return self.mapToScene(self.boundingRect().center())
 
     def shape(self) -> QPainterPath:
         path = QPainterPath()
@@ -355,6 +370,15 @@ class NodeItem(QGraphicsObject):
             painter.setPen(pen)
             painter.drawRoundedRect(rect.adjusted(-1, -1, 1, 1), NODE_ROUND + 1, NODE_ROUND + 1)
 
+        # 关联边被选中时的联动高亮（蓝色虚线2px）
+        # 当用户选中一条连线时，两端节点会显示这个高亮，便于在线多时识别关联节点
+        if self._edge_link_highlighted:
+            painter.setBrush(Qt.NoBrush)
+            pen = QPen(QColor("#58A6FF"), 2)
+            pen.setStyle(Qt.DashLine)
+            painter.setPen(pen)
+            painter.drawRoundedRect(rect.adjusted(-3, -3, 3, 3), NODE_ROUND + 3, NODE_ROUND + 3)
+
         # 闪烁（红色3px，到期自动恢复）
         try:
             import time
@@ -382,6 +406,13 @@ class NodeItem(QGraphicsObject):
         on = bool(on)
         if self._highlighted != on:
             self._highlighted = on
+            self.update()
+
+    def set_edge_link_highlighted(self, on: bool):
+        """关联边被选中时的联动高亮：画一圈蓝色虚线边（问题3）。"""
+        on = bool(on)
+        if self._edge_link_highlighted != on:
+            self._edge_link_highlighted = on
             self.update()
 
     def flash(self, duration_ms: int = 2000):
@@ -435,21 +466,50 @@ class EdgeItem(QGraphicsPathItem):
         self._from_port: Optional[PortItem] = None
         self._to_port: Optional[PortItem] = None
         self._temp_mode = edge is None
-        self.setZValue(-1)
+        # ZValue=-2：低于 PortItem(2)/NodeItem(1)，点击时端口永远优先命中，
+        # 避免连线命中区盖住端口导致用户点不到端口
+        self.setZValue(-2)
         self.setAcceptHoverEvents(True)
         self.setFlag(QGraphicsItem.ItemIsSelectable, True)
         self._base_color = COL_ANY
         self._hover = False
+        # 关联节点被选中时的联动高亮（问题5）：加粗+加亮
+        self._node_link_highlighted = False
         self._update_pen()
 
     def _update_pen(self):
+        """线条颜色优先级（从高到低）：
+        1. 选中线条本身 → 橙色高亮 COL_EDGE_SELECTED_HL（加粗）
+        2. 关联节点被选中 → 亮绿色高亮 COL_NODE_LINK_HL（加粗）
+        3. hover → 基础色 lighter 130%
+        4. 普通 → 基础色（临时连线默认暗淡灰，悬停端口时变绿/红反馈）
+        """
         if self.isSelected():
-            color = COL_SELECTED
-        else:
-            color = self._base_color if not self._hover else self._base_color.lighter(130)
+            # 选中线条本身：橙色高亮 + 加粗
+            pen = QPen(COL_EDGE_SELECTED_HL)
+            pen.setWidth(3)
+            self.setPen(pen)
+            return
+        if self._node_link_highlighted:
+            # 关联节点被选中：亮绿色高亮 + 加粗
+            pen = QPen(COL_NODE_LINK_HL)
+            pen.setWidth(3)
+            self.setPen(pen)
+            return
+        # 普通状态：基础色（hover 时加亮加粗）
+        # 临时连线默认 _base_color=COL_TEMP_WIRE（暗淡灰），悬停端口时由 mouseMoveEvent 改为绿/红
+        color = self._base_color if not self._hover else self._base_color.lighter(130)
+        width = 2 if not self._hover else 3
         pen = QPen(color)
-        pen.setWidth(2 if not self._hover else 3)
+        pen.setWidth(width)
         self.setPen(pen)
+
+    def set_node_link_highlighted(self, on: bool):
+        """关联节点被选中时的联动高亮（问题5）。"""
+        on = bool(on)
+        if self._node_link_highlighted != on:
+            self._node_link_highlighted = on
+            self._update_pen()
 
     def set_base_color(self, color: QColor):
         self._base_color = color
@@ -489,23 +549,41 @@ class EdgeItem(QGraphicsPathItem):
         self._rebuild_bezier()
 
     def _rebuild_bezier(self):
+        """统一用贝塞尔曲线绘制（EXEC/DATA 都用曲线）。
+        曲线控制点在水平方向偏移，避免多条线重叠成一根线（问题4）。
+        参考 Qflow 样式：从端口水平出发，到目标端口水平进入。"""
         p1 = self._from_pos
         p2 = self._to_pos
-        dx = max(40, abs(p2.x() - p1.x()) * 0.5)
+        # 控制点偏移量：水平方向，至少 40px 保证曲线有明显弧度
+        # 距离越远偏移越大，但不超过 200px（避免曲线过于夸张）
+        dx = max(40, min(200, abs(p2.x() - p1.x()) * 0.5))
         path = QPainterPath(p1)
-        if self._from_port and self._from_port.is_exec():
-            # 直角折线（更像控制流）
-            mid_x = (p1.x() + p2.x()) / 2
-            path.lineTo(QPointF(mid_x, p1.y()))
-            path.lineTo(QPointF(mid_x, p2.y()))
-            path.lineTo(p2)
-        else:
-            path.cubicTo(
-                QPointF(p1.x() + dx, p1.y()),
-                QPointF(p2.x() - dx, p2.y()),
-                p2,
-            )
+        # 全部用三次贝塞尔曲线（cubicTo），不再区分 EXEC/DATA
+        # 两条控制点都在水平方向：从 p1 水平向右/左延伸 dx，从 p2 水平向左/右延伸 dx
+        # 这样曲线从端口水平出发，到目标端口水平进入，符合节点连线视觉习惯
+        path.cubicTo(
+            QPointF(p1.x() + dx, p1.y()),
+            QPointF(p2.x() - dx, p2.y()),
+            p2,
+        )
         self.setPath(path)
+        # 触发 boundingRect 重算（shape() 命中区依赖 path）
+        self.prepareGeometryChange()
+
+    def shape(self) -> QPainterPath:
+        """重写：命中检测区域使用 8px 宽的描边路径，方便用户点中连线选中/删除。
+        8px 是平衡值：太宽会盖住端口附近点击；太窄用户点不中。"""
+        stroker = QPainterPathStroker()
+        stroker.setWidth(8)
+        stroker.setCapStyle(Qt.RoundCap)
+        stroker.setJoinStyle(Qt.RoundJoin)
+        return stroker.createStroke(self.path())
+
+    def boundingRect(self) -> QRectF:
+        """重写：boundingRect 也要足够大以容纳 8px 宽的命中区域。"""
+        pad = 8
+        base = self.path().boundingRect()
+        return base.adjusted(-pad, -pad, pad, pad)
 
     def hoverEnterEvent(self, event):
         self._hover = True
@@ -518,6 +596,9 @@ class EdgeItem(QGraphicsPathItem):
         super().hoverLeaveEvent(event)
 
     def itemChange(self, change, value):
-        if change == QGraphicsItem.ItemSelectedChange:
+        # 用 ItemSelectedHasChanged 而非 ItemSelectedChange：
+        # 后者在选中状态"即将改变"时触发，此时 isSelected() 还返回旧值，
+        # 导致 _update_pen 里 self.isSelected() 取到旧状态，颜色不立即切换
+        if change == QGraphicsItem.ItemSelectedHasChanged:
             self._update_pen()
         return super().itemChange(change, value)

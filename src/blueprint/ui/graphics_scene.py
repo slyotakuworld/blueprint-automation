@@ -8,6 +8,7 @@ from PySide6.QtGui import (
     QDragEnterEvent,
     QDragMoveEvent,
     QDropEvent,
+    QAction,
     QKeyEvent,
     QPainter,
     QPen,
@@ -22,8 +23,11 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QHBoxLayout,
     QLabel,
+    QMenu,
     QToolButton,
     QVBoxLayout,
+    QCheckBox,
+    QComboBox,
 )
 
 from ..core.models import BlueprintGraph, Edge, Node, PortDirection
@@ -53,9 +57,18 @@ class NodeScene(QGraphicsScene):
         self.graph: Optional[BlueprintGraph] = None
         self._node_items: Dict[str, NodeItem] = {}
         self._edge_items: Dict[str, EdgeItem] = {}
+        # ========== 连线交互状态机（方案A：阈值化启动） ==========
+        # _pending_port: 左键按下端口但还没拖动超过阈值时的"待连线起点端口"
+        # _pending_press_pos: 按下时的场景坐标，用于和当前鼠标位置计算拖动距离
+        # _connecting_edge: 拖动超过阈值后创建的临时连线（None=未进入连线模式）
+        # _connecting_from: 已进入连线模式时的起点端口（即 _pending_port 转正）
+        self._pending_port: Optional[PortItem] = None
+        self._pending_press_pos: Optional[QPointF] = None
         self._connecting_edge: Optional[EdgeItem] = None
         self._connecting_from: Optional[PortItem] = None
-        self._wire_invalid = False
+        # 拖动阈值（px）：超过这个距离才从"按下端口"切换为"开始连线"
+        # 5px 是业界常用值（Unreal/Blender），既不敏感也不迟钝
+        self._wire_drag_threshold = 5.0
         self._drag_start_positions: Optional[Dict[str, tuple]] = None
 
         self.setBackgroundBrush(QBrush(QColor("#1C2128")))
@@ -160,10 +173,91 @@ class NodeScene(QGraphicsScene):
         ni.node_selected_changed.connect(self._on_node_sel)
         for pi in ni.all_port_items():
             pi.port_pressed.connect(self._on_port_pressed)
-            pi.port_released.connect(self._on_port_released)
+            pi.port_right_clicked.connect(self._on_port_right_clicked)
         if emit:
             self.node_created.emit(node.id)
             self.graph_changed.emit()
+
+    # ---------------- 右键端口：QMenu 上下文菜单（方案C） ----------------
+    def disconnect_all_from_port(self, pi: PortItem) -> int:
+        """解除指定端口关联的所有连线，返回被删除的连线数量。"""
+        if self.graph is None:
+            return 0
+        nid = pi.node_item().node.id
+        pname = pi.port_name()
+        removed = 0
+        # 要避免在遍历 dict 时删除它，先收集再删
+        target_edge_ids = []
+        for eid, e in self.graph.edges.items():
+            # 输入端口：作为 to_port 出现
+            # 输出端口：作为 from_port 出现
+            if (e.from_node == nid and e.from_port == pname) or \
+               (e.to_node == nid and e.to_port == pname):
+                target_edge_ids.append(eid)
+        for eid in target_edge_ids:
+            self.remove_edge(eid)
+            removed += 1
+        return removed
+
+    def _count_edges_of_port(self, pi: PortItem) -> int:
+        """统计指定端口关联的连线数量。"""
+        if self.graph is None:
+            return 0
+        nid = pi.node_item().node.id
+        pname = pi.port_name()
+        count = 0
+        for e in self.graph.edges.values():
+            if (e.from_node == nid and e.from_port == pname) or \
+               (e.to_node == nid and e.to_port == pname):
+                count += 1
+        return count
+
+    def _on_port_right_clicked(self, pi: PortItem):
+        """右键端口：弹 QMenu 上下文菜单（方案C），用户点菜单项才执行解除。
+        符合所有桌面软件的右键习惯，不再用模态 QMessageBox 阻塞主线程。"""
+        if self.graph is None:
+            return
+        nid = pi.node_item().node.id
+        pname = pi.port_name()
+        count = self._count_edges_of_port(pi)
+        # 构建右键菜单
+        menu = QMenu()
+        menu.setStyleSheet(
+            "QMenu { background: #21262D; color: #C9D1D9; border: 1px solid #30363D; padding: 4px; }"
+            "QMenu::item { padding: 6px 18px; border-radius: 3px; }"
+            "QMenu::item:selected { background: #1F6FEB; color: #FFFFFF; }"
+            "QMenu::item:disabled { color: #484F58; }"
+        )
+        # 主菜单项：解除所有连线
+        act_disconnect = QAction(
+            f"解除所有连线 ({count} 条)" if count > 0 else "解除所有连线（无连线）",
+            menu,
+        )
+        act_disconnect.setEnabled(count > 0)
+        act_disconnect.triggered.connect(lambda _checked=False, p=pi: self._do_disconnect_all_from_port(p))
+        menu.addAction(act_disconnect)
+        # 在鼠标位置弹出（mapToGlobal 需要 view 的坐标转换）
+        views = self.views()
+        if views:
+            view = views[0]
+            # 用上次鼠标位置（QCursor.pos() 全局坐标）
+            from PySide6.QtGui import QCursor
+            menu.exec(QCursor.pos())
+        else:
+            menu.exec()
+
+    def _do_disconnect_all_from_port(self, pi: PortItem):
+        """实际执行解除连线（由 QMenu 菜单项触发）。"""
+        nid = pi.node_item().node.id
+        pname = pi.port_name()
+        removed = self.disconnect_all_from_port(pi)
+        if removed:
+            # 不再弹模态提示框，状态由 scene.graph_changed 信号驱动主窗口状态栏更新即可
+            # 这里仅打印到 stdout（可选，便于调试）
+            try:
+                print(f"[Edge] 已解除端口 {nid}.{pname} 的 {removed} 条连线（Ctrl+Z 可撤销）")
+            except Exception:
+                pass
 
     def remove_node(self, node_id: str):
         if self.graph is None or node_id not in self.graph.nodes:
@@ -188,6 +282,12 @@ class NodeScene(QGraphicsScene):
         self.graph_changed.emit()
 
     def _on_node_moved(self, node_id: str):
+        """节点移动后：更新所有关联的边（让连线跟随节点移动）+ 发 graph_changed 信号。"""
+        # 关键：节点移动后必须刷新关联边的路径，否则线条还停留在原位置
+        for ei in self._edge_items.values():
+            # 只更新与该节点关联的边（性能优化：避免全量刷新）
+            if ei.edge and (ei.edge.from_node == node_id or ei.edge.to_node == node_id):
+                ei.update_path_from_ports()
         self.graph_changed.emit()
 
     def _on_node_sel(self, node_id: str, selected: bool):
@@ -254,40 +354,69 @@ class NodeScene(QGraphicsScene):
         for ei in self._edge_items.values():
             ei.update_path_from_ports()
 
-    # ---------------- 端口连线交互 ----------------
+    # ---------------- 端口连线交互（方案A：阈值化启动 + 方案B：统一临时连线方向） ----------------
     def _on_port_pressed(self, pi: PortItem):
+        """左键按下端口：只记录"待连线起点"状态，不立即创建临时连线。
+        真正的临时连线要等 mouseMoveEvent 中拖动距离超过 _wire_drag_threshold 才创建。
+        这样按下端口不拖动直接释放 = 什么都不做（符合 Unreal/Blender 习惯）。"""
         if self.graph is None:
             return
+        # 清理可能残留的上一轮状态（防御性）
+        self._cancel_pending_wire()
+        self._pending_port = pi
+        self._pending_press_pos = QPointF(pi.global_center())
+
+    def _start_wire_drag(self, from_pi: PortItem):
+        """拖动超过阈值后真正进入连线模式：创建临时 EdgeItem。
+        方案B：无论 from_pi 是输入还是输出端口，临时连线都从 from_pi 出发画到鼠标位置。
+        - from_pi 是输出端口(OUT)：temp.from_port = from_pi，temp.to_pos 跟随鼠标
+        - from_pi 是输入端口(IN)：temp.to_port = from_pi，temp.from_pos 跟随鼠标
+          视觉上都是从 from_pi 出发画到鼠标（因为 from_pos=鼠标位置，to_pos=from_pi 位置）。
+        """
         temp = EdgeItem()
-        # 如果按住的是输出端口，from就是它；否则from留空，等释放时再确定方向
-        if pi.port.direction == PortDirection.OUT:
-            temp.set_from_port(pi)
-            temp.set_temp_to(pi.global_center())
+        if from_pi.port.direction == PortDirection.OUT:
+            # 输出端口：from_port 固定为 from_pi，to_pos 跟随鼠标
+            temp.set_from_port(from_pi)
+            temp.set_temp_to(from_pi.global_center())
         else:
-            temp.set_to_port(pi)
-            temp._from_pos = pi.global_center()
+            # 输入端口：to_port 固定为 from_pi，from_pos 跟随鼠标
+            temp.set_to_port(from_pi)
+            temp._from_pos = from_pi.global_center()
             temp._rebuild_bezier()
-        self._connecting_from = pi
+        # 临时连线默认暗淡灰（连线中状态），悬停端口时由 mouseMoveEvent 改为绿/红反馈
+        from .graphics_items import COL_TEMP_WIRE
+        temp.set_base_color(COL_TEMP_WIRE)
+        self._connecting_from = from_pi
         self._connecting_edge = temp
         self.addItem(temp)
 
-    def _on_port_released(self, pi: PortItem):
-        temp = self._connecting_edge
-        from_p = self._connecting_from
-        self._connecting_edge = None
+    def _find_port_at(self, scene_pos: QPointF, ignore_pi: Optional[PortItem] = None) -> Optional[PortItem]:
+        """查找 scene 坐标下的端口图元（忽略指定的端口，避免自己连自己）。"""
+        for it in self.items(scene_pos):
+            if isinstance(it, PortItem) and it is not ignore_pi:
+                return it
+        return None
+
+    def _cancel_pending_wire(self):
+        """取消"待连线"状态：清理 pending 状态 + 临时连线（如果有）。"""
+        self._pending_port = None
+        self._pending_press_pos = None
+        if self._connecting_edge is not None:
+            try:
+                self.removeItem(self._connecting_edge)
+            except Exception:
+                pass
+            self._connecting_edge = None
         self._connecting_from = None
-        self._wire_invalid = False
-        if temp:
-            self.removeItem(temp)
-        if not (temp and from_p and from_p != pi):
-            return
-        self.connect_ports(from_p, pi)
 
     def mousePressEvent(self, event: QGraphicsSceneMouseEvent):
         if event.button() == Qt.LeftButton:
             items_under = self.items(event.scenePos())
+            # 方案F：只有"光标下有 NodeItem 但没有 PortItem"时才记录节点拖动快照。
+            # 否则按下端口会同时触发节点拖动快照 + 连线 pending 状态，逻辑路径很脏。
             has_node = any(isinstance(it, NodeItem) for it in items_under)
-            if has_node:
+            has_port = any(isinstance(it, PortItem) for it in items_under)
+            if has_node and not has_port:
                 snap = {}
                 for ni in self._node_items.values():
                     if ni.isSelected() or (any(it is ni for it in items_under)):
@@ -298,30 +427,47 @@ class NodeScene(QGraphicsScene):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        # ========== 方案A：阈值化启动连线 ==========
+        # 按下了端口但还没进入连线模式 → 检查拖动距离是否超过阈值
+        if (self._pending_port is not None and
+                self._connecting_edge is None and
+                self._pending_press_pos is not None):
+            cur_pos = event.scenePos()
+            dx = cur_pos.x() - self._pending_press_pos.x()
+            dy = cur_pos.y() - self._pending_press_pos.y()
+            dist = (dx * dx + dy * dy) ** 0.5
+            if dist >= self._wire_drag_threshold:
+                # 超过阈值 → 真正进入连线模式
+                self._start_wire_drag(self._pending_port)
+                # 注意：不 return，继续走下面的"已进入连线模式"分支更新临时线位置
+
+        # ========== 已进入连线模式：更新临时连线终点 + 颜色（方案B） ==========
         if self._connecting_edge is not None and self._connecting_from is not None:
             pos = event.scenePos()
             from_p = self._connecting_from
             # 检查悬停端口
-            items = self.items(pos)
+            target_pi = self._find_port_at(pos, ignore_pi=from_p)
             target_ok = False
-            hover = None
-            for it in items:
-                if isinstance(it, PortItem) and it is not from_p:
-                    hover = it
-                    if from_p.compatible_with(it):
-                        target_ok = True
-                    break
-            # 设置颜色：兼容绿/不兼容红
-            if hover is None:
-                self._connecting_edge.set_base_color(QColor("#8B949E"))
+            if target_pi is not None and from_p.compatible_with(target_pi):
+                target_ok = True
+            # 设置颜色：兼容绿/不兼容红/暗淡灰（连线中默认暗淡）
+            if target_pi is None:
+                # 悬停空白：暗淡灰（连线中状态）
+                self._connecting_edge.set_base_color(QColor("#6E7681"))
             elif target_ok:
+                # 兼容端口：亮绿（可以连接）
                 self._connecting_edge.set_base_color(QColor("#3FB950"))
             else:
+                # 不兼容端口：红色（不能连接）
                 self._connecting_edge.set_base_color(QColor("#F85149"))
-                self._wire_invalid = True
+            # 方案B：无论 from_p 是输入还是输出端口，临时连线都从 from_p 出发画到鼠标位置
             if from_p.port.direction == PortDirection.OUT:
+                # 输出端口：from_port 固定，to_pos 跟随鼠标
                 self._connecting_edge.set_temp_to(pos)
             else:
+                # 输入端口：to_port 固定为 from_p，from_pos 跟随鼠标
+                # 视觉效果：从鼠标位置画到输入端口（=从输入端口出发画到鼠标的反向，
+                #           但用户体感是"线从我按下的端口出发，跟着鼠标走"）
                 self._connecting_edge._from_pos = pos
             self._connecting_edge._rebuild_bezier()
             event.accept()
@@ -349,25 +495,60 @@ class NodeScene(QGraphicsScene):
             event.accept()
             return
 
-        if self._connecting_edge:
+        # ========== 连线释放判定（统一入口） ==========
+        if event.button() == Qt.LeftButton and self._pending_port is not None:
             pos = event.scenePos()
-            has_port_under_cursor = any(
-                isinstance(it, PortItem) for it in self.items(pos)
-            )
-            if has_port_under_cursor:
-                super().mouseReleaseEvent(event)
-                return
-            temp = self._connecting_edge
-            self._connecting_edge = None
-            self._connecting_from = None
-            self._wire_invalid = False
-            if temp:
-                self.removeItem(temp)
+            from_p = self._pending_port
+            # 查找光标下的目标端口
+            target_pi = self._find_port_at(pos, ignore_pi=from_p)
+            # 清理临时连线状态（无论成功与否都要清）
+            self._cancel_pending_wire()
+            # 方案A关键：如果按下后没拖动超过阈值（_connecting_edge 始终为 None），
+            # 且释放时不在别的端口上 → 什么都不做（避免误触创建连线）
+            # 如果拖动了且在目标端口上 → 创建连线
+            if from_p is not None and target_pi is not None:
+                self.connect_ports(from_p, target_pi)
             event.accept()
             return
 
     # ---------------- 选择/键盘 ----------------
     def _on_selection_changed(self):
+        """选择变化时联动高亮（问题3+问题5）：
+        - 选中 EdgeItem → 高亮两端 NodeItem（蓝色虚线边框）
+        - 选中 NodeItem → 高亮关联的所有 EdgeItem（加粗加亮）
+        - 清空选择 → 清除所有联动高亮
+        """
+        sel_items = self.selectedItems()
+        sel_edges = [it for it in sel_items if isinstance(it, EdgeItem)]
+        sel_nodes = [it for it in sel_items if isinstance(it, NodeItem)]
+
+        # ===== 问题3：选中连线 → 高亮两端节点 =====
+        # 先清空所有节点的边关联高亮
+        for ni in self._node_items.values():
+            ni.set_edge_link_highlighted(False)
+        # 如果选中了边，高亮其两端节点
+        for ei in sel_edges:
+            if ei.edge:
+                from_ni = self._node_items.get(ei.edge.from_node)
+                to_ni = self._node_items.get(ei.edge.to_node)
+                if from_ni:
+                    from_ni.set_edge_link_highlighted(True)
+                if to_ni:
+                    to_ni.set_edge_link_highlighted(True)
+
+        # ===== 问题5：选中节点 → 高亮关联边 =====
+        # 先清空所有边的节点关联高亮
+        for ei in self._edge_items.values():
+            ei.set_node_link_highlighted(False)
+        # 如果选中了节点，高亮其关联的所有边
+        if sel_nodes:
+            selected_node_ids = {ni.node.id for ni in sel_nodes}
+            for ei in self._edge_items.values():
+                if ei.edge and (ei.edge.from_node in selected_node_ids or
+                                ei.edge.to_node in selected_node_ids):
+                    ei.set_node_link_highlighted(True)
+
+        # 原有逻辑：发节点选中信号
         ids = self.selected_node_ids()
         if ids:
             self.node_selected.emit(ids[0])
@@ -461,7 +642,7 @@ class NodeView(QGraphicsView):
 
         self._search_le = QLineEdit()
         self._search_le.setPlaceholderText(
-            "搜索 title/type/id (支持子串不区分大小写)；Enter下一个；Esc清空；Ctrl+F聚焦"
+            "搜索 (勾选下方分类)；Enter跳转下一个；Esc清空；Ctrl+F聚焦"
         )
         self._search_le.setStyleSheet("""
             QLineEdit {
@@ -473,6 +654,49 @@ class NodeView(QGraphicsView):
         self._search_le.textChanged.connect(self._on_search_changed)
         self._search_le.returnPressed.connect(self._on_search_next)
         bar.addWidget(self._search_le, 1)
+
+        # 分类搜索控件：
+        # - ID 勾选框：勾选后按节点 ID 子串匹配
+        # - Title 勾选框：勾选后按节点标题子串匹配
+        # - Type 下拉框：选择具体节点类型过滤（"全部"=不过滤）
+        cb_style = (
+            "QCheckBox { color:#8b949e; spacing:4px; padding:2px 6px;"
+            "  background:#21262D; border:1px solid #30363D; border-radius:4px; }"
+            "QCheckBox:checked { color:#58A6FF; border:1px solid #1F6FEB; }"
+            "QCheckBox::indicator { width:12px; height:12px; }"
+        )
+        self._cb_search_id = QCheckBox("ID")
+        self._cb_search_id.setChecked(True)
+        self._cb_search_id.setStyleSheet(cb_style)
+        self._cb_search_id.toggled.connect(self._on_search_changed)
+        bar.addWidget(self._cb_search_id)
+
+        self._cb_search_title = QCheckBox("Title")
+        self._cb_search_title.setChecked(True)
+        self._cb_search_title.setStyleSheet(cb_style)
+        self._cb_search_title.toggled.connect(self._on_search_changed)
+        bar.addWidget(self._cb_search_title)
+
+        # Type 下拉框：包含"全部" + 所有节点库类型
+        combo_style = (
+            "QComboBox { color:#8b949e; padding:2px 8px;"
+            "  background:#21262D; border:1px solid #30363D; border-radius:4px;"
+            "  min-width:70px; }"
+            "QComboBox:hover { border:1px solid #1F6FEB; }"
+            "QComboBox::drop-down { border:none; width:16px; }"
+            "QComboBox QAbstractItemView { background:#21262D; color:#C9D1D9;"
+            "  selection-background-color:#1F6FEB; border:1px solid #30363D; }"
+        )
+        self._cb_search_type = QComboBox()
+        self._cb_search_type.setStyleSheet(combo_style)
+        self._cb_search_type.setToolTip("按节点类型过滤（全部=不过滤）")
+        self._cb_search_type.addItem("全部类型")
+        for ntype in sorted(NODE_LIBRARY.keys()):
+            meta = NODE_LIBRARY.get(ntype)
+            title = meta.title if meta else ntype
+            self._cb_search_type.addItem(title, ntype)
+        self._cb_search_type.currentIndexChanged.connect(self._on_search_changed)
+        bar.addWidget(self._cb_search_type)
 
         prev_btn = QToolButton()
         prev_btn.setText("▲")
@@ -521,10 +745,10 @@ class NodeView(QGraphicsView):
         if self._top_bar is None:
             return
         vw = max(320, int(self.width()))
-        w = min(vw - 16, 880)           # 宽度不超过880，窄屏自适应
+        w = min(vw - 16, 920)           # 宽度不超过920（加了勾选框需要更宽），窄屏自适应
         x = 8 + max(0, (vw - 16 - w) // 2)
         y = 8
-        h = 44
+        h = 48                          # 高度从44→48，容纳勾选框
         self._top_bar.setGeometry(x, y, w, h)
         self._top_bar.raise_()
 
@@ -539,60 +763,82 @@ class NodeView(QGraphicsView):
         return []
 
     def _node_match(self, ni: NodeItem, kw: str) -> bool:
+        """根据搜索条件匹配节点：
+        - Type 下拉框选了具体类型 → 先按类型过滤
+        - ID/Title 勾选框 → 决定按哪些字段做子串匹配
+        如果关键词为空但选了具体类型，也返回 True（纯类型过滤）。"""
+        n = ni.node
+        # Type 下拉框过滤（index 0 = "全部类型"，>0 = 具体类型）
+        type_idx = self._cb_search_type.currentIndex() if self._cb_search_type else 0
+        if type_idx > 0:
+            selected_type = self._cb_search_type.itemData(type_idx)
+            if n.type != selected_type:
+                return False
+            # 选了具体类型但关键词为空 → 纯类型过滤，直接匹配
+            if not kw:
+                return True
+        # 读取 ID/Title 勾选状态
+        check_id = self._cb_search_id.isChecked() if self._cb_search_id else True
+        check_title = self._cb_search_title.isChecked() if self._cb_search_title else True
+        # 没有关键词且没选类型 → 不匹配
         if not kw:
             return False
-        kw = kw.lower()
-        n = ni.node
-        if n.id and kw in n.id.lower():
+        # ID/Title 都没勾 → 不匹配
+        if not (check_id or check_title):
+            return False
+        kw_lower = kw.lower()
+        if check_id and n.id and kw_lower in n.id.lower():
             return True
-        if n.type and kw in n.type.lower():
-            return True
-        meta = ni._meta()
-        if meta:
-            if meta.title and kw in meta.title.lower():
+        if check_title:
+            meta = ni._meta()
+            if meta and meta.title and kw_lower in meta.title.lower():
                 return True
-            if meta.description and kw in meta.description.lower():
-                return True
-        # 搜索变量名 / 输出变量字段（常用于快速找赋值节点）
-        try:
-            for k, v in (n.params or {}).items():
-                if isinstance(v, str) and kw in v.lower():
-                    return True
-        except Exception:
-            pass
         return False
 
-    def _on_search_changed(self, text: str):
-        kw = (text or "").strip()
+    def _on_search_changed(self, *args):
+        """搜索框文本变化或勾选框/下拉框状态变化时触发。
+        实时高亮匹配节点 + 更新计数，但不跳转画布（按回车或前进/后退按钮才跳转）。
+        *args 兼容 textChanged(str)、toggled(bool)、currentIndexChanged(int) 三种信号。"""
+        kw = (self._search_le.text() if self._search_le else "").strip()
+        # 判断是否有搜索条件：有关键词 或 选了具体类型
+        type_idx = self._cb_search_type.currentIndex() if self._cb_search_type else 0
+        has_condition = bool(kw) or type_idx > 0
         self._search_results = []
         for ni in self._iter_node_items():
-            hit = self._node_match(ni, kw) if kw else False
+            hit = self._node_match(ni, kw) if has_condition else False
             try:
                 ni.set_highlighted(hit)
             except Exception:
                 pass
             if hit:
                 self._search_results.append(ni.node.id)
-        self._search_idx = 0 if (kw and self._search_results) else -1
+        # 重置索引到第一个匹配（但不跳转，等用户按回车）
+        self._search_idx = 0 if (has_condition and self._search_results) else -1
+        self._search_jumpedin = False  # 重置"已跳转"标志，下次回车跳到第一个
         if self._search_count_lbl:
             total = len(self._search_results)
             if total and self._search_idx >= 0:
                 self._search_count_lbl.setText(f"{self._search_idx + 1}/{total}")
             else:
                 self._search_count_lbl.setText(str(total))
-        if self._search_idx >= 0:
-            self._goto_search_result(self._search_idx, flash_ok=False)
 
     def _on_search_next(self):
         if not self._search_results:
             return
-        self._search_idx = (self._search_idx + 1) % len(self._search_results)
+        # 首次按回车（还没跳转过）→ 跳到当前索引（第一个）；后续按回车 → 跳到下一个
+        if not getattr(self, "_search_jumpedin", False):
+            self._search_jumpedin = True
+        else:
+            self._search_idx = (self._search_idx + 1) % len(self._search_results)
         self._goto_search_result(self._search_idx, flash_ok=True)
 
     def _on_search_prev(self):
         if not self._search_results:
             return
-        self._search_idx = (self._search_idx - 1) % len(self._search_results)
+        if not getattr(self, "_search_jumpedin", False):
+            self._search_jumpedin = True
+        else:
+            self._search_idx = (self._search_idx - 1) % len(self._search_results)
         self._goto_search_result(self._search_idx, flash_ok=True)
 
     def _goto_search_result(self, idx: int, flash_ok: bool):
@@ -603,9 +849,11 @@ class NodeView(QGraphicsView):
         ni = sc._node_items.get(node_id) if isinstance(sc, NodeScene) else None
         if ni is None:
             return
-        # 选中 + 居中
-        self.centerOn(ni.global_center())
+        # 先确保缩放合适（避免缩放后中心偏移），再居中
         self._zoom_ensure_visible(ni)
+        # centerOn 将节点的场景坐标居中显示在视口中
+        self.centerOn(ni.global_center())
+        # 选中节点
         try:
             ni.setSelected(True)
         except Exception:
@@ -642,6 +890,7 @@ class NodeView(QGraphicsView):
                 pass
         self._search_results = []
         self._search_idx = -1
+        self._search_jumpedin = False
         if self._search_count_lbl:
             self._search_count_lbl.setText("0")
 
@@ -686,6 +935,23 @@ class NodeView(QGraphicsView):
 
     # ---------------- 中键/右键平移 ----------------
     def mousePressEvent(self, event):
+        # 【右键端口冲突处理】右键点击时，如果光标下有端口（PortItem），
+        # 就不要进入平移模式，把事件交给scene→PortItem处理，
+        # 这样用户右键点端口才能弹"解除所有连线"菜单。
+        if event.button() == Qt.RightButton:
+            scene_pos = self.mapToScene(event.position().toPoint())
+            scene = self.scene()
+            has_port_under = False
+            if isinstance(scene, NodeScene):
+                for it in scene.items(scene_pos):
+                    if isinstance(it, PortItem):
+                        has_port_under = True
+                        break
+            if has_port_under:
+                # 有端口：不进入panning，走默认Qt分发，让PortItem收到右键事件
+                super().mousePressEvent(event)
+                return
+            # 空白区域右键：照常进入平移
         if event.button() in (Qt.MiddleButton, Qt.RightButton):
             self._panning = True
             self._last_pan = event.position()

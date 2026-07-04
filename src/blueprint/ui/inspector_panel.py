@@ -162,15 +162,6 @@ class InspectorPanel(QWidget):
         elif t in ("SoundDetect",):
             opening = "🐺 <b style='color:#E3B341'>赫萝：</b>侧耳倾听——风声、脚步声、金币落袋声，可逃不过咱的耳朵哟。"
             flair = "音量够不够、调门对不对，咱这对狼耳一辨便知。设备可别选错了，不然咱也帮不了汝呐。"
-        elif t in ("TargetSetup",):
-            opening = "🐺 <b style='color:#E3B341'>赫萝：</b>啧啧，这是老掉牙的旧路啦，走不得哟。"
-            flair = "赶紧拆掉重建成 OpenApp + BindWindow 吧，踩旧路栽跟头可别怪咱没提醒，哼哼哼。"
-        elif t in ("Web",):
-            opening = "🐺 <b style='color:#E3B341'>赫萝：</b>啧啧，这『网页/HTTP请求』是旧合版啦，已经被咱劈成两条路咯。"
-            flair = "要开浏览器刷网页就用『网页』节点，要往驿站捎信拿回执就用『HTTP请求』节点——可别再抱着这老古董走啦，咱可不保它哪天就塌咯，哼。"
-        elif t in ("TemplatePicker", "RegionLiteral", "Branch", "Note"):
-            opening = "🐺 <b style='color:#E3B341'>赫萝：</b>啧啧，这些小盒子要么过时要么没啥用，咱都收进旧物箱咯。"
-            flair = "便签更是多此一举——节点标题、参数旁边就是现成的写字地方，蓝图本身比啥便签都清楚！别堆些没用的小玩意儿在画布上碍眼啦，哼。"
         else:
             opening = "🐺 <b style='color:#E3B341'>赫萝：</b>嗯？汝选中了个有意思的小玩意儿嘛。"
             flair = "咱也不知该说啥好，总之一路顺风，别把麦子弄丢了哟～"
@@ -194,54 +185,6 @@ class InspectorPanel(QWidget):
         self._clear_action_bar()
         if node is None:
             self._action_host.hide()
-            return
-        if node.type == "TargetSetup":
-            # 旧蓝图用户可能还选到已废弃节点，给出WARN提示
-            lbl = QLabel("⚠️ 已废弃：请删除后重建为 OpenApp + BindWindow")
-            lbl.setStyleSheet("color:#F85149; background:#1C2128; padding:4px 8px; border:1px solid #2D333B; border-radius:4px; font-size:9px;")
-            btn_docs = QPushButton("📄 看设计文档")
-            btn_docs.setStyleSheet(self._btn_style("#2D333B", "#3A3F4B"))
-            btn_docs.setToolTip("《Qflow对齐改造_开发设计文档.md》P0-5 节")
-            btn_docs.clicked.connect(lambda _=False: self._open_dev_doc())
-            self._action_layout.addWidget(lbl, 1)
-            self._action_layout.addWidget(btn_docs)
-            self._action_host.show()
-            return
-        if node.type == "Web":
-            # 旧蓝图中遗留的 网页/HTTP请求 合版节点，提示用户拆成两个
-            lbl = QLabel("⚠️ 已废弃：请删除后重建为『网页』+『HTTP请求』两个独立节点（本节点保持兼容运行，不再维护）")
-            lbl.setStyleSheet("color:#F85149; background:#1C2128; padding:4px 8px; border:1px solid #2D333B; border-radius:4px; font-size:9px;")
-            lbl.setWordWrap(True)
-            self._action_layout.addWidget(lbl, 1)
-            self._action_host.show()
-            return
-        if node.type == "TemplatePicker":
-            lbl = QLabel("⚠️ 已废弃：『模板(截图入库)』不再需要单独创建节点 → ✂ 切分界面选碎图 → 点『生成 FindImage 节点』一键产出已填好 template/region/阈值的完整找图节点。")
-            lbl.setStyleSheet("color:#F85149; background:#1C2128; padding:4px 8px; border:1px solid #2D333B; border-radius:4px; font-size:9px;")
-            lbl.setWordWrap(True)
-            self._action_layout.addWidget(lbl, 1)
-            self._action_host.show()
-            return
-        if node.type == "RegionLiteral":
-            lbl = QLabel("⚠️ 已废弃：『区域常量』不再需要单独创建节点 → 直接在 FindImage/Mouse 等节点的 params 里填 region 参数即可；✂ 切分界面生成的找图节点会自动把 region 填好。")
-            lbl.setStyleSheet("color:#F85149; background:#1C2128; padding:4px 8px; border:1px solid #2D333B; border-radius:4px; font-size:9px;")
-            lbl.setWordWrap(True)
-            self._action_layout.addWidget(lbl, 1)
-            self._action_host.show()
-            return
-        if node.type == "Branch":
-            lbl = QLabel("⚠️ 已废弃：『条件分支(Branch)』被『变量分流(VarSwitch)』完全覆盖——上游 bool 接 VarSwitch.in_value，留空 var_name/cases，就会走 yes/no 二分支（与 Branch out_true/out_false 等价）；VarSwitch 还支持读变量、表达式、多值枚举N选一，统一用 VarSwitch 即可。")
-            lbl.setStyleSheet("color:#F85149; background:#1C2128; padding:4px 8px; border:1px solid #2D333B; border-radius:4px; font-size:9px;")
-            lbl.setWordWrap(True)
-            self._action_layout.addWidget(lbl, 1)
-            self._action_host.show()
-            return
-        if node.type == "Note":
-            lbl = QLabel("⚠️ 已废弃：『便签』无 in/out 端口，不参与执行流和数据流。需要写备注直接写在相关节点的 标题/描述/参数 旁边即可，蓝图本身就是自文档化的。")
-            lbl.setStyleSheet("color:#F85149; background:#1C2128; padding:4px 8px; border:1px solid #2D333B; border-radius:4px; font-size:9px;")
-            lbl.setWordWrap(True)
-            self._action_layout.addWidget(lbl, 1)
-            self._action_host.show()
             return
         if node.type == "Notify":
             btn = QPushButton("🔍 预览通知内容")

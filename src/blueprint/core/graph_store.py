@@ -14,10 +14,8 @@ BACKUP_SUFFIX_TS = ".bp.backup_{ts}.json"
 
 IMAGE_PARAM_NODES = {
     "FindImage",
-    "TemplatePicker",
     "IfImageDetect",
     "StillnessDetect",
-    "WaitAnyImage",
     "FindAnyImage",
 }
 
@@ -459,14 +457,6 @@ class BlueprintStore:
                         node.runtime_attrs.update(ra)
                 except Exception:
                     pass
-            # 旧蓝图 TargetSetup 提示（用户决策：不自动迁移，让用户自己重建）
-            target_setup_count = sum(1 for n in g.nodes.values() if n.type == "TargetSetup")
-            if target_setup_count > 0:
-                BlueprintStore._emit_log(
-                    f"[Warn] 蓝图含 {target_setup_count} 个已废弃的 TargetSetup 单节点，"
-                    f"请删除后重建为 OpenApp（启动程序）+ BindWindow（绑定窗口）两个节点（按Qflow设计拆分）。",
-                    level="WARN",
-                )
             return g
         except Exception as e:
             BlueprintStore._emit_log(f"[Error] BlueprintStore.load 异常: {e}", level="ERROR")

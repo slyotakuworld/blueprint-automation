@@ -30,15 +30,12 @@ CATEGORY_APP       = "应用控制"     # 第一类：打开程序/绑定窗口/
 CATEGORY_LOGIC     = "逻辑组件"     # 第二类：开始/结束/循环/序列/变量/分流/剪贴板/提示
 CATEGORY_EXECUTE   = "执行动作"     # 第三类：鼠标/键盘/延时
 CATEGORY_VISION    = "视觉、感知"   # 第四类：找图/检索/静止/声音
-CATEGORY_DEPRECATED = "🗑 废弃/兼容"
 
 CATEGORIES_ORDER = [
     CATEGORY_APP,
     CATEGORY_LOGIC,
     CATEGORY_EXECUTE,
     CATEGORY_VISION,
-    # 注意：CATEGORY_DEPRECATED（已废弃/兼容）故意不在这里列出，它不会出现在节点库侧栏中，
-    # 但 NODE_LIBRARY / CATEGORY_NODE_ORDER / EXECUTORS 仍保留对应条目，确保旧蓝图加载+执行不报错。
 ]
 
 # 每个分类内部的节点顺序（严格按照txt小节的序号排列）
@@ -47,8 +44,8 @@ CATEGORY_NODE_ORDER: Dict[str, List[str]] = {
     CATEGORY_APP: [
         "OpenApp",       # 1、打开程序
         "BindWindow",    # 2、绑定窗口
-        "Command",       # 3、系统命令
-        "WebBrowser",    # 4、网页（浏览器操作：开URL/刷新/回退/前进）
+        "WebBrowser",    # 3、网页（浏览器操作：开URL/刷新/回退/前进）
+        "Command",       # 4、系统命令
         "HttpRequest",   # 5、HTTP请求（接口调用：GET/POST/PUT/DELETE/Header/Body/超时）
     ],
     CATEGORY_LOGIC: [
@@ -72,17 +69,6 @@ CATEGORY_NODE_ORDER: Dict[str, List[str]] = {
         "IfImageDetect", # 2、检索 → 多图AND
         "StillnessDetect",# 3、静止
         "SoundDetect",   # 4、声音
-    ],
-    CATEGORY_DEPRECATED: [
-        "Click",         # 已被 Mouse 四合一取代（隐藏但兼容执行）
-        "WaitAnyImage",  # 已被 FindAnyImage 取代
-        "EdgeCounter",   # 废弃
-        "GetVariable",   # 已被 VariableEngine 内联+{var} 取代
-        "Web",           # 已拆为 网页(WebBrowser) + HTTP请求(HttpRequest) 两个节点
-        "RegionLiteral", # 已废弃：无需单独创建字面量节点 → FindImage 节点 params.region 直接填坐标即可（切分导入自动填）
-        "TemplatePicker",# 已废弃：无需单独创建字面量节点 → FindImage 节点 params.template 直接填路径即可（切分导入自动填）
-        "Branch",        # 已废弃：VarSwitch 覆盖了全部功能（布尔 yes/no = Branch 真/假；多值枚举 Branch 做不到）→ 直接用 VarSwitch
-        "Note",          # 已废弃：便签纯注释无端口无执行价值，需要备注直接写到相关节点的属性里（节点标题/描述/params注释字段足够）
     ],
 }
 
@@ -188,23 +174,6 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         outputs=[],
         params=[],
         qflow_name="end",
-    ),
-    "Branch": NodeMeta(
-        type="Branch",
-        category=CATEGORY_DEPRECATED,
-        title="【已废弃】条件分支",
-        description="【请删除后改用 变量分流(VarSwitch)】VarSwitch 简单模式 已完全覆盖 Branch：把上游的 bool 值接到 VarSwitch 的 in_value 数据线，留空 var_name 和 cases，就会走 yes/no 二分支（等价于 Branch 的 out_true/out_false）；此外 VarSwitch 还额外支持「读变量名 + {var} 表达式判断 + 多值枚举 N选一」，Branch 无法做到。本节点保留仅兼容旧蓝图。",
-        color="#5E4A1B",
-        accent="#6E7681",
-        inputs=[
-            _exec_in(),
-            _data_in("in_cond", "bool", label="条件"),
-        ],
-        outputs=[
-            _exec_out("out_true", label="真"),
-            _exec_out("out_false", label="假"),
-        ],
-        qflow_name="branch",
     ),
     "Loop": NodeMeta(
         type="Loop",
@@ -393,58 +362,6 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         qflow_name="find_any_image",
         has_dynamic_ports=True,
     ),
-    "WaitAnyImage": NodeMeta(
-        type="WaitAnyImage",
-        category=CATEGORY_DEPRECATED,
-        title="【废弃】等待多图任一",
-        description="【⚠️ 已废弃】请改用「多图任找(分支) FindAnyImage」，其数据线 out_found_index/out_pos/out_found 完全覆盖本节点功能。本节点仅保留兼容旧蓝图。",
-        color="#484F58",
-        accent="#54AEFF",
-        inputs=[_exec_in()],
-        outputs=[
-            _exec_out(),
-            _data_out("out_pos", "tuple2", label="命中位置"),
-            _data_out("out_found_index", "int", label="命中序号"),
-            _data_out("out_found", "bool", label="是否命中"),
-        ],
-        params=[
-            ParamDef(name="templates", editor=EDITOR_STRING, default="", label="模板列表(逗号分隔)", required=True),
-            ParamDef(name="threshold", editor=EDITOR_FLOAT, default=0.75, label="阈值", min=0.3, max=1.0, step=0.01),
-            ParamDef(name="timeout_ms", editor=EDITOR_FLOAT, default=5000.0, label="超时(ms)", min=100.0, max=3600000.0, step=100.0),
-            ParamDef(name="interval_ms", editor=EDITOR_FLOAT, default=300.0, label="轮询间隔(ms)", min=50.0, max=60000.0, step=10.0),
-            ParamDef(name="fast_mode", editor=EDITOR_BOOL, default=True, label="快速模式"),
-        ],
-        qflow_name="wait_any_image",
-        deprecated=True,
-    ),
-    "Click": NodeMeta(
-        type="Click",
-        category=CATEGORY_DEPRECATED,
-        title="点击/按键",
-        description="【⚠️ 新建库隐藏，旧蓝图可正常加载】后续将合并到 Qflow 对齐的 Mouse 四合一节点（mouse move/click/scroll/drag）。当前保留仅用于兼容已存在的旧蓝图。",
-        color="#DA3633",
-        accent="#F85149",
-        inputs=[
-            _exec_in(),
-            _data_in("in_pos", "tuple2", label="坐标"),
-            _data_in("in_region", "tuple4", label="区域"),
-        ],
-        outputs=[_exec_out()],
-        params=[
-            ParamDef(name="mode", editor=EDITOR_ENUM, default="position", label="模式", options=CLICK_MODE_OPTIONS, help="position=坐标；region=区域中心；key=按键"),
-            ParamDef(name="key", editor=EDITOR_STRING, default="", label="按键"),
-            ParamDef(name="double", editor=EDITOR_BOOL, default=False, label="双击"),
-            ParamDef(name="post_delay", editor=EDITOR_FLOAT, default=0.1, label="点击后延时(s)", min=0.0, max=10.0, step=0.01),
-            ParamDef(name="random_offset_radius", editor=EDITOR_INT, default=8, label="随机偏移半径(px)", min=0, max=200, step=1),
-            ParamDef(name="hold_ms_min", editor=EDITOR_INT, default=30, label="按下保持最小(ms)", min=1, max=5000, step=1),
-            ParamDef(name="hold_ms_max", editor=EDITOR_INT, default=80, label="按下保持最大(ms)", min=1, max=5000, step=1),
-            ParamDef(name="post_delay_min_ms", editor=EDITOR_INT, default=80, label="后延时最小(ms)", min=0, max=10000, step=1),
-            ParamDef(name="post_delay_max_ms", editor=EDITOR_INT, default=200, label="后延时最大(ms)", min=0, max=10000, step=1),
-        ],
-        # 阶段3映射 Mouse 四合一（Mouse节点才是qflow_name=mouse）；当前新建隐藏、旧蓝图仍可加载执行
-        qflow_name="",
-        hidden_in_palette=True,
-    ),
     "PressKey": NodeMeta(
         type="PressKey",
         category=CATEGORY_EXECUTE,
@@ -522,58 +439,7 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         ],
         qflow_name="mouse",
     ),
-    # ---------------- 常量 / 输入 ----------------
-    "RegionLiteral": NodeMeta(
-        type="RegionLiteral",
-        category=CATEGORY_DEPRECATED,
-        title="【已废弃】区域常量",
-        description="【请删除后改用参数写法】不再需要单独创建一个区域常量节点再连线：所有支持 in_region 的节点（FindImage/Mouse/Click 等）都已内置 region 参数，直接在该节点的属性面板里填 (x,y,w,h) 即可。✂ 切分界面点「生成区域」按钮也会直接把坐标塞进目标节点 params.region，不会再创建本节点。",
-        color="#223320",
-        accent="#4C545A",
-        outputs=[_data_out("out_region", "tuple4", label="区域")],
-        params=[
-            ParamDef(name="x", editor=EDITOR_INT, default=0, label="X", min=0, max=10000, step=1, required=True),
-            ParamDef(name="y", editor=EDITOR_INT, default=0, label="Y", min=0, max=10000, step=1, required=True),
-            ParamDef(name="w", editor=EDITOR_INT, default=100, label="W", min=1, max=10000, step=1, required=True),
-            ParamDef(name="h", editor=EDITOR_INT, default=100, label="H", min=1, max=10000, step=1, required=True),
-        ],
-        qflow_name="region_literal",
-    ),
-    "TemplatePicker": NodeMeta(
-        type="TemplatePicker",
-        category=CATEGORY_DEPRECATED,
-        title="【已废弃】模板(截图入库)",
-        description="【请删除后改用 FindImage 内嵌模板】不再需要单独创建一个模板节点再连线：直接从 ✂ 切分界面选碎图 → 「导入到画布」一键生成 FindImage 节点，节点 params.template 自动填好模板路径，同时 region/阈值 也已预填好，开箱即用。本节点保留仅为兼容旧蓝图。",
-        color="#0E2A45",
-        accent="#4C545A",
-        outputs=[_data_out("out_template", "path", label="模板路径")],
-        params=[
-            ParamDef(name="template_path", editor=EDITOR_TEMPLATE_PICKER, default="", label="模板路径", required=True),
-        ],
-        qflow_name="image_picker",
-    ),
     # ---------------- 变量 ----------------
-    "EdgeCounter": NodeMeta(
-        type="EdgeCounter",
-        category=CATEGORY_DEPRECATED,
-        title="【废弃】边沿计数",
-        description="【⚠️ 已废弃】Qflow 对齐蓝图中不推荐使用。后续可通过 SetVariable 配合 {= {var} + 1} 表达式实现累计计数。当前保留仅兼容旧蓝图。",
-        color="#484F58",
-        accent="#6E7681",
-        inputs=[
-            _exec_in(),
-            _data_in("in_signal", "bool", label="信号"),
-        ],
-        outputs=[
-            _exec_out(),
-            _data_out("rising_count", "int", label="上升沿累计"),
-            _data_out("falling_count", "int", label="下降沿累计"),
-            _data_out("edge_rising", "bool", label="本帧上升"),
-            _data_out("edge_falling", "bool", label="本帧下降"),
-        ],
-        qflow_name="",
-        deprecated=True,
-    ),
     "SetVariable": NodeMeta(
         type="SetVariable",
         category=CATEGORY_LOGIC,
@@ -591,22 +457,7 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         ],
         qflow_name="set_var",
     ),
-    "GetVariable": NodeMeta(
-        type="GetVariable",
-        category=CATEGORY_DEPRECATED,
-        title="【废弃】读取变量",
-        description="【⚠️ 已废弃】改用 Qflow 对齐的 {var}/${var} 全局变量插值（在任意文本框/参数框里直接写 {my_var} 即可）；或使用 VarSwitch 做变量分支。当前保留仅兼容旧蓝图。",
-        color="#484F58",
-        accent="#8957E5",
-        outputs=[_data_out("out_value", "any", label="值")],
-        params=[
-            ParamDef(name="name", editor=EDITOR_STRING, default="", label="变量名", required=True),
-            ParamDef(name="default", editor=EDITOR_STRING, default="", label="默认值"),
-        ],
-        qflow_name="get_var",
-        deprecated=True,
-    ),
-    # ---------------- 便签（非执行） ----------------
+    # ---------------- 通知 ----------------
     "Notify": NodeMeta(
         type="Notify",
         category=CATEGORY_LOGIC,
@@ -693,38 +544,6 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         ],
         qflow_name="cmd",
     ),
-    "Web": NodeMeta(
-        type="Web",
-        category=CATEGORY_DEPRECATED,
-        title="【已废弃】网页/HTTP请求",
-        description="【请删除后重建】已拆分为『网页（WebBrowser，浏览器操作）』+『HTTP请求（HttpRequest，接口调用）』两个独立节点，不要再使用本节点（保持兼容执行，旧蓝图不会立刻坏）。",
-        color="#3A3F00",
-        accent="#6E7681",
-        inputs=[_exec_in()],
-        outputs=[
-            _exec_out("out_done", label="完成"),
-            _exec_out("err", label="失败/超时"),
-            _data_out("response_text", "str", label="响应原文"),
-            _data_out("response_json", "dict", label="响应JSON(字典)"),
-            _data_out("status_code", "int", label="HTTP状态码"),
-        ],
-        params=[
-            ParamDef(name="mode", editor=EDITOR_ENUM, default="browser",
-                     options=["browser", "http_get", "http_post"],
-                     label="模式"),
-            ParamDef(name="url", editor=EDITOR_STRING, default="https://example.com/api?name={name}",
-                     label="URL（支持{var}）"),
-            ParamDef(name="body_json", editor=EDITOR_MULTILINE, default='{"key": "{var}"}',
-                     label="POST请求体(JSON，支持{var})"),
-            ParamDef(name="headers_json", editor=EDITOR_MULTILINE, default='{"Authorization": "Bearer {token}"}',
-                     label="请求头(JSON，支持{var})"),
-            ParamDef(name="timeout_ms", editor=EDITOR_INT, default=10000, min=500, max=300000,
-                     label="超时(ms)"),
-            ParamDef(name="save_json_to_vars", editor=EDITOR_BOOL, default=True,
-                     label="JSON自动拆成 web_ 变量"),
-        ],
-        qflow_name="web",
-    ),
     "WebBrowser": NodeMeta(
         type="WebBrowser",
         category=CATEGORY_APP,
@@ -791,20 +610,6 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
                      help='勾了后响应JSON若是字典，每个 key 自动塞到 ctx.variables["web_"+key]，后续节点直接 {web_user_id} 用'),
         ],
         qflow_name="http_request",
-    ),
-    "Note": NodeMeta(
-        type="Note",
-        category=CATEGORY_DEPRECATED,
-        title="【已废弃】便签",
-        description="【请删除】便签节点没有任何 in/out 端口，不参与执行流，也不产出任何数据，属纯装饰占位。需要写备注直接写到相关节点的 标题/描述/参数 字段旁边即可，蓝图本身就是自文档化的。",
-        color="#3A320F",
-        accent="#6E7681",
-        inputs=[],
-        outputs=[],
-        params=[
-            ParamDef(name="text", editor=EDITOR_STRING, default="", label="内容"),
-        ],
-        qflow_name="note",
     ),
     # ---------------- 检测节点 ----------------
     "IfImageDetect": NodeMeta(

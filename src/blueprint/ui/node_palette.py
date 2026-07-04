@@ -121,16 +121,11 @@ class NodePalette(QWidget):
             f = it.font(0)
             f.setBold(True)
             it.setFont(0, f)
-            if "废弃" in cat or "deprecated" in cat.lower():
-                it.setForeground(0, QColor("#F78166"))
-                it.setToolTip(0, "该分类下的节点已废弃，仅用于兼容加载旧蓝图，不建议新蓝图使用")
-            else:
-                it.setForeground(0, QColor("#8B949E"))
+            it.setForeground(0, QColor("#8B949E"))
             it.setFlags(it.flags() & ~Qt.ItemIsDragEnabled)
             self._tree.addTopLevelItem(it)
             category_items[cat] = it
 
-        from ..core.node_library import CATEGORY_DEPRECATED
         for ntype in NODE_TYPES_ORDERED:
             meta = NODE_LIBRARY.get(ntype)
             if not meta:
@@ -154,14 +149,8 @@ class NodePalette(QWidget):
                 tip_parts.insert(0, "【⚠️ 已废弃，不推荐】")
             else:
                 it.setForeground(0, QColor("#C9D1D9"))
-            if meta.category == CATEGORY_DEPRECATED:
-                tip_parts.insert(0, "【⚠️ 废弃分类，仅兼容旧蓝图】")
             it.setToolTip(0, "\n".join(t for t in tip_parts if t))
         self._tree.expandAll()
-        # 如果废弃分类无任何子项，隐藏整组：保持显示提示
-        for cat, it in category_items.items():
-            if it.childCount() == 0 and "废弃" not in cat:
-                continue  # 保留废弃组即使空也显示（提示用户分类存在，除非完全没废弃节点时折叠
 
     def current_node_type(self) -> Optional[str]:
         it = self._tree.currentItem()

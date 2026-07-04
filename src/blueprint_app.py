@@ -1784,7 +1784,6 @@ class BlueprintMainWindow(QMainWindow):
     # ==================== 截图 / 切分工具 (S3 / S4 hooks) ====================
     def _build_tool_hooks(self) -> dict:
         return {
-            "create_region_node": self._hook_create_region_node,
             "create_find_image_node": self._hook_create_find_image_node,
             "get_active_hwnd": self.get_active_hwnd,
         }
@@ -1995,7 +1994,12 @@ class BlueprintMainWindow(QMainWindow):
     def _on_scene_node_will_remove(self, node_id: str, node_snap: dict, related_edge_snaps: list):
         if self._applying_undo_redo:
             return
-        if not hasattr(self, "_pending_remove_nodes"):
+        # 关键修复：不能用 hasattr(self, "_pending_remove_nodes") 判断，
+        # 因为 _flush_pending_removes 执行后属性还在（只是列表被清空），
+        # 会导致第二次删除时定时器不注册，undo 栈永远不 push（问题1根因）。
+        # 改用专门的 _remove_flush_scheduled 标志，在 _flush_pending_removes 结束时重置。
+        if not getattr(self, "_remove_flush_scheduled", False):
+            self._remove_flush_scheduled = True
             self._pending_remove_nodes = []
             self._pending_remove_edges = []
             QTimer.singleShot(0, self._flush_pending_removes)
@@ -2004,8 +2008,9 @@ class BlueprintMainWindow(QMainWindow):
     def _on_scene_edge_will_remove(self, edge_id: str, edge_snap: dict):
         if self._applying_undo_redo:
             return
-        # 只有"用户单独选中边→删除"的情况走到这里；删节点连带的边在 node_will_remove 里已记录
-        if not hasattr(self, "_pending_remove_nodes"):
+        # 同上：用 _remove_flush_scheduled 标志而非 hasattr 判断
+        if not getattr(self, "_remove_flush_scheduled", False):
+            self._remove_flush_scheduled = True
             self._pending_remove_nodes = []
             self._pending_remove_edges = []
             QTimer.singleShot(0, self._flush_pending_removes)
@@ -2017,6 +2022,8 @@ class BlueprintMainWindow(QMainWindow):
         edge_list = getattr(self, "_pending_remove_edges", None) or []
         self._pending_remove_nodes = []
         self._pending_remove_edges = []
+        # 关键：重置标志，让下次删除操作能重新注册定时器（问题1修复）
+        self._remove_flush_scheduled = False
         if not node_list and not edge_list:
             return
         # 构造 remove_nodes 项：节点快照 + 节点关联边 + 独立删除的边 放在一起
@@ -2179,28 +2186,6 @@ class BlueprintMainWindow(QMainWindow):
         self._scene.graph_changed.emit()
 
     # ---------- Hooks implementation ----------
-    def _hook_create_region_node(self, region_tuple4):
-        try:
-            from PySide6.QtCore import QPointF
-            x, y, w, h = region_tuple4
-            scene_center = self._view.mapToScene(
-                self._view.viewport().rect().center()
-            )
-            if scene_center is None:
-                scene_center = QPointF(400, 300)
-            node = self._scene.add_node_by_type("RegionLiteral", scene_center)
-            if node is not None:
-                node.params.update({"x": x, "y": y, "w": w, "h": h})
-                self._scene.select_node_id(node.id)
-                self._inspector.set_node(node)
-                # 注意：scene.add_node_by_type 内部已经 emit 了 node_created / graph_changed，
-                # 此处不能再重复 emit，否则撤销栈会对同一节点重复 push add_nodes
-                self._scene.graph_changed.emit()
-            return node.id if node else None
-        except Exception as e:
-            self._log.append_log(f"[Hook] create_region_node 失败: {e}", "ERROR")
-            return None
-
     def _hook_create_find_image_node(self, template_path, region_tuple4_or_None):
         try:
             from PySide6.QtCore import QPointF
@@ -2228,7 +2213,33 @@ class BlueprintMainWindow(QMainWindow):
 
     # ==================== 全局热键 & 游戏内无弹窗截图 ====================
     def closeEvent(self, event):
-        """关闭窗口时释放 pynput 全局钩子，避免进程残留/键盘异常。"""
+        """关闭窗口时：先检查蓝图是否有未保存修改 → 再释放 pynput 全局钩子，避免进程残留。"""
+        # 1) 先检查并询问蓝图保存（用户明确要求：关程序前必须检测保存状态）
+        try:
+            if self._runner is not None and self._runner.isRunning():
+                ret = QMessageBox.question(
+                    self, "蓝图正在运行中",
+                    "当前有蓝图正在执行，关闭程序会强制停止它。\n\n是否仍然关闭？",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+                )
+                if ret != QMessageBox.Yes:
+                    event.ignore()
+                    return
+                try:
+                    self._runner.request_stop()
+                    self._runner.wait(500)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            if not self._confirm_discard():
+                # 用户选了 Cancel 或保存后仍需保存（例如保存失败又取消丢弃）
+                event.ignore()
+                return
+        except Exception:
+            pass
+        # 2) 释放全局热键钩子
         try:
             self._hotkey_mgr.unregister()
         except Exception:
@@ -2239,6 +2250,11 @@ class BlueprintMainWindow(QMainWindow):
                     self._split_dialog_ref.close()
                 except Exception:
                     pass
+        except Exception:
+            pass
+        # 3) 同步用户设置到磁盘（保证设置对话框里改过的热键等下次启动还在）
+        try:
+            save_user_settings(self._user_settings)
         except Exception:
             pass
         super().closeEvent(event)

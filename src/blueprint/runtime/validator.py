@@ -3,9 +3,6 @@ from typing import List, Tuple
 from ..core.models import BlueprintGraph, Node, PortType
 
 
-LITERAL_TYPES = {"RegionLiteral", "TemplatePicker", "GetVariable", "Note"}
-
-
 class ValidationIssue:
     def __init__(self, level: str, code: str, message: str, node_id: str = "", edge_id: str = ""):
         self.level = level    # ERROR | WARN
@@ -41,10 +38,8 @@ def validate_graph(graph: BlueprintGraph) -> List[ValidationIssue]:
         if not has_out:
             issues.append(ValidationIssue("WARN", "START_NO_OUT", "Start 节点没有 out_exec 出边，蓝图不会执行任何动作。", s.id))
 
-    # 3. 非 Start / 字面量节点 in_exec 必须有上游
+    # 3. 非 Start 节点 in_exec 必须有上游
     for n in nodes:
-        if n.type in LITERAL_TYPES:
-            continue
         if n.type == "Start":
             continue
         need_exec_in = any(p for p in n.inputs if p.type == PortType.EXEC)
@@ -108,28 +103,17 @@ def _check_required_params(n: Node, issues: List[ValidationIssue]):
     if t == "FindImage":
         if not _not_empty(n.params.get("template")):
             issues.append(ValidationIssue("ERROR", "FIND_NO_TEMPLATE", "FindImage.template 不能为空（需要一个模板路径）。", n.id))
-    elif t == "FindAnyImage" or t == "WaitAnyImage":
+    elif t == "FindAnyImage":
         if not _not_empty(n.params.get("templates")):
             issues.append(ValidationIssue("ERROR", "ANY_NO_TEMPLATES", f"{t}.templates 不能为空（逗号分隔多个模板）。", n.id))
-    elif t == "Click":
-        mode = str(n.params.get("mode", "position"))
-        if mode == "key":
-            if not _not_empty(n.params.get("key")):
-                issues.append(ValidationIssue("ERROR", "CLICK_NO_KEY", "Click 在 key 模式时必须填写 key。", n.id))
     elif t == "PressKey":
         if not _not_empty(n.params.get("key")):
             issues.append(ValidationIssue("ERROR", "PRESS_NO_KEY", "PressKey.key 不能为空。", n.id))
-    elif t == "TemplatePicker":
-        if not _not_empty(n.params.get("template_path")):
-            issues.append(ValidationIssue("WARN", "PICKER_EMPTY", "TemplatePicker 未选择模板图片。", n.id))
     elif t == "SetVariable":
         has_batch = bool(str(n.params.get("batch_text", "") or "").strip())
         has_legacy_name = bool(str(n.params.get("name", "") or "").strip())
         if not has_batch and not has_legacy_name:
             issues.append(ValidationIssue("WARN", "SET_EMPTY", "SetVariable 未设置任何变量：batch_text 与 name 均为空。", n.id))
-    elif t == "GetVariable":
-        if not _not_empty(n.params.get("name")):
-            issues.append(ValidationIssue("ERROR", "GET_NO_NAME", "GetVariable.name 不能为空。", n.id))
 
 
 def has_errors(issues: List[ValidationIssue]) -> bool:
