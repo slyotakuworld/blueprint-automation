@@ -2014,6 +2014,8 @@ class InspectorPanel(QWidget):
             "click_count": ["click"],
             "hold_ms_min": ["click", "press"],
             "hold_ms_max": ["click", "press"],
+            "post_delay_min_ms": ["click", "press"],
+            "post_delay_max_ms": ["click", "press"],
             "move_speed_ms": ["move", "drag"],
             # --- scroll 独有 ---
             "scroll_dy": ["scroll"],

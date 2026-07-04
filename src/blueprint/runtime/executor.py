@@ -1033,8 +1033,8 @@ def execute_Mouse(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
             hold_min = max(1, int(p.get("hold_ms_min", 30) or 30))
             hold_max = max(1, int(p.get("hold_ms_max", 80) or 80))
             hold_range = (min(hold_min, hold_max), max(hold_min, hold_max))
-            post_min = max(0, int(p.get("post_delay_min_ms", 80) or 80))
-            post_max = max(0, int(p.get("post_delay_max_ms", 200) or 200))
+            post_min = max(0, int(p.get("post_delay_min_ms", 30) or 30))
+            post_max = max(0, int(p.get("post_delay_max_ms", 80) or 80))
             post_range = (min(post_min, post_max), max(post_min, post_max))
             double = clicks >= 2
             if ia is not None:
@@ -1046,13 +1046,19 @@ def execute_Mouse(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
             ctx.log(f"[Mouse] click @{pos} btn={btn} x{clicks}", "SUCCESS")
 
         elif action == "press":
-            hold_ms = max(0, int(p.get("press_ms", 0) or 0))
+            hold_min = max(1, int(p.get("hold_ms_min", 30) or 30))
+            hold_max = max(1, int(p.get("hold_ms_max", 80) or 80))
+            hold_range = (min(hold_min, hold_max), max(hold_min, hold_max))
+            post_min = max(0, int(p.get("post_delay_min_ms", 30) or 30))
+            post_max = max(0, int(p.get("post_delay_max_ms", 80) or 80))
+            post_range = (min(post_min, post_max), max(post_min, post_max))
             if ia is not None:
                 ia.game_click(pos, double=False, random_offset_radius=0,
-                              hold_ms_range=(hold_ms, hold_ms) if hold_ms > 0 else (30, 80),
-                              post_delay_range=(0, 0))
-            annotate_step(ctx, node, "press", pos=pos, note=f"press@{pos} btn={btn} hold={hold_ms}ms")
-            ctx.log(f"[Mouse] press @{pos} btn={btn} hold={hold_ms}ms", "SUCCESS")
+                              hold_ms_range=hold_range,
+                              post_delay_range=post_range)
+            annotate_step(ctx, node, "press", pos=pos,
+                          note=f"press@{pos} btn={btn} hold={hold_range}ms")
+            ctx.log(f"[Mouse] press @{pos} btn={btn} hold={hold_range}ms", "SUCCESS")
 
         elif action == "release":
             annotate_step(ctx, node, "release", pos=pos, note=f"release btn={btn}")
