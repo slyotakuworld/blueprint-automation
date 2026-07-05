@@ -29,6 +29,7 @@ _THEME_DAY: Dict[str, str] = {
 
     # ---- 主色/强调色（赫萝提取）----
     "primary":         "#E8A95C",   # 赫萝发色 金棕 主色
+    "primary_light":   "#FFD89A",   # 主色浅色背景（蓝图状态胶囊 / 浅色高亮）
     "primary_dark":    "#C97F35",   # hover / pressed
     "accent":          "#E55D5D",   # 赫萝苹果红（强调 / 发送按钮）
     "accent_dark":     "#C94040",
@@ -55,6 +56,10 @@ _THEME_DAY: Dict[str, str] = {
     "bubble_holo_0":   "#FFFFFF",   # 赫萝气泡 奶白（起）
     "bubble_holo_1":   "#FFF5EC",   # 赫萝气泡 奶茶（止）
     "bubble_holo_border": "#F2D4B0",
+    # -- 粉红可爱版赫萝气泡（day：樱粉→蔷薇粉） --
+    "bubble_holo_pink_0":   "#FFF7FB",   # 粉樱白
+    "bubble_holo_pink_1":   "#FFE4F0",   # 浅粉
+    "bubble_holo_pink_border": "#F5B7C9",
 
     # ---- 状态 ----
     "success":         "#7FAA5C",   # 成功绿（温柔，不是 GitHub 那种深绿）
@@ -77,6 +82,7 @@ _THEME_NIGHT: Dict[str, str] = {
 
     # ---- 主色/强调 ----
     "primary":         "#F5C976",   # 深夜版赫萝金发光（更亮）
+    "primary_light":   "#584270",   # 主色浅色背景（蓝图状态胶囊 / 浅色高亮）
     "primary_dark":    "#E8A95C",
     "accent":          "#E55D5D",   # 苹果红不变
     "accent_dark":     "#C94040",
@@ -103,6 +109,10 @@ _THEME_NIGHT: Dict[str, str] = {
     "bubble_holo_0":   "#3B2A4A",   # 赫萝气泡：深夜紫
     "bubble_holo_1":   "#231A2E",
     "bubble_holo_border": "#4A375E",
+    # -- 粉红可爱版赫萝气泡（night：紫粉→粉紫） --
+    "bubble_holo_pink_0":   "#4A2F48",   # 紫粉深
+    "bubble_holo_pink_1":   "#3A2238",   # 粉紫深
+    "bubble_holo_pink_border": "#6E4769",
 
     # ---- 状态 ----
     "success":         "#A0D97A",

@@ -249,7 +249,7 @@ class LLMSettingsDialog(QDialog):
             qp = QPainter(out); qp.setRenderHint(QPainter.Antialiasing)
             path = QPainterPath(); path.addEllipse(0, 0, 72, 72); qp.setClipPath(path)
             # 原图人物偏左，整体向右平移 4px，让脸/主体落在圆形视觉中心
-            qp.drawPixmap(4, 0, apm); qp.setClipping(False)
+            qp.drawPixmap(6, 0, apm); qp.setClipping(False)
             pen = QPen(Qt.NoPen); qp.setPen(pen)
             qp.setBrush(Qt.NoBrush)
             qp.setPen(QPen(Qt.transparent))
@@ -1012,7 +1012,7 @@ class LLMSettingsDialog(QDialog):
             qp = _QP2(out); qp.setRenderHint(_QP2.Antialiasing)
             pth = _QPP2(); pth.addEllipse(0, 0, 112, 112); qp.setClipPath(pth)
             # 原图人物偏左，整体向右平移 6px，让脸/主体落在圆形视觉中心
-            qp.drawPixmap(6, 0, apm); qp.setClipping(False)
+            qp.drawPixmap(14, 0, apm); qp.setClipping(False)
             qp.setPen(_QPen2(_QCol2(_THEME["primary"]), 3)); qp.setBrush(Qt.NoBrush)
             qp.drawEllipse(0, 0, 111, 111); qp.end()
             big_avatar.setPixmap(out); big_avatar.setFixedSize(112, 112)

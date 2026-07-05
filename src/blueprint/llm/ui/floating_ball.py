@@ -28,7 +28,7 @@
 交互（原设计保持不变）：
   * 左键单击 —— 打开完整 FullChatDialog
   * 右键单击 —— 在浮标周围弹出 QuickChatBubble
-  * 左键拖动 —— 可移动，松开自动吸附到最近的屏幕边缘
+  * 左键拖动 —— 可移动
 """
 from __future__ import annotations
 
@@ -162,6 +162,8 @@ class FloatingBall(QWidget):
 
         # ---- 状态 ----
         self._drag_pos: Optional[QPoint] = None
+        self._press_global_pos: Optional[QPoint] = None
+        self._did_drag: bool = False
         self._hovered = False
         self._opacity_val = 0.0
         # ---- 赫萝 5 状态：idle / thinking / happy / sleep / sad
@@ -390,7 +392,7 @@ class FloatingBall(QWidget):
             "\n━━━━━━━━━━━━━━━━━━"
             "\n🐾 左键：完整对话大窗口"
             "\n🐾 右键：快速气泡（悬浮球旁）"
-            "\n🐾 拖动：自由移动，松开吸附屏幕边缘"
+            "\n🐾 拖动：自由移动，拖到哪停在哪"
         )
         self.setToolTip(tip)
 
@@ -567,8 +569,11 @@ class FloatingBall(QWidget):
         if self._state in ("sleep", "sad"):
             self.set_avatar_state("idle")
         if e.button() == Qt.LeftButton:
-            # 拖动锚点：鼠标全局坐标 - 窗口左上角
-            self._drag_pos = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            # 记录按下时的全局坐标，用作「是否拖过」的基准
+            self._press_global_pos = e.globalPosition().toPoint()
+            # 拖动锚点：鼠标全局坐标 - 窗口左上角（按下瞬间的帧左上角）
+            self._drag_pos = self._press_global_pos - self.frameGeometry().topLeft()
+            self._did_drag = False
             e.accept()
             return
         if e.button() == Qt.RightButton:
@@ -582,6 +587,14 @@ class FloatingBall(QWidget):
 
     def mouseMoveEvent(self, e):
         if self._drag_pos is not None and e.buttons() & Qt.LeftButton:
+            # 超过系统拖动阈值（默认 ~6-8px）就认为是拖动，后续 release 不再触发点击
+            if (not self._did_drag) and self._press_global_pos is not None:
+                cur = e.globalPosition().toPoint()
+                dx = cur.x() - self._press_global_pos.x()
+                dy = cur.y() - self._press_global_pos.y()
+                threshold = QApplication.startDragDistance() + 2  # 再加 2px 防抖动
+                if (dx * dx + dy * dy) > threshold * threshold:
+                    self._did_drag = True
             self.move(e.globalPosition().toPoint() - self._drag_pos)
             e.accept()
             return
@@ -592,18 +605,23 @@ class FloatingBall(QWidget):
 
     def mouseReleaseEvent(self, e):
         if e.button() == Qt.LeftButton and self._drag_pos is not None:
-            # 判断是 click 还是 drag
-            moved = (
-                e.globalPosition().toPoint()
-                - self.frameGeometry().topLeft()
-                - self._drag_pos
-            )
-            dist = float(moved.x() ** 2 + moved.y() ** 2) ** 0.5
+            drag_pos_was = self._drag_pos
             self._drag_pos = None
-            if dist < 5.0:
-                self._open_full_chat()
+            # 只要拖过（_did_drag = True）就保留当前位置（不吸附），绝不触发打开
+            if self._did_drag:
+                self._did_drag = False
+                e.accept()
+                return
+            # 没拖过：再做一次兜底距离检查（防极短距离的误触），阈值比 startDragDistance 稍大
+            if self._press_global_pos is not None:
+                cur = e.globalPosition().toPoint()
+                dx = cur.x() - self._press_global_pos.x()
+                dy = cur.y() - self._press_global_pos.y()
+                if (dx * dx + dy * dy) <= 36:  # 6px
+                    self._open_full_chat()
             else:
-                self._snap_to_edge()
+                self._open_full_chat()
+            self._press_global_pos = None
             e.accept()
             return
         try:
@@ -629,21 +647,42 @@ class FloatingBall(QWidget):
             pass
 
     def _show_quick_bubble(self):
-        """右键 → 在悬浮球旁弹出 QuickChatBubble（新版：parent=None + popup_at 屏幕坐标）。"""
+        """右键 → 在悬浮球旁弹出 QuickChatBubble（自动避屏边界 + 不遮挡球 + 共享自由聊天记录）。"""
         if self._quick_bubble is None:
             self._quick_bubble = QuickChatBubble(parent=None)
             self._quick_bubble.message_sent.connect(self._on_user_message_quick)
-            self._quick_bubble.open_full_chat_requested.connect(self._open_full_chat)
-        # 锚点：悬浮球中心（取屏幕全局坐标），然后 popup_at 右下偏移
+        # 确保 FullChatDialog 已创建（不 show），用于共享聊天记录
+        if self._full_dlg is None:
+            self._full_dlg = FullChatDialog()
+            self._full_dlg.message_sent.connect(self._on_user_message_from_full)
+        # 从 FullChatDialog 同步当前自由聊天会话记录（共享同一份记录）
+        self._quick_bubble.sync_from(self._full_dlg)
+
         from PySide6.QtCore import QPoint as _QP
-        anchor_global = self.mapToGlobal(_QP(self.width() // 2, self.height() // 2))
-        # 判断悬浮球在屏幕哪边 -> 反向偏移不越界
         geo = self._screen_available()
-        # 默认往右（右侧 10px + 下 2px）
-        off_r = 14; off_d = -36
-        if self.x() + self.width() + 440 > geo.right():
-            off_r = -(440 + 14)
-        self._quick_bubble.popup_at(anchor_global, off_r, off_d)
+        ball_geo = self.geometry()           # 球的全局 rect
+        ball_x, ball_y = ball_geo.x(), ball_geo.y()
+        ball_w, ball_h = ball_geo.width(), ball_geo.height()
+        ball_cx = ball_x + ball_w // 2
+
+        bub_w = self._quick_bubble.width()    # 420
+        bub_h = self._quick_bubble.height()   # 480
+        gap = 8                                # 球与气泡间距
+
+        # 水平：球在屏幕左半 → 气泡在右；球在右半 → 气泡在左
+        if ball_cx < geo.center().x():
+            x = ball_x + ball_w + gap          # 球右边 + 间距
+        else:
+            x = ball_x - bub_w - gap           # 球左边 - 间距 - 气泡宽
+
+        # 垂直：默认让气泡顶部和球顶部对齐，再做边界保护
+        y = ball_y
+        if y + bub_h > geo.bottom() + 1:
+            y = geo.bottom() - bub_h + 1
+        if y < geo.top():
+            y = geo.top()
+
+        self._quick_bubble.popup_at(_QP(x, y))
 
     # =================================================================
     # 用户消息 —— 打桩：toast + 发信号
