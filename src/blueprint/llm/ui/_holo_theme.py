@@ -1,14 +1,12 @@
 # -*- coding: utf-8 -*-
-"""赫萝双主题配色 + QSS 生成器（供 4 个 UI 壳子统一调用）。
+"""赫萝主题配色 + QSS 生成器（供 4 个 UI 壳子统一调用）。
 
-两套主题：
-  · day   → 奶茶白日（默认）：赫萝金棕发色 + 苹果红强调 + 奶茶背景
-  · night → 深夜狼瞳紫：赫萝金发微光 + 深夜紫黑背景 + 苹果红不变
+主题：固定奶茶白日（赫萝金棕发色 + 苹果红强调 + 奶茶背景）。
 
 对外 API：
-  get_theme(name: str = "day") -> dict[str, str]   取色板字典
-  build_qss(theme: dict) -> str                     生成通用 QSS 片段
-  apply_font_stack() -> list[str]                   获取字体 fallback 栈（已存在则优先）
+  get_theme(name: str = "day") -> dict[str, str]   取色板字典（参数兼容历史写法，实际固定返回 day）
+  build_qss(name: str = "day") -> str              把主题色板填进 QSS 模板，返回完整 QSS
+  font_stack() -> str                               返回 QSS 可用的 font-family 字符串
 """
 from __future__ import annotations
 
@@ -34,7 +32,7 @@ _THEME_DAY: Dict[str, str] = {
     "accent":          "#E55D5D",   # 赫萝苹果红（强调 / 发送按钮）
     "accent_dark":     "#C94040",
     "wolf":            "#6B5B73",   # 狼尾灰紫（辅助文字）
-    "wolf_light":      "#B9A8D4",   # 深夜版用的亮狼尾
+    "wolf_light":      "#B9A8D4",   # 狼尾亮紫（强调辅助色）
     "maid_black":      "#2D2419",   # 女仆装黑（标题色）
     "maid_white":      "#FAF6F0",   # 女仆装内衬（面板高光）
     "maid_green":      "#7FAA5C",   # 女仆装抹茶绿（胶囊 pill / tag）
@@ -70,68 +68,13 @@ _THEME_DAY: Dict[str, str] = {
     "name":            "day",
 }
 
-_THEME_NIGHT: Dict[str, str] = {
-    # ---- 背景 ----
-    "bg_root":         "#231A2E",   # 深夜紫黑
-    "bg_card":         "#2F2440",   # 卡片紫
-    "bg_sidebar":      "#1A1320",   # 侧栏更深
-    "bg_hover":        "#3B2A4A",   # hover
-    "bg_checked":      "#4A375E",   # checked
-    "bg_input":        "#2F2440",
-    "bg_input_dis":    "#1A1320",
-
-    # ---- 主色/强调 ----
-    "primary":         "#F5C976",   # 深夜版赫萝金发光（更亮）
-    "primary_light":   "#584270",   # 主色浅色背景（蓝图状态胶囊 / 浅色高亮）
-    "primary_dark":    "#E8A95C",
-    "accent":          "#E55D5D",   # 苹果红不变
-    "accent_dark":     "#C94040",
-    "wolf":            "#B9A8D4",   # 狼尾亮紫（深夜辅助色）
-    "wolf_light":      "#D4C5EE",
-    "maid_black":      "#1A1320",
-    "maid_white":      "#FAF6F0",
-    "maid_green":      "#8BC978",   # 深夜版：更亮的绿
-
-    # ---- 文字 ----
-    "text_main":       "#F5EDFF",
-    "text_sub":        "#A99BC4",
-    "text_on_primary": "#1A1320",
-    "text_on_accent":  "#FFFFFF",
-
-    # ---- 边框/阴影 ----
-    "border":          "#4A375E",
-    "border_focus":    "#F5C976",
-    "shadow":          "0 4px 18px rgba(0, 0, 0, 0.5)",
-
-    # ---- 气泡 ----
-    "bubble_user_0":   "#D97F3A",   # 用户气泡：深夜暖橙
-    "bubble_user_1":   "#A05115",
-    "bubble_holo_0":   "#3B2A4A",   # 赫萝气泡：深夜紫
-    "bubble_holo_1":   "#231A2E",
-    "bubble_holo_border": "#4A375E",
-    # -- 粉红可爱版赫萝气泡（night：紫粉→粉紫） --
-    "bubble_holo_pink_0":   "#4A2F48",   # 紫粉深
-    "bubble_holo_pink_1":   "#3A2238",   # 粉紫深
-    "bubble_holo_pink_border": "#6E4769",
-
-    # ---- 状态 ----
-    "success":         "#A0D97A",
-    "warn":            "#F5C976",
-    "danger":          "#F56D6D",
-
-    "name":            "night",
-}
-
 _THEMES: Dict[str, Dict[str, str]] = {
     "day": _THEME_DAY,
-    "night": _THEME_NIGHT,
 }
 
 
 def get_theme(name: str = "day") -> Dict[str, str]:
-    """取主题色板字典，未知名字自动 fallback 到 day。"""
-    if name in _THEMES:
-        return dict(_THEMES[name])
+    """取主题色板字典（实际固定返回奶茶白日 day）；name 参数为历史兼容保留。"""
     return dict(_THEMES["day"])
 
 
@@ -161,7 +104,7 @@ _QSS_TEMPLATE = """
 /* ---------- 全局透明兜底：拒绝系统深色/浅色主题渗透进来 ----------
    只有下面显式声明了 background 的容器 / 控件才负责填色。
    未声明背景的控件（QLabel / Tab 内封装 QWidget / 布局空白区…）一律透明，
-   让父级容器的配色（奶茶白日 / 深夜狼瞳紫）正确透出。 */
+   让父级容器的配色（固定奶茶白日）正确透出。 */
 QWidget {{
     background: transparent;
 }}

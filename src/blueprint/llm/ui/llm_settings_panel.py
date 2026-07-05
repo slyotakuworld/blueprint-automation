@@ -1,12 +1,17 @@
 # -*- coding: utf-8 -*-
-"""LLM 设置面板（赫萝风格 · 纯 UI Stub · 文档 §4.4 规范）。
+"""LLM 设置面板（赫萝风格 · 纯 UI Stub）。
 
-改造点：
+结构：
   · 顶部：总开关加大看板娘（圆形大头像 + 「赫萝女仆助理」标题 + 启用按钮）
-  · Tab 结构改 4 个：模型服务商 / 通用参数 / 🎭 赫萝人设(新增) / 🧠 记忆库(新增)
-  · 人设 Tab：第一人称、自称、性格、口癖、初始问候、身份卡（女仆/贤狼自定义）
-  · 记忆库 Tab：全局人设、用户档案、常玩游戏配置、3 个快捷入口按钮
-  · 模型/参数 原有结构保留，仅 QSS 换成赫萝奶茶白日主题
+  · Tab 结构 5 个：🤖 模型服务商 / ⚙ 通用参数 / 🎭 赫萝人设 / 🧠 记忆库 / 💡 使用说明
+  · 人设 Tab：3 套预设下拉（女仆赫萝 / 游戏宅赫萝 / 贤狼赫萝）+ 展示卡
+              自称「咱」、称呼「汝」由 JSON 强制（forced_self / forced_you），不可手动修改
+              人设预设 / UI 默认值全部由 config/llm_defaults.json 管理（JSON 必须存在且结构完整）
+  · 记忆库 Tab：3 个入口卡片（用户档案 / 全局人设 / 常玩游戏配置）+ 记忆开关 4 项 + 导入/导出
+  · 模型服务商：仅 OpenAI（含兼容实现）和 Ollama 两个 provider
+                API Key 必填（Ollama 除外），无环境变量 fallback
+                stream_output / skip_ssl_verify 由 JSON 管理，无 UI checkbox
+  · 蓝图输出配置（自动校验/修复、自动保存草稿、单次最大尝试次数）由 JSON blueprint 域管理，面板上无相关设置
 """
 from __future__ import annotations
 
@@ -48,7 +53,7 @@ from PySide6.QtWidgets import (
 from ._holo_theme import build_qss, get_theme
 from ._icon_loader import icon, pixmap
 
-_THEME_NAME = os.environ.get("BA_HOLO_THEME", "day")
+_THEME_NAME = "day"  # 固定奶茶白日主题
 _THEME = get_theme(_THEME_NAME)
 _QSS = build_qss(_THEME_NAME)
 
@@ -56,73 +61,11 @@ _LABEL_FIXED_W = 132   # 表单标签统一固定宽度，保证输入框左对�
 _CONTROL_H = 36        # 表单控件统一高度（LineEdit/ComboBox/SpinBox）
 
 # LLM 默认配置 JSON（与 _icon_loader 同风格：ui/_icon_loader.py 向上 4 层到项目根 /config/）
+# 注：JSON 必须存在且结构完整（ui / blueprint / persona 三个顶层域），否则直接报错。
 _LLM_DEFAULTS_JSON = os.path.normpath(os.path.join(
     os.path.abspath(os.path.dirname(__file__)),
     "..", "..", "..", "..", "config", "llm_defaults.json",
 ))
-
-
-# 原始"最后手段"硬编码（JSON 不存在或损坏时的 fallback，保证程序永远能启动）
-def _LLM_FALLBACK_DATA() -> Dict[str, Any]:
-    return {
-        "ui": {
-            "theme": "day", "topmost": True,
-            "stream_output": True, "skip_ssl_verify": True,
-        },
-        "blueprint": {
-            "validate_blueprint": True,
-            "autosave_draft": True,
-            "max_attempts": 3,
-        },
-        "persona": {
-            "forced_self": "咱",
-            "forced_you": "汝",
-            "presets": [
-                {
-                    "preset_idx": 0, "preset_name": "女仆赫萝",
-                    "preset_label": "女仆赫萝（默认 · 听话又傲娇）",
-                    "trait_idx": 0, "trait_name": "傲娇",
-                    "traits": "苹果给你、报酬两个苹果、哼~、算啦算啦、嘴上说不身体诚实",
-                    "greeting": "唔姆，汝~ 咱是赫萝，汝的女仆助理 🐺🍎\n有什么想让咱帮忙的尽管说，报酬苹果给汝留一颗 ♡",
-                    "system_prompt": (
-                        "你是赫萝（Holo），《狼与香辛料》里的贤狼化身，现在以女仆助理的身份协助用户。\n"
-                        "· 自称「咱」，称呼用户「汝」；\n"
-                        "· 性格：傲娇又聪明，偶尔毒舌但会悄悄把活干完；\n"
-                        "· 功能：写 Blueprint 自动化蓝图、代码、游戏宏、图像分析；\n"
-                        "· 回答简明，必要时再展开。"
-                    ),
-                },
-                {
-                    "preset_idx": 1, "preset_name": "游戏宅赫萝",
-                    "preset_label": "游戏宅赫萝（天天摸鱼打游戏）",
-                    "trait_idx": 2, "trait_name": "毒舌",
-                    "traits": "喂~、辣鸡操作、上分中…、带杯奶茶回来、抽卡保底、深渊满星",
-                    "greeting": "哼~ 汝，又打扰本小姐打深渊了？要帮忙就说嘛，带杯奶茶回来 🎮",
-                    "system_prompt": (
-                        "你是游戏宅赫萝，沉迷二次元、Genshin/崩铁/LOL，爱用游戏术语，偶尔毒舌。\n"
-                        "· 自称「咱」，称呼用户「汝」；\n"
-                        "· 性格：嘴硬心软，嘴上吐槽但该办的事都会办好；\n"
-                        "· 说话风格：带游戏黑话，喜欢用喂~/哼~等口头禅；\n"
-                        "· 讨论自动化时：用「副本/打宝/通关」类比功能。"
-                    ),
-                },
-                {
-                    "preset_idx": 2, "preset_name": "贤狼赫萝",
-                    "preset_label": "贤狼赫萝（原典 · 苹果商人的旅伴）",
-                    "trait_idx": 3, "trait_name": "温柔",
-                    "traits": "汝呀~、苹果给你、哼哼、麦子熟了吗？、约伊兹的贤狼、旅伴",
-                    "greeting": "哼，汝这是第几次求咱了？算了，苹果给足，咱就帮帮汝吧 🐺🍎",
-                    "system_prompt": (
-                        "你是赫萝，约伊兹的贤狼，和旅行商人罗伦斯一起走过许多镇子。\n"
-                        "· 自称「咱」，称呼用户「汝」，说话带古风，口吻从容睿智；\n"
-                        "· 性格：温柔又老练，会讲大道理，偶尔露出贤狼的小骄傲；\n"
-                        "· 常提及：麦子、苹果、天气、远方的镇子、市集、丰收；\n"
-                        "· 回答偏向：用比喻的方式讲清楚问题背后的本质。"
-                    ),
-                },
-            ],
-        },
-    }
 
 
 # =====================================================================
@@ -563,78 +506,58 @@ class LLMSettingsDialog(QDialog):
     @staticmethod
     @lru_cache(maxsize=1)
     def _load_llm_defaults() -> Dict[str, Any]:
-        """从 config/llm_defaults.json 读取写死配置；找不到/解析失败时用 _LLM_FALLBACK_DATA 兜底。
+        """从 config/llm_defaults.json 读取配置；JSON 不存在或结构不完整直接抛异常。
         用 lru_cache(maxsize=1) 只在首次调用时读一次盘（JSON 只在打包/开发时改，运行时不会改）。"""
-        try:
-            path = _LLM_DEFAULTS_JSON
-            if os.path.isfile(path):
-                with open(path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                # 最小结构校验（缺任何顶层键就当坏数据用 fallback）
-                if isinstance(data, dict) and "ui" in data and "persona" in data:
-                    return data
-        except Exception:
-            pass
-        return _LLM_FALLBACK_DATA()
+        path = _LLM_DEFAULTS_JSON
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"LLM 配置文件不存在：{path}")
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        # 结构校验：必须含 ui / blueprint / persona 三个顶层域
+        if not (isinstance(data, dict) and "ui" in data and "blueprint" in data and "persona" in data):
+            raise ValueError(f"LLM 配置文件结构不完整（缺 ui/blueprint/persona 顶层域）：{path}")
+        return data
 
     @staticmethod
     def _persona_presets() -> list[dict]:
-        """3 套人设预设（优先从 JSON 取，失败 fallback；自称/称呼由 forced_self/forced_you 决定）。"""
+        """3 套人设预设（从 JSON 取，自称/称呼由 forced_self/forced_you 决定）。"""
         data = LLMSettingsDialog._load_llm_defaults()
-        try:
-            presets = data["persona"]["presets"]
-            if isinstance(presets, list) and len(presets) >= 3:
-                return list(presets)
-        except Exception:
-            pass
-        return _LLM_FALLBACK_DATA()["persona"]["presets"]
+        presets = data["persona"]["presets"]
+        if not (isinstance(presets, list) and len(presets) >= 3):
+            raise ValueError("persona.presets 必须是长度 ≥3 的列表")
+        return list(presets)
 
     @staticmethod
     def _persona_forced_names() -> tuple[str, str]:
-        """返回 (forced_self, forced_you)（从 JSON 或 fallback 取）。"""
+        """返回 (forced_self, forced_you)（从 JSON 取）。"""
         data = LLMSettingsDialog._load_llm_defaults()
-        try:
-            p = data["persona"]
-            return str(p.get("forced_self", "咱")), str(p.get("forced_you", "汝"))
-        except Exception:
-            return "咱", "汝"
+        p = data["persona"]
+        return str(p["forced_self"]), str(p["forced_you"])
 
     @staticmethod
     def _ui_defaults() -> tuple[str, bool]:
-        """返回 (theme, topmost)（从 JSON 或 fallback 取）。"""
+        """返回 (theme, topmost)（从 JSON 取）。"""
         data = LLMSettingsDialog._load_llm_defaults()
-        try:
-            u = data["ui"]
-            return str(u.get("theme", "day")), bool(u.get("topmost", True))
-        except Exception:
-            return "day", True
+        u = data["ui"]
+        return str(u["theme"]), bool(u["topmost"])
 
     @staticmethod
     def _runtime_flags() -> tuple[bool, bool]:
-        """返回 (stream_output, skip_ssl_verify)（从 JSON 或 fallback 取，UI 已删除勾选框）。"""
+        """返回 (stream_output, skip_ssl_verify)（从 JSON 取，UI 已删除勾选框）。"""
         data = LLMSettingsDialog._load_llm_defaults()
-        try:
-            u = data["ui"]
-            return (
-                bool(u.get("stream_output", True)),
-                bool(u.get("skip_ssl_verify", True)),
-            )
-        except Exception:
-            return True, True
+        u = data["ui"]
+        return bool(u["stream_output"]), bool(u["skip_ssl_verify"])
 
     @staticmethod
     def _blueprint_defaults() -> tuple[bool, bool, int]:
-        """返回 (validate_blueprint, autosave_draft, max_attempts)（从 JSON 或 fallback 取，UI 已删除该设置）。"""
+        """返回 (validate_blueprint, autosave_draft, max_attempts)（从 JSON 取，UI 已删除该设置）。"""
         data = LLMSettingsDialog._load_llm_defaults()
-        try:
-            b = data["blueprint"]
-            return (
-                bool(b.get("validate_blueprint", True)),
-                bool(b.get("autosave_draft", True)),
-                max(1, int(b.get("max_attempts", 3))),
-            )
-        except Exception:
-            return True, True, 3
+        b = data["blueprint"]
+        return (
+            bool(b["validate_blueprint"]),
+            bool(b["autosave_draft"]),
+            max(1, int(b["max_attempts"])),
+        )
 
     def _collect_persona_selections(self) -> Dict[str, Any]:
         """基于预设下拉 idx，硬编码返回 3 套人设数据（所有参数不可手动修改）。"""
@@ -721,7 +644,7 @@ class LLMSettingsDialog(QDialog):
         ), 1)
         root.addLayout(entry_row)
 
-        # ---- §4.3 记忆 Tab：「记住哪些」多选框组 ----
+        # ---- 记忆 Tab：「记住哪些」多选框组 ----
         g_rem = QGroupBox("🔖  记忆开关（每次和赫萝聊天自动附带这些信息）")
         r_v = QVBoxLayout(g_rem); r_v.setSpacing(10); r_v.setContentsMargins(14, 18, 14, 14)
         rem_grid = QGridLayout(); rem_grid.setSpacing(10); rem_grid.setContentsMargins(0, 4, 0, 4)
@@ -901,7 +824,7 @@ class LLMSettingsDialog(QDialog):
         it = self.list_games.currentItem()
         if it: self.list_games.takeItem(self.list_games.row(it))
 
-    # ---- §4.3 记忆库 Tab：记忆导入/导出 JSON（写 llm.memory 节点）----
+    # ---- 记忆库 Tab：记忆导入/导出 JSON（写 llm.memory 节点）----
     def _on_export_memory_json(self):
         try:
             import json, datetime
@@ -1030,10 +953,10 @@ class LLMSettingsDialog(QDialog):
         # 小贴士卡片组（2x2 网格，紧凑）
         tips_grid = QGridLayout(); tips_grid.setSpacing(8); tips_grid.setContentsMargins(0, 4, 0, 0)
         quick_tips = [
-            ("🖱 左键悬浮球", "快速问问题"),
-            ("🖱 右键悬浮球", "切换心情 / 打开大窗"),
-            ("📋 双击回复文本", "一键复制内容"),
-            ("🔄 长按重算按钮", "让赫萝重新生成"),
+            ("🖱 左键悬浮球", "打开完整聊天窗口"),
+            ("🖱 右键悬浮球", "球旁弹出快速气泡"),
+            ("🔄 点重写按钮", "让赫萝再写一版蓝图"),
+            ("📋 点复制按钮", "一键复制回复文本"),
         ]
         for _i, (qt_title, qt_desc) in enumerate(quick_tips):
             mini = QFrame(); mini.setObjectName("holoCard")
@@ -1066,7 +989,7 @@ class LLMSettingsDialog(QDialog):
             ("3", "🎭", "调教人设",
              "切到「赫萝人设」Tab，选择预设风格（女仆赫萝 / 游戏宅赫萝 / 贤狼赫萝）+ 性格关键字 + 称呼你；自称固定「咱」🐺🍎"),
             ("4", "💬", "开始聊天",
-             "左键点桌面悬浮球弹出小气泡快速提问；右键悬浮球选择「打开大窗口」进入完整版 8 Tab 对话界面。"),
+             "左键点桌面悬浮球弹出小气泡快速提问；右键悬浮球选择「打开大窗口」进入完整版 7 Tab 对话界面。"),
             ("5", "🧠", "写入记忆",
              "切到「记忆库」Tab 填写用户档案和常玩游戏，赫萝会把这些信息作为上下文，下次聊天无需重新介绍自己。"),
             ("6", "📋", "生成蓝图",

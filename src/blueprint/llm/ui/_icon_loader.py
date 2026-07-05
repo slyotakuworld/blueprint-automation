@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""赫萝 Icon 资源统一加载 + 缓存（smoke test 专用临时版）。"""
+"""赫萝 Icon 资源统一加载 + 缓存（避免每次 QPixmap 解码大图 1.8MB）。"""
 from __future__ import annotations
 
 import os
@@ -12,7 +12,6 @@ _ICON_DIR = os.path.normpath(os.path.join(
     os.path.abspath(os.path.dirname(__file__)),
     "..", "..", "..", "..", "images", "llm_icons",
 ))
-print(f"[smoke] Icon dir = {_ICON_DIR}  exists=", os.path.isdir(_ICON_DIR))
 
 def icon_path(filename: str) -> str:
     return os.path.join(_ICON_DIR, filename).replace("\\", "/")

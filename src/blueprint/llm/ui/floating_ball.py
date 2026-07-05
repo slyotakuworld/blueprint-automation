@@ -25,10 +25,10 @@
   5. **Linux/macOS 兼容**：没有 ctypes.windll 时走 Qt 默认 StaysOnTopHint，不会崩溃
      （只是达不到"压过游戏全屏"的效果，属于合理降级）。
 
-交互（原设计保持不变）：
-  * 左键单击 —— 打开完整 FullChatDialog
-  * 右键单击 —— 在浮标周围弹出 QuickChatBubble
-  * 左键拖动 —— 可移动
+交互：
+  * 左键单击（无拖动） —— 打开完整 FullChatDialog
+  * 右键单击 —— 在悬浮球旁弹出 QuickChatBubble（自动避屏边界，不遮挡球）
+  * 左键拖动 —— 移动悬浮球（无吸附，停在哪就在哪）
 """
 from __future__ import annotations
 
@@ -70,7 +70,7 @@ from .quick_chat_bubble import QuickChatBubble
 from ._holo_theme import get_theme
 from ._icon_loader import pixmap as _icon_pixmap
 
-_THEME = get_theme(os.environ.get("BA_HOLO_THEME", "day"))
+_THEME = get_theme("day")  # 固定奶茶白日主题
 
 # ====================================================================
 # 人物动画资源路径（相对于项目根目录 images/）
@@ -296,7 +296,7 @@ class FloatingBall(QWidget):
     # 生命周期
     # =================================================================
     def _setup_avatar_movie(self):
-        """加载 Animated WebP 人物动画，失败 fallback 到 🤖 emoji 自绘。"""
+        """加载 Animated WebP 人物动画，失败 fallback 到 🐺 emoji 自绘（赫萝贤狼）。"""
         self._movie = self._load_webp_movie(_ANIM_AVATAR_WEBP)
         self._movie_thinking = self._load_webp_movie(_ANIM_THINKING_WEBP)
         if self._movie is None:

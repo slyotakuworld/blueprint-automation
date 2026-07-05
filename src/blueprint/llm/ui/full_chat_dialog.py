@@ -1,17 +1,17 @@
 # -*- coding: utf-8 -*-
 """完整对话大窗口（赫萝风格通用助手版 · 纯 UI Stub）。
 
-结构（§4.1 文档规范）：
+结构：
   ┌──────────────────────────────────────────────────────────────┐
   │ [左 220px 侧栏 holoSideFrame]  │ [右 主区]                      │
   │ ┌─看板娘 64x64 avatar_holo ─┐ │ 顶部操作条（新建/历史会话2赫萝Icon）  │
   │ │ 赫萝·女仆助理 Lv.99 ♡     │ │ ───────────────────────────── │
   │ ├─────────────────────────┤ │ 聊天消息列表（ChatBubble 重写）│
   │ │ [icon_chat]    自由聊天  │ │ ───────────────────────────── │
-  │ │ [icon_blueprint] 蓝图生成│ │ 推荐话题卡（替代快捷短语）    │
+  │ │ [icon_blueprint] 蓝图生成│ │ 蓝图输入区（含状态卡片）       │
   │ │ [icon_image]    图像分析│ │ ───────────────────────────── │
   │ │ [icon_game]    游戏辅助 │ │ 输入卡片：                    │
-  │ │ [icon_code]    代码助手│ │  [📷][📂][🎤][😊] [输入] [🍎发送圆]│
+  │ │ [icon_code]    代码助手│ │  [📷][📂][🎤] [输入] [🍎发送圆]│
   │ │ [icon_history] 对话历史│ │                                │
   │ │ [icon_settings]助手设置│ │                                │
   │ ├─────────────────────────┤ │                                │
@@ -21,8 +21,12 @@
 
 打桩保留：
   · 发送消息 → 自己气泡 + 模拟打桩回复气泡
-  · 导入到画布 / 清空对话 → QMessageBox
+  · 新建会话 / 历史会话 → QMessageBox
   · 7 Tab 除「自由聊天 / 蓝图生成」外，点击显示对应 Stub 面板（赫萝 Icon + 占位文字）
+
+注：7 Tab = 自由聊天 / 蓝图生成 / 图像分析 / 游戏辅助 / 代码助手 / 对话历史 / 助手设置
+   （记忆库 Tab 已移除，相关配置统一在 LLM 设置面板管理）
+   （自由聊天 / 蓝图生成 / 代码助手 使用各自独立的系统提示词，互不干扰）
 """
 from __future__ import annotations
 
@@ -73,7 +77,7 @@ from PySide6.QtWidgets import (
 from ._holo_theme import build_qss, get_theme
 from ._icon_loader import circular_pixmap, icon, icon_path, pixmap
 
-_THEME_NAME = os.environ.get("BA_HOLO_THEME", "day")  # day / night
+_THEME_NAME = "day"  # 固定奶茶白日主题
 _THEME = get_theme(_THEME_NAME)
 _QSS = build_qss(_THEME_NAME)
 
@@ -297,10 +301,7 @@ class _BubbleContent(QWidget):
             if not pm_ok:
                 fallback_circle = QPainterPath()
                 fallback_circle.addEllipse(ax, avatar_y, avatar_size, avatar_size)
-                if _THEME_NAME == "night":
-                    p.setBrush(QColor(74, 47, 72, 160))
-                else:
-                    p.setBrush(QColor(255, 222, 236, 200))
+                p.setBrush(QColor(255, 222, 236, 200))
                 p.drawPath(fallback_circle)
                 p.setPen(QPen(_qcolor("maid_white")))
                 ff = QFont(); ff.setPixelSize(18); p.setFont(ff)
@@ -314,10 +315,7 @@ class _BubbleContent(QWidget):
                     inner = (avatar_size - pw) // 2
                     thin_ring = QPainterPath()
                     thin_ring.addEllipse(ax + inner - 1, avatar_y + inner - 1, pw + 2, pw + 2)
-                    if _THEME_NAME == "night":
-                        p.setBrush(QColor(230, 180, 210, 60))
-                    else:
-                        p.setBrush(QColor(255, 200, 220, 55))
+                    p.setBrush(QColor(255, 200, 220, 55))
                     p.drawPath(thin_ring)
                     p.drawPixmap(ax + inner, avatar_y + inner, self._holo_avatar_pm)
 
@@ -342,23 +340,15 @@ class _BubbleContent(QWidget):
 
             # 3 色渐变填充（完全不画任何描边/线条！彻底去左侧线框）
             grad = QLinearGradient(bx, by, bx, by + bh)
-            if _THEME_NAME == "night":
-                grad.setColorAt(0.0, _qcolor("bubble_holo_pink_0"))
-                grad.setColorAt(0.55, QColor(90, 55, 90))
-                grad.setColorAt(1.0, _qcolor("bubble_holo_pink_1"))
-            else:
-                grad.setColorAt(0.0, QColor("#FFF9FC"))
-                grad.setColorAt(0.55, QColor("#FFE8F3"))
-                grad.setColorAt(1.0, QColor("#FFD5E7"))
+            grad.setColorAt(0.0, QColor("#FFF9FC"))
+            grad.setColorAt(0.55, QColor("#FFE8F3"))
+            grad.setColorAt(1.0, QColor("#FFD5E7"))
             text_c = _qcolor("text_main")
             p.setPen(Qt.NoPen)
             p.fillPath(path, QBrush(grad))
 
             # 内发光：1 圈柔光（仅填充，无线）
-            if _THEME_NAME == "night":
-                glow_c = QColor(230, 180, 210, 26)
-            else:
-                glow_c = QColor(255, 255, 255, 70)
+            glow_c = QColor(255, 255, 255, 70)
             # 内发光路径简化：用 painterPath 跟气泡形状一致，再整体缩小 3.5px
             s = 3.5
             ir2, ibw2, ibh2 = r - 2, bw - s * 2, bh - s * 2
@@ -383,10 +373,7 @@ class _BubbleContent(QWidget):
             p.drawPath(glow)
 
             # 左上奶油高光泡泡（保持）
-            if _THEME_NAME == "night":
-                dot = QColor(255, 220, 240, 55)
-            else:
-                dot = QColor(255, 255, 255, 155)
+            dot = QColor(255, 255, 255, 155)
             p.setBrush(dot)
             dot1 = QPainterPath(); dot1.addEllipse(bx + 20, by + 10, 11, 8)
             p.drawPath(dot1)
@@ -394,10 +381,7 @@ class _BubbleContent(QWidget):
             p.drawPath(dot2)
 
             # 小云（保持，半透粉）
-            if _THEME_NAME == "night":
-                cloud_c = QColor(200, 150, 190, 40)
-            else:
-                cloud_c = QColor(255, 205, 225, 75)
+            cloud_c = QColor(255, 205, 225, 75)
             p.setBrush(cloud_c)
             cx, cy = bx + bw - 74, by - 6
             cloud = QPainterPath()
@@ -407,10 +391,7 @@ class _BubbleContent(QWidget):
             p.drawPath(cloud)
 
             # 右上角小爱心（保持）
-            if _THEME_NAME == "night":
-                heart_c = QColor(255, 160, 200, 160)
-            else:
-                heart_c = QColor(255, 120, 165, 190)
+            heart_c = QColor(255, 120, 165, 190)
             p.setBrush(heart_c)
             hx, hy = bx + bw - 22, by + 9
             hp = QPainterPath()
@@ -588,7 +569,7 @@ class ChatBubble(QWidget):
 
 
 # =====================================================================
-# 8 Tab 的右侧主工作区 Stub 面板（除聊天/蓝图外的 6 个占位页）
+# 7 Tab 的右侧主工作区 Stub 面板（除聊天/蓝图外的 5 个占位页）
 # =====================================================================
 class _StubPanel(QFrame):
     def __init__(self, icon_name: str, title_cn: str, stub_text: str):
@@ -1021,7 +1002,7 @@ class FullChatDialog(QDialog):
         sep.setStyleSheet(f"background:{_THEME['border']}; margin:4px 4px;")
         ll.addWidget(sep)
 
-        # 8 Tab
+        # 7 Tab
         tabs = [
             ("chat",      "icon_chat.png",      "自由聊天"),
             ("blueprint", "icon_blueprint.png", "蓝图生成"),
@@ -1268,7 +1249,7 @@ class FullChatDialog(QDialog):
     # =================================================================
     # Page 1: 蓝图生成（完全独立对话界面：顶栏+聊天列表+输入卡，和自由聊天互不干扰）
     # - assistant 消息显示：重写 / 导入画布 / 复制 三个操作按钮（自由聊天只有复制）
-    # - 顶栏按钮：导入画布 / 重新生成 / 清空（不需要新建会话/历史会话）
+    # - 顶栏按钮：新建会话 / 历史会话（蓝图模式独立会话管理，不与自由聊天共用记录）
     # =================================================================
     def _build_blueprint_page(self) -> QWidget:
         page = QWidget()

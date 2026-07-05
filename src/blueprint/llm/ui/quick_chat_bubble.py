@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """快速聊天小气泡（悬浮球周围弹出，赫萝风格 · 纯 UI Stub）。
 
-按 UI 规范 §4.2 改造：
+结构：
   · 顶部：圆形赫萝动画头像（工作女仆赫萝.webp）+ 「🐺 赫萝想跟你说~」标题
   · 中部：聊天气泡（复用 FullChatDialog 的 ChatBubble 类）
   · 快捷栏：截图 / 语音 / 预设问题下拉（选择后填入输入框）
   · 底部：输入框 + 苹果红圆形发送按钮
-  · 配色：赫萝奶茶白日 / 深夜狼瞳紫（_holo_theme）
+  · 配色：固定奶茶白日赫萝风格（_holo_theme）
   · 欢迎语：赫萝口吻（唔姆 / 苹果商人~）
   · 弹出位置：紧贴悬浮球边缘（左/右自动判断），不遮挡球，自动避屏边界
   · 圆角透明：WA_TranslucentBackground=True，四角无纯色底
@@ -40,7 +40,7 @@ from ._icon_loader import icon
 # ---- 共享 ChatBubble（尖角气泡 + 赫萝圆形头像）----
 from .full_chat_dialog import ChatBubble
 
-_THEME_NAME = os.environ.get("BA_HOLO_THEME", "day")
+_THEME_NAME = "day"  # 固定奶茶白日主题
 _THEME = get_theme(_THEME_NAME)
 _QSS = build_qss(_THEME_NAME)
 
