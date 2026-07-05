@@ -146,6 +146,9 @@ class BlueprintMainWindow(QMainWindow):
         self._applying_undo_redo: bool = False
         self._paste_batch_collecting: bool = False
         self._paste_batch_node_ids: list = []
+        # ---- LLM 集成（UI 壳子） ----
+        self._llm_settings_dialog_ref = None   # LLM 设置对话框（单例，避免点两次开两窗）
+        self._floating_ball = None             # 悬浮球（None=未启用或被隐藏）
 
         self._build_central()
         self._build_toolbar()
@@ -162,6 +165,27 @@ class BlueprintMainWindow(QMainWindow):
 
         # 最后：把 settings 中所有快捷键应用（global 注册到 _hotkey_mgr + local 到 QAction）
         self._apply_shortcuts_from_settings(changed_keys=None, log_success=True)
+
+        # LLM 壳子：启动时按设置决定是否显示悬浮球（关闭开关时不创建，避免无意义窗口占用）
+        try:
+            from src.config.user_settings import is_llm_enabled
+            en = is_llm_enabled()
+            if en:
+                self._ensure_floating_ball(show=True)
+            try:
+                # 无论成功失败都写一条日志到面板，让用户知道启动时发生了什么
+                self._log.append_log(
+                    f"[LLM] 启动时 enabled={'ON' if en else 'OFF'}，悬浮球{'已创建并显示（右下角）' if en and self._floating_ball is not None else '未显示'}",
+                    "SUCCESS" if en and self._floating_ball is not None else "INFO"
+                )
+            except Exception:
+                # 日志面板还没初始化好时用 print 兜底（PyCharm/终端能看到）
+                print(f"[LLM][Boot] enabled={en}, floating_ball_created={self._floating_ball is not None}")
+        except Exception as e:
+            try:
+                self._log.append_log(f"[LLM] 启动时创建悬浮球异常：{type(e).__name__}: {e}", "ERROR")
+            except Exception:
+                print(f"[LLM][Boot][ERROR] {type(e).__name__}: {e}", flush=True)
 
         # 程序图标双保险：从全局 QApplication 取已经加载好的多尺寸图标，应用到主窗口
         # （main() 里已经 app.setWindowIcon 并存到 property("app_icon_multi") 了，这里优先拿多尺寸的）
@@ -739,11 +763,27 @@ class BlueprintMainWindow(QMainWindow):
         self._act_split = mk_act("#7C3AED", "✂ 切分UI元素", self._on_open_split_dialog)
         add_toolbtn(self._act_split, bg="#2A1B4F", color="#A371F7", hover_bg="#381E6F", hover_border="#7C3AED")
 
-        # --------------- 右侧: 目标程序 全局选择器 ---------------
+        # --------------- 右侧: LLM 入口按钮 + 目标程序 全局选择器 ---------------
         tb.addSeparator()
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         tb.addWidget(spacer)
+
+        # ---- LLM 入口按钮（在🎯 目标程序 左边） ----
+        btn_llm = QPushButton("🤖 LLM 设置")
+        btn_llm.setCursor(Qt.PointingHandCursor)
+        btn_llm.setStyleSheet(
+            "QPushButton { background:#1F6FEB; color:#FFFFFF; border:1px solid #1158C8; border-radius:4px; padding:3px 12px; font-weight:600; }"
+            "QPushButton:hover { background:#1158C8; border-color:#58A6FF; }"
+            "QPushButton:pressed { background:#0F50B5; }"
+        )
+        btn_llm.setToolTip("打开 LLM 智能助手设置（启用后桌面右下角将出现悬浮球）")
+        btn_llm.clicked.connect(self._on_llm_settings_clicked)
+        tb.addWidget(btn_llm)
+        # 视觉分隔：和目标程序下拉之间留点空间
+        sep2 = QLabel("  ·  ")
+        sep2.setStyleSheet("color:#30363D;")
+        tb.addWidget(sep2)
 
         target_hint = QLabel("🎯 目标程序:")
         target_hint.setStyleSheet("color:#C9D1D9; padding: 0 4px 0 8px;")
@@ -2620,6 +2660,25 @@ class BlueprintMainWindow(QMainWindow):
                     pass
         except Exception:
             pass
+        # 2.5) 销毁 LLM 相关窗口（悬浮球 + 聊天窗口 + 设置对话框）
+        try:
+            for _attr in ("_llm_settings_dialog_ref", "_floating_ball"):
+                w = getattr(self, _attr, None)
+                if w is None:
+                    continue
+                try:
+                    # full_chat_dialog / quick_bubble 是子窗口挂在 floating_ball 上的，这里关父窗口就行
+                    w.close()
+                except Exception:
+                    pass
+                try:
+                    w.deleteLater()
+                except Exception:
+                    pass
+            setattr(self, "_llm_settings_dialog_ref", None)
+            setattr(self, "_floating_ball", None)
+        except Exception:
+            pass
         # 3) 同步用户设置到磁盘（保证设置对话框里改过的热键等下次启动还在）
         try:
             save_user_settings(self._user_settings)
@@ -3068,6 +3127,134 @@ class BlueprintMainWindow(QMainWindow):
     def _clear_split_dialog_ref(self):
         try:
             self._split_dialog_ref = None
+        except Exception:
+            pass
+
+    # ==================== LLM UI 壳子 ====================
+    def _on_llm_settings_clicked(self):
+        """工具栏 🤖 LLM 设置按钮点击 → 打开/激活对话框（单例，不会开多个）。"""
+        try:
+            from src.blueprint.llm.ui.llm_settings_panel import LLMSettingsDialog
+        except Exception as e:
+            QMessageBox.critical(
+                self, "模块加载失败",
+                f"加载 LLM 设置面板失败（UI 壳子文件缺失或语法错误）：\n{e}"
+            )
+            return
+
+        if self._llm_settings_dialog_ref is None or not getattr(
+            self._llm_settings_dialog_ref, "isVisible", lambda: False)():
+            dlg = LLMSettingsDialog(self)
+            # 保存后如果启用开关变了 → 立即显示/隐藏悬浮球（两个信号都监听，双保险）
+            try:
+                dlg.llm_enabled_changed.connect(self._on_llm_enabled_changed_from_dialog)
+            except Exception as e:
+                try: self._log.append_log(f"[LLM] 连接信号 llm_enabled_changed 失败：{e}", "WARN")
+                except Exception: pass
+            try:
+                dlg.settings_saved.connect(self._on_llm_settings_saved_from_dialog)
+            except Exception as e:
+                try: self._log.append_log(f"[LLM] 连接信号 settings_saved 失败：{e}", "WARN")
+                except Exception: pass
+            try:
+                dlg.destroyed.connect(lambda *_: setattr(self, "_llm_settings_dialog_ref", None))
+            except Exception:
+                pass
+            self._llm_settings_dialog_ref = dlg
+            dlg.show()
+            dlg.raise_()
+            dlg.activateWindow()
+        else:
+            # 已打开 → 提到前台
+            try:
+                dlg = self._llm_settings_dialog_ref
+                dlg.showNormal()
+                dlg.raise_()
+                dlg.activateWindow()
+            except Exception:
+                pass
+
+    def _on_llm_settings_saved_from_dialog(self, data: dict):
+        """设置对话框保存 → 根据 data['enable'] 同步悬浮球。"""
+        try:
+            en = bool(data.get("enable", True))
+            self._ensure_floating_ball(show=en)
+            try: self._log.append_log(f"[LLM] 设置已保存，悬浮球状态：{'显示' if en else '隐藏'}", "INFO")
+            except Exception: pass
+        except Exception:
+            pass
+
+    def _on_llm_enabled_changed_from_dialog(self, enabled: bool):
+        """设置对话框里勾/取消「启用 LLM」 → 立即创建/销毁悬浮球（实时，不等保存）。"""
+        try:
+            self._ensure_floating_ball(show=bool(enabled))
+            try: self._log.append_log(f"[LLM] 开关切换：悬浮球{'显示' if enabled else '隐藏'}（实时生效）", "INFO")
+            except Exception: pass
+        except Exception as e:
+            try: self._log.append_log(f"[LLM] 创建/销毁悬浮球失败：{type(e).__name__}: {e}", "ERROR")
+            except Exception: pass
+
+    def _ensure_floating_ball(self, show: bool):
+        """
+        show=True  → 若没创建就创建悬浮球并显示；已存在就 raise_ 到前面
+        show=False → 若存在就关闭并销毁并置 None
+        """
+        if show:
+            if self._floating_ball is None:
+                try:
+                    from src.blueprint.llm.ui.floating_ball import FloatingBall
+                    # ⚠ 传 parent=None —— 必须让 FloatingBall 成为独立顶层窗口：
+                    #   - 主窗口最小化后悬浮球仍可见
+                    #   - Z-order 不跟随主窗口（游戏全屏时能压在游戏上面）
+                    ball = FloatingBall(None)
+                    # （预留）用户在悬浮球发送的消息，可以接信号连到 BlueprintGenerator
+                    try:
+                        ball.user_message.connect(self._on_ball_user_message_stub)
+                    except Exception:
+                        pass
+                    self._floating_ball = ball
+                except Exception as e:
+                    self._status_lbl.setText(f"[LLM] 创建悬浮球失败：{e}")
+                    return
+            try:
+                self._floating_ball.show()
+                self._floating_ball.raise_()
+            except Exception:
+                pass
+        else:
+            if self._floating_ball is None:
+                return
+            try:
+                # 先把挂在它下面的气泡/完整对话框关掉
+                for attr in ("_full_dlg", "_quick_bubble"):
+                    sub = getattr(self._floating_ball, attr, None)
+                    if sub is not None:
+                        try:
+                            sub.close()
+                        except Exception:
+                            pass
+                        try:
+                            sub.deleteLater()
+                        except Exception:
+                            pass
+                    try:
+                        setattr(self._floating_ball, attr, None)
+                    except Exception:
+                        pass
+                self._floating_ball.close()
+                try:
+                    self._floating_ball.deleteLater()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            self._floating_ball = None
+
+    def _on_ball_user_message_stub(self, msg: str):
+        """悬浮球发送消息打桩：在状态栏显示一条提示（真正接入 LLMClient 后改这里）。"""
+        try:
+            short = msg if len(msg) <= 40 else msg[:37] + "..."
+            self._status_lbl.setText(f"[LLM 打桩] 已接收：{short}（真实发送功能待接入）")
         except Exception:
             pass
 
