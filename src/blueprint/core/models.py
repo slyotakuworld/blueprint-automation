@@ -360,6 +360,10 @@ class ExecutionContext:
     last_progress_ts: float = 0.0
     # 扩展 runtime_attrs：给 OpenApp → BindWindow 传 last_launched_pid 等（文档P0-5上下文联动）
     runtime_attrs: Dict[str, Any] = field(default_factory=dict)
+    # 单步调试：点"下一步"按钮后 True；执行完一个节点后自动置 False 并自动 is_paused=True 进入再次暂停（类似 debugger Step Over）
+    step_mode: bool = False
+    # 当前正在/刚执行完的节点ID（Sequence分支/主循环 两个入口统一写入）：供搜索栏「下一断点/定位执行点」按钮快速跳到画布中执行位置
+    current_node_id: Optional[str] = None
 
     def log(self, msg: str, level: str = "INFO"):
         try:

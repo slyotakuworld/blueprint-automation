@@ -209,10 +209,15 @@ def _walk_branch_until_end(
 
         wait_if_paused(ctx)
 
-        # UI 高亮 + 进度（复用 runner 信号
+        # UI 高亮 + 进度（复用 runner 信号） + 记录当前执行节点ID + 发 current_node_changed
         try:
             runner.highlight_node.emit(curr_id)
             runner.progress_step.emit(ctx.step_counter + 1, node.type)
+        except Exception:
+            pass
+        try:
+            ctx.current_node_id = curr_id
+            runner.current_node_changed.emit(curr_id, node.type)
         except Exception:
             pass
 
@@ -222,6 +227,8 @@ def _walk_branch_until_end(
 
         # 2) 执行（复用 EXECUTORS）
         ctx.log(f"[Node▶] {node.type}  id={curr_id[:8]} [seq分支]", "INFO")
+        # --- 断点命中检查（Sequence 分支入口）---
+        _hit_node_breakpoint(ctx, node, runner)
         fn = EXECUTORS.get(node.type)
         try:
             if fn is None:
@@ -232,6 +239,9 @@ def _walk_branch_until_end(
             tb = traceback.format_exc()
             ctx.log(f"[Node] seq分支内执行异常 {node.type}: {e}\n{tb}", "ERROR")
             outputs, next_ports = {}, []
+
+        if not ctx.is_running:
+            return False, "运行被用户停止"
 
         # 3) 保存输出
         ctx.set_outputs(curr_id, outputs or {})
@@ -1219,8 +1229,12 @@ def execute_Clipboard(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any])
             in_text = inputs.get("in_text") if inputs else None
             if in_text is None or (isinstance(in_text, str) and not in_text):
                 # 用 value 参数，支持变量插值
-                from .variable_engine import VariableEngine
-                text_to_write = VariableEngine.render(value_template, ctx.variables)
+                from src.blueprint.core.variable_engine import VariableEngine
+                engine = getattr(ctx, "var_engine", None) or VariableEngine(ctx.variables)
+                if engine.has_any_marker(value_template):
+                    text_to_write = str(engine.interpolate(value_template))
+                else:
+                    text_to_write = str(value_template)
             else:
                 text_to_write = str(in_text)
             if clip is not None:
@@ -1268,13 +1282,16 @@ def execute_Command(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
 
     try:
         wait_if_paused(ctx)
-        from .variable_engine import VariableEngine
+        from src.blueprint.core.variable_engine import VariableEngine
         # 变量插值 + 特殊占位符 {blueprint_dir}
-        ctx_vars = dict(getattr(ctx, "variables", {}) or {})
-        blueprint_dir = ctx_vars.get("blueprint_dir", getattr(ctx, "blueprint_dir", ""))
-        ctx_vars["blueprint_dir"] = blueprint_dir
-        command = VariableEngine.render(cmd_template, ctx_vars)
-        working_dir = VariableEngine.render(wd_template, ctx_vars) if wd_template else ""
+        engine = getattr(ctx, "var_engine", None) or VariableEngine(getattr(ctx, "variables", {}) or {})
+        blueprint_dir = engine.get("blueprint_dir") or getattr(ctx, "blueprint_dir", "")
+        if not engine.has("blueprint_dir"):
+            engine.set("blueprint_dir", blueprint_dir)
+        command = str(engine.interpolate(cmd_template)) if engine.has_any_marker(cmd_template) else str(cmd_template)
+        working_dir = ""
+        if wd_template:
+            working_dir = str(engine.interpolate(wd_template)) if engine.has_any_marker(wd_template) else str(wd_template)
 
         # 解析 shell 模式
         if shell_mode == "no_shell":
@@ -2444,6 +2461,69 @@ def wait_if_paused(ctx: ExecutionContext, tick_s: float = 0.05):
 
 
 # ============================================================
+# 辅助：断点命中（Step 模式 OR 手动 breakpoint=True）→ 进入节点开头立即暂停
+# ============================================================
+def _hit_node_breakpoint(ctx: ExecutionContext, node: Node, runner: "BlueprintRunner"):
+    """
+    统一在 EXECUTORS 执行前调用（进入节点开头先停住，和 IDE 调试一致）。
+    有两种停住的情况（前者优先级高，都不生效则不停，直接返回）：
+
+    1️⃣ Step 模式：用户上次停住时，不是点▶继续，而是点了⏭下一步 → ctx.step_mode=True
+       → 进入**任何节点**（哪怕该节点完全没设置 breakpoint）都自动暂停，实现「点下一步松开断点后，
+         后续节点全部自动带断点效果」。
+       → 暂停后，如果用户再次点⏭下一步：step_mode 仍保持 True → 取消暂停继续跑 → 下一个节点
+         进入时又被这个分支 catch 住 → 再停，直到用户点▶继续（toggle_pause 会把 step_mode=False）
+       → 暂停后，如果用户点▶继续：toggle_pause 把 step_mode=False → 退出 Step 模式，之后走情况2。
+
+    2️⃣ 手动断点：用户通过节点右键切为 breakpoint=True 的节点 → 进入即停。
+       → step_mode=False 时才走这里（否则用户点⏭下一步松开断点后还是会停在当前节点，不合理）
+       → 命中一次不清空，用户右键取消才消失（循环重复场景持续生效）。
+
+    任何情况停住都会打 WARN 级日志 + annotate_step 保存调试截图/证据 + is_paused=True + 发
+    pause_changed(True) Signal 给 UI，让暂停按钮文字切为「继续」、下一步按钮变可点。
+    """
+    # ---------- 情况 1：Step 模式 → 什么节点都停 ----------
+    if bool(getattr(ctx, "step_mode", False)):
+        try:
+            annotate_step(ctx, node, "step_mode", note="Step模式: 进入每个节点自动暂停")
+        except Exception:
+            pass
+        ctx.log(
+            f"[Step] ⏭ Step模式：进入节点 id={node.id[:8]} type={node.type} → 自动暂停（点⏭下一步→步过到下节点 / 点▶继续→退出Step模式，后续只手动断点=True才停）",
+            "WARN",
+        )
+        ctx.is_paused = True
+        try:
+            runner.pause_changed.emit(True)
+        except Exception:
+            pass
+        # wait_if_paused 内部循环检查 is_paused / is_running
+        #  - 用户点⏭下一步：step_mode 保持 True，is_paused=False → wait 返回 → 执行完当前节点 → 下节点开头又回到这里 Step 分支
+        #  - 用户点▶继续：toggle_pause 把 step_mode=False + is_paused=False → wait 返回 → 后面只走情况2
+        wait_if_paused(ctx)
+        # 如果 wait 返回后用户在暂停时点了停止（is_running=False）→ 上层立即结束，不再继续
+        return
+
+    # ---------- 情况 2：手动断点（node.breakpoint=True）----------
+    if not bool(getattr(node, "breakpoint", False)):
+        return
+    try:
+        annotate_step(ctx, node, "breakpoint", note="命中断点")
+    except Exception:
+        pass
+    ctx.log(
+        f"[Breakpoint] 📍 命中断点 id={node.id[:8]} type={node.type} → 已进入暂停（按 Ctrl+F10 继续 / Ctrl+F11 停止 / 工具栏⏭下一步→进入Step模式每节点自动停）",
+        "WARN",
+    )
+    ctx.is_paused = True
+    try:
+        runner.pause_changed.emit(True)
+    except Exception:
+        pass
+    wait_if_paused(ctx)
+
+
+# ============================================================
 # BlueprintRunner（QThread，硬约束 §4 线程隔离）
 # ============================================================
 class BlueprintRunner(QThread):
@@ -2460,6 +2540,10 @@ class BlueprintRunner(QThread):
     finished_err = Signal(str)
     progress_step = Signal(int, str)
     pause_changed = Signal(bool)
+    # 当前执行节点变更（每次进入一个新节点前发射，参数: node_id, node_type）
+    #  供搜索栏「📍下一断点/定位执行点」按钮标签实时显示 📍执行中: TypeX id=xx
+    #  以及命中断点/暂停后快速跳画布
+    current_node_changed = Signal(str, str)
 
     def __init__(self, graph: BlueprintGraph, parent=None, initial_hwnd=None):
         super().__init__(parent)
@@ -2475,19 +2559,80 @@ class BlueprintRunner(QThread):
     def request_pause(self, pause: bool):
         if self._ctx is not None:
             self._ctx.is_paused = bool(pause)
+            # 手动置暂停/继续时，如果是从暂停→继续（pause=False），且当前在 Step 模式 → 也同步清掉 Step 模式
+            if (not pause) and bool(getattr(self._ctx, "step_mode", False)):
+                self._ctx.step_mode = False
+                try:
+                    self._ctx.log("[Step] ▶ 手动取消暂停 → 已退出 Step 模式（后续只认手动 breakpoint=True 的节点才会停）", "INFO")
+                except Exception:
+                    pass
             self.pause_changed.emit(self._ctx.is_paused)
 
     def toggle_pause(self) -> bool:
+        """暂停/继续切换（对应工具栏⏸暂停/▶继续按钮 或 Ctrl+F10 快捷键）。
+        【和 Step 模式联动】：如果当前处于 Step 模式（之前点过⏭下一步）且用户现在点的是「▶继续」
+        （即 paused=True → False），把 step_mode=False 清掉，退出 Step 模式，
+        后续不再「进入每节点自动停」，只认用户手动设置的 breakpoint=True 节点才会停。"""
         if self._ctx is None:
             return False
         cur = not bool(self._ctx.is_paused)
+        # 暂停 → 继续：退出 Step 模式（后续不再每节点自动停）
+        if (not cur) and bool(getattr(self._ctx, "step_mode", False)):
+            self._ctx.step_mode = False
+            try:
+                self._ctx.log("[Step] ▶ 点继续恢复执行 → 已退出 Step 模式（后续只认手动 breakpoint=True 的节点才会停）", "INFO")
+            except Exception:
+                pass
         self._ctx.is_paused = cur
         self.pause_changed.emit(cur)
         return cur
 
+    def request_step(self) -> bool:
+        """『下一步』调试：语义为【打开/保持 Step 模式】，后续进入每个节点都自动暂停。
+        只在「暂停状态」下有效（命中断点暂停 / 手动⏸暂停 / Step 模式自动停 都算）：
+        1. 置 step_mode=True（打开/保持 Step 模式：后面进入每一个节点，不管它自己设没设 breakpoint，
+           在 _hit_node_breakpoint 的 Step 分支都会自动 is_paused=True 停住，直到用户点「▶继续」清 step_mode）
+        2. 临时置 is_paused=False → wait_if_paused 返回，执行当前节点 → 下一个节点开头又 Step 自动停
+        返回 True=请求成功；False=当前 ctx 不存在 / 没在运行。"""
+        if self._ctx is None:
+            return False
+        if not bool(getattr(self._ctx, "is_running", True)):
+            return False
+        self._ctx.step_mode = True
+        self._ctx.is_paused = False
+        # UI 更新：暂停按钮从▶继续 → 切回⏸暂停，下一步⏭灰禁用（下一次 Step 停住才再次亮）
+        try:
+            self.pause_changed.emit(False)
+        except Exception:
+            pass
+        self._ctx.log(
+            f"[Step] ⏭ 请求下一步 → 进入/保持 Step 模式：后续每个节点进入时都会自动暂停。点▶继续可随时退出 Step 模式",
+            "WARN",
+        )
+        return True
+
     @property
     def is_paused(self) -> bool:
         return bool(self._ctx.is_paused) if self._ctx is not None else False
+
+    @property
+    def current_node_id(self) -> Optional[str]:
+        """当前正在/刚执行完的节点 ID：None 表示还没开始执行或已结束。"""
+        if self._ctx is None:
+            return None
+        val = getattr(self._ctx, "current_node_id", None)
+        return val if isinstance(val, str) and len(val) > 0 else None
+
+    @property
+    def current_node_type(self) -> Optional[str]:
+        """拿到当前执行节点的 type（若在 graph 中找到），供 UI 标签显示节点类型。"""
+        nid = self.current_node_id
+        if nid is None:
+            return None
+        if self._graph is None or self._graph.nodes is None:
+            return None
+        nd = self._graph.nodes.get(nid)
+        return nd.type if nd is not None else None
 
     # ---------------- 主循环 ----------------
     def run(self):
@@ -2630,9 +2775,14 @@ class BlueprintRunner(QThread):
         if not ctx.is_running:
             return
         wait_if_paused(ctx)
-        # UI 高亮（硬约束 §4 Signal 回传）
+        # UI 高亮（硬约束 §4 Signal 回传） + 记录当前执行节点ID + 发 current_node_changed
         self.highlight_node.emit(node.id)
         self.progress_step.emit(ctx.step_counter + 1, node.type)
+        try:
+            ctx.current_node_id = node.id
+            self.current_node_changed.emit(node.id, node.type)
+        except Exception:
+            pass
 
         # 1. 解析 DATA 输入
         inputs = _resolve_data_inputs(graph, ctx, node)
@@ -2640,7 +2790,10 @@ class BlueprintRunner(QThread):
         # 2. 日志
         ctx.log(f"[Node▶] {node.type}  id={node.id[:8]}", "INFO")
 
-        # 3. 执行
+        # 3. 断点命中检查（主执行入口）
+        _hit_node_breakpoint(ctx, node, self)
+
+        # 4. 执行
         fn = EXECUTORS.get(node.type)
         try:
             if fn is None:
@@ -2655,6 +2808,9 @@ class BlueprintRunner(QThread):
 
         # 4. 保存输出
         ctx.set_outputs(node.id, outputs or {})
+
+        if not ctx.is_running:
+            return
 
         # 5. 根据 next_ports 入队下游 exec
         for pname in next_ports:

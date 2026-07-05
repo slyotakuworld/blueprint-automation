@@ -920,6 +920,46 @@ class NodeView(QGraphicsView):
         if self._search_count_lbl:
             self._search_count_lbl.setText(f"{idx + 1}/{total}")
 
+    # ---------------- 公开方法：画布跳节点（供 BlueprintApp 命中断点/Step 自动暂停后自动跳画布用） ----------------
+    def jump_to_node_by_id(self, node_id: str, flash_ms: int = 2400) -> bool:
+        """【外部调用】跳到指定 node_id 所在画布位置：缩放居中 + 选中 + flash 高亮
+        返回 True=找到了节点并跳转，False=没找到。
+        注意：这个是纯 UI 跳转，不触发任何执行/暂停。"""
+        ni = None
+        try:
+            sc = self.scene()
+            if isinstance(sc, NodeScene) and hasattr(sc, "_node_items"):
+                ni = sc._node_items.get(node_id)
+        except Exception:
+            ni = None
+        if ni is None:
+            for cand in self._iter_node_items():
+                try:
+                    if cand.node.id == node_id:
+                        ni = cand
+                        break
+                except Exception:
+                    continue
+        if ni is None:
+            return False
+        try:
+            self._zoom_ensure_visible(ni)
+        except Exception:
+            pass
+        try:
+            self.centerOn(ni.global_center())
+        except Exception:
+            pass
+        try:
+            ni.setSelected(True)
+        except Exception:
+            pass
+        try:
+            ni.flash(int(flash_ms))
+        except Exception:
+            pass
+        return True
+
     def _zoom_ensure_visible(self, ni: NodeItem):
         # 如果当前缩放太小导致节点几乎不可见，则适当放大
         try:

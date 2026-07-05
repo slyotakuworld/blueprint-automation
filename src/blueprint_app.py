@@ -733,22 +733,29 @@ class BlueprintMainWindow(QMainWindow):
         self._act_save_global.setShortcut(QKeySequence("Ctrl+S"))
         self.addAction(self._act_save_global)
 
-        # --------------- 运行控制组（暂停 → 运行/停止） ---------------
+        # --------------- 运行控制组（暂停 → 运行 → 停止 → 下一步） ---------------
         self._act_pause = mk_act("#9A6700", "⏸ 暂停", self._on_toggle_pause)
         self._act_pause.setEnabled(False)
         self._act_pause.setToolTip("运行中可点，临时冻结所有步骤；再点一次继续（不会丢状态）")
         self._act_run = mk_act("#238636", "▶ 运行", self._on_run_clicked)
         self._act_stop = mk_act("#DA3633", "■ 停止", self._on_stop_clicked)
+        # ---------------- ⏭ 下一步（Step Over 单步调试） ----------------
+        self._act_step = mk_act("#1F6FEB", "⏭ 下一步", self._on_step_clicked)
+        self._act_step.setToolTip("仅暂停状态下可用（命中断点或手动⏸暂停后）。步过下一个节点并自动暂停（类似IDE F10 Step Over）。无断点想一步步跑→先⏸暂停再点此按钮。")
         # 【2026-07-03 用户明确：运行/停止/暂停的全局热键用 GlobalHotkeyManager(pynput) 跨窗口注册，
         #  QAction 层面不再设置局部 shortcut（局部只有主窗口激活才生效，游戏前台按不到，违背全局热键的初衷）】
         #  L519-L520 旧的 F5/F8 局部硬编码已删除。
         self._act_run.setShortcut(QKeySequence())
         self._act_stop.setShortcut(QKeySequence())
+        self._act_step.setShortcut(QKeySequence())
         self._act_stop.setEnabled(False)
+        self._act_step.setEnabled(False)
         # 暂停按钮单独保存引用：会动态切"⏸暂停/▶继续"和颜色
         self._btn_pause = add_toolbtn(self._act_pause, bg="#5B4200", color="#F0B429", hover_bg="#875F00", hover_border="#9A6700")
         add_toolbtn(self._act_run, bg="#0F3321", color="#3FB950", hover_bg="#194B31", hover_border="#238636")
         add_toolbtn(self._act_stop, bg="#3B1314", color="#F85149", hover_bg="#58151C", hover_border="#DA3633")
+        # 【用户要求位置：停止按钮和缩放适应之间插入 ⏭ 下一步】所以放 ■停止之后、tb.addSeparator() 之前
+        self._btn_step = add_toolbtn(self._act_step, bg="#0D2957", color="#58A6FF", hover_bg="#1158C8", hover_border="#1F6FEB")
         tb.addSeparator()
 
         # --------------- 缩放 / 视图工具 / 切图工具组（BP特有切图引擎 双入口） ---------------
@@ -1083,6 +1090,13 @@ class BlueprintMainWindow(QMainWindow):
         if zoom_fit and self._view is not None:
             try:
                 self._view.zoom_fit()
+            except Exception:
+                pass
+        # 4) 蓝图加载后刷新 🔴 断点计数（第一次打开蓝图时 NodeView 构造还没 graph，所以这里必须手动触发一次）
+        if self._view is not None:
+            try:
+                self._view._breakpoint_idx = -1  # 重置跳转游标到最开始
+                self._view._refresh_breakpoint_label()
             except Exception:
                 pass
 
@@ -2060,13 +2074,27 @@ class BlueprintMainWindow(QMainWindow):
             return
         now_paused = self._runner.toggle_pause()
         self._log.append_log(
-            "⏸ 已暂停，运行冻结（不丢状态 / 不变量）。再点「继续」恢复。"
+            "⏸ 已暂停，运行冻结（不丢状态 / 不变量）。再点「继续」恢复；或点⏭下一步单步执行一个节点。"
             if now_paused else "▶ 已恢复执行。",
             "WARN" if now_paused else "INFO",
         )
 
+    def _on_step_clicked(self):
+        """工具栏 ⏭ 下一步 (Step Over)：仅暂停状态下可用，单步执行 1 个节点后自动再次暂停。"""
+        if self._runner is None or not self._runner.isRunning():
+            self._log.append_log("⏭ 下一步需要蓝图运行中才能使用（请先▶运行）。", "INFO")
+            return
+        if not self._runner.is_paused:
+            self._log.append_log("⏭ 下一步只在暂停状态下生效（先⏸暂停 / 命中断点自动暂停 → 再点⏭下一步步过下一个节点）。", "WARN")
+            return
+        ok = self._runner.request_step()
+        if not ok:
+            self._log.append_log("⏭ 下一步请求失败（蓝图可能已停止 / 上下文丢失）。", "WARN")
+
     def _apply_pause_state_to_ui(self, paused: bool):
-        """根据暂停/继续，动态切换暂停按钮的文字/背景色/状态栏提示。"""
+        """根据暂停/继续，动态切换暂停按钮的文字/背景色/状态栏提示，以及⏭下一步按钮使能。
+        【新增】任何原因进入 paused=True（命中🔴断点 / 手动⏸ / ⏭下一步单步自动暂停） → 自动把画布视图
+        跳到当前执行节点 current_node_id 所在位置，和搜索栏「📍定位」按钮同一逻辑，不用再手动点按钮找节点。"""
         try:
             if hasattr(self, "_act_pause"):
                 if paused:
@@ -2089,9 +2117,26 @@ class BlueprintMainWindow(QMainWindow):
                         "QToolButton:hover { background:#875F00; }"
                         "QToolButton:disabled { color:#484F58; background:#1C2128; }"
                     )
+            # ⏭ 下一步按钮：暂停=True 才能点（运行中还没停住 → 下一步没用；结束后也没用）
+            if hasattr(self, "_act_step"):
+                self._act_step.setEnabled(bool(paused))
             if paused:
-                self._status_run.setText("状态: 已暂停  [按⏸按钮继续]")
+                self._status_run.setText("状态: 已暂停  [按⏸继续 / ⏭下一步单步]")
                 self._status_run.setStyleSheet("color: #F0B429; font-size: 10px; padding: 0 8px;")
+                # 📍 自动跳画布到当前暂停的那个节点（3 种暂停都生效：断点命中 / 手动⏸ / ⏭单步完）
+                try:
+                    if self._view is not None and self._runner is not None:
+                        curr_id = getattr(self._runner, "current_node_id", None)
+                        if isinstance(curr_id, str) and len(curr_id) > 0:
+                            ok = self._view.jump_to_node_by_id(curr_id, flash_ms=3200)
+                            if ok:
+                                ntype = getattr(self._runner, "current_node_type", None) or "节点"
+                                self._log.append_log(
+                                    f"📍画布已自动定位到暂停节点 → {ntype} id={curr_id[:8]}",
+                                    "INFO",
+                                )
+                except Exception:
+                    pass
         except Exception:
             pass
 

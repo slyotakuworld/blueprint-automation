@@ -5,8 +5,10 @@ from typing import Dict, List, Optional, Tuple
 
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import (
+    QAction,
     QBrush,
     QColor,
+    QCursor,
     QFont,
     QPainter,
     QPainterPath,
@@ -19,8 +21,10 @@ from PySide6.QtWidgets import (
     QGraphicsItem,
     QGraphicsObject,
     QGraphicsPathItem,
+    QGraphicsSceneContextMenuEvent,
     QGraphicsSceneHoverEvent,
     QGraphicsSceneMouseEvent,
+    QMenu,
     QStyle,
     QStyleOptionGraphicsItem,
     QWidget,
@@ -239,6 +243,7 @@ class NodeItem(QGraphicsObject):
     node_position_changed = Signal(str, QPointF)
     node_selected_changed = Signal(str, bool)
     request_delete = Signal(str)
+    breakpoint_toggled = Signal(str, bool)   # (node_id, new_state) 断点切换后通知外部（scene 可更新 persist 缓存）
 
     def __init__(self, node: Node):
         super().__init__()
@@ -259,6 +264,45 @@ class NodeItem(QGraphicsObject):
         self._build_ports()
         x, y = int(node.pos[0]), int(node.pos[1])
         self.setPos(x, y)
+
+    # ---------------- 断点切换 ----------------
+    def toggle_breakpoint(self) -> bool:
+        """切换当前节点的断点状态，返回新状态（True=开断点）。
+        状态直接写入底层 Node.breakpoint（与 models.Node.to_dict/from_dict 兼容，
+        保存蓝图时自动序列化到 JSON，无需 scene 额外同步）。"""
+        new_state = not bool(getattr(self.node, "breakpoint", False))
+        self.node.breakpoint = new_state
+        try:
+            self.breakpoint_toggled.emit(self.node.id, new_state)
+        except Exception:
+            pass
+        self.update()
+        return new_state
+
+    # ---------------- 右键菜单（QMenu 上下文菜单） ----------------
+    def contextMenuEvent(self, event: QGraphicsSceneContextMenuEvent):
+        """节点右键：只保留「切换断点」。
+        按用户 2026-07-05 明确要求：移除无效果的"删除节点"项（当前 request_delete 未挂接处理逻辑，容易误导用户）。"""
+        menu = QMenu()
+        menu.setStyleSheet(
+            "QMenu { background: #21262D; color: #C9D1D9; border: 1px solid #30363D; padding: 4px; }"
+            "QMenu::item { padding: 6px 18px; border-radius: 3px; }"
+            "QMenu::item:selected { background: #1F6FEB; color: #FFFFFF; }"
+            "QMenu::item:disabled { color: #484F58; }"
+        )
+        # 菜单项 1：切换断点（Checkable，显示 Check 勾号）
+        is_on = bool(getattr(self.node, "breakpoint", False))
+        act_bp = QAction("切换断点 (Breakpoint)", menu)
+        act_bp.setCheckable(True)
+        act_bp.setChecked(is_on)
+        act_bp.setIconText("🔴" if is_on else "⭘")
+        def _do_toggle():
+            self.toggle_breakpoint()
+        act_bp.triggered.connect(_do_toggle)
+        menu.addAction(act_bp)
+        # 在鼠标处弹出
+        menu.exec(QCursor.pos())
+        super().contextMenuEvent(event)
 
     # ---------------- 结构 ----------------
     def _meta(self):
@@ -744,14 +788,25 @@ class NodeItem(QGraphicsObject):
         clip = QPainterPath()
         clip.addRect(0, 0, NODE_WIDTH, NODE_HEADER_H)
         painter.drawPath(path & clip)
-        # 标题文本
+        # ================ 断点视觉标识（标题栏左上角红色圆点 / IDE 风格） ================
+        # breakpoint=True: 实心红圆 + 白色描边（醒目，像 VSCode 断点）
+        # breakpoint=False: 不画任何东西（保持界面整洁，用户右键切换到 ON 才显示）
+        is_bp_on = bool(getattr(self.node, "breakpoint", False))
+        if is_bp_on:
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            bp_cx, bp_cy, bp_r = 16, (NODE_HEADER_H / 2), 7
+            # 1. 白色描边（在彩色标题栏上清晰可见）
+            painter.setPen(QPen(QColor("#FFFFFF"), 2))
+            painter.setBrush(QBrush(QColor("#F85149")))   # 番茄红 = GitHub 危险色，和 IDE 断点一致
+            painter.drawEllipse(QPointF(bp_cx, bp_cy), bp_r, bp_r)
+        # 标题文本（左边留 32px 给断点圆点，避免文字与红点重叠）
         painter.setPen(QPen(QColor("#FFFFFF")))
         f = QFont()
         f.setBold(True)
         f.setPointSize(9)
         painter.setFont(f)
         painter.drawText(
-            QRectF(10, 0, NODE_WIDTH - 20, NODE_HEADER_H),
+            QRectF(32, 0, NODE_WIDTH - 44, NODE_HEADER_H),
             Qt.AlignVCenter | Qt.AlignLeft,
             title,
         )
