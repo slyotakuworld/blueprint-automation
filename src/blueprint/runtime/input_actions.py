@@ -123,6 +123,47 @@ DIK_CODES = {
     "f10": (0x44, False),
     "f11": (0x57, False),
     "f12": (0x58, False),
+    # Win 键
+    "lwin": (0x5B, True),
+    "rwin": (0x5C, True),
+    # 其他常用键
+    "printscreen": (0xE037, True),
+    "scrolllock": (0x46, False),
+    "numlock": (0x45, False),
+    "pause": (0xE046, True),
+    # 符号键
+    "minus": (0x0C, False),       # - _
+    "equals": (0x0D, False),      # = +
+    "lbracket": (0x1A, False),    # [ {
+    "rbracket": (0x1B, False),    # ] }
+    "semicolon": (0x27, False),   # ; :
+    "quote": (0x28, False),       # ' "
+    "backslash": (0x2B, False),   # \ |
+    "comma": (0x33, False),       # , <
+    "period": (0x34, False),      # . >
+    "slash": (0x35, False),       # / ?
+    "backquote": (0x29, False),   # ` ~
+}
+
+# 按键别名映射（用户友好名 → DIK_CODES 键名）
+KEY_ALIASES = {
+    "ctrl": "lctrl",
+    "alt": "lalt",
+    "shift": "lshift",
+    "win": "lwin",
+    "super": "lwin",
+    "meta": "lwin",
+    "return": "enter",
+    "esc": "esc",
+    "escape": "esc",
+    "del": "delete",
+    "ins": "insert",
+    "pgup": "pageup",
+    "pgdn": "pagedown",
+    "bs": "backspace",
+    "bksp": "backspace",
+    "prtsc": "printscreen",
+    "prtscr": "printscreen",
 }
 
 KEYDOWN_FLAG = 0x0008
@@ -145,9 +186,11 @@ class InputActions:
         self.safe_region = region_xywh
 
     def _send_key_event(self, key, is_down):
+        # 别名转换
+        key = KEY_ALIASES.get(key, key)
         if key not in DIK_CODES:
             self._log(f"[Input] 未知按键: {key}", "WARN")
-            return
+            return False
         scan_code, extended = DIK_CODES[key]
         flags = (KEYDOWN_FLAG if is_down else KEYUP_FLAG) | (EXTENDED_KEY_FLAG if extended else 0)
         extra = ctypes.c_ulong(0)
@@ -155,6 +198,7 @@ class InputActions:
         ii_.ki = KeyBdInput(0, scan_code, flags, 0, ctypes.pointer(extra))
         x = Input(ctypes.c_ulong(1), ii_)
         SendInput(1, ctypes.pointer(x), ctypes.sizeof(x))
+        return True
 
     def key_down(self, key):
         self._send_key_event(key, True)

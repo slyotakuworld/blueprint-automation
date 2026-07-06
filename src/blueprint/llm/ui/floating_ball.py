@@ -361,18 +361,8 @@ class FloatingBall(QWidget):
 
     def _tick_state_anim(self):
         self._rot_tick += 1
-        # idle：轻微呼吸（-1.0 ~ +1.0 像素上下浮动）→ bounce_offset 用作 draw 位移
-        s = self._state
-        if s == "idle":
-            self._bounce_offset = 0.8 * __import__("math").sin(self._rot_tick * 0.18)
-        elif s == "thinking":
-            self._bounce_offset = 1.4 * __import__("math").sin(self._rot_tick * 0.55)  # 抖得快
-        elif s == "happy":
-            self._bounce_offset = 2.4 * abs(__import__("math").sin(self._rot_tick * 0.35))  # 上下跳
-        elif s == "sleep":
-            self._bounce_offset = 0.4 * __import__("math").sin(self._rot_tick * 0.08)  # 极慢
-        elif s == "sad":
-            self._bounce_offset = -0.8 - 0.4 * __import__("math").sin(self._rot_tick * 0.22)  # 耷拉
+        # 不做上下浮动动画，头像静止不动
+        self._bounce_offset = 0.0
         self.update()
 
     def set_avatar_state(self, state: str):
@@ -485,8 +475,13 @@ class FloatingBall(QWidget):
             p.drawPath(path)
 
             # 4) 中间头像 —— 先 setClipPath 圆形裁切，y 方向应用 _bounce_offset（伪动画）
+            #    使用固定居中坐标（基于 _AVATAR_DRAW_SIZE），不依赖 scaled 实际尺寸，
+            #    避免 WebP 各帧尺寸微小差异导致 y 跳动抖动。
             drawn_avatar = False
             y_shift = int(round(self._bounce_offset))
+            # 固定居中坐标
+            avatar_x = rect.x() + (rect.width() - _AVATAR_DRAW_SIZE.width()) // 2
+            avatar_y = rect.y() + (rect.height() - _AVATAR_DRAW_SIZE.height()) // 2 + 1 + y_shift
 
             # thinking 状态：用工作女仆赫萝 WebP 动画
             if self._state == "thinking" and self._movie_thinking is not None:
@@ -494,9 +489,8 @@ class FloatingBall(QWidget):
                 if not pm.isNull():
                     p.save(); p.setClipPath(path)
                     scaled = pm.scaled(_AVATAR_DRAW_SIZE, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                    x = rect.x() + (rect.width() - scaled.width()) // 2
-                    y = rect.y() + (rect.height() - scaled.height()) // 2 + 1 + y_shift
-                    p.drawPixmap(x, y, scaled); p.restore(); drawn_avatar = True
+                    # 用固定坐标居中，不随 scaled 尺寸变化
+                    p.drawPixmap(avatar_x, avatar_y, scaled); p.restore(); drawn_avatar = True
 
             # happy/sleep/sad 状态：用 llm_icons 静态头像
             if not drawn_avatar:
@@ -505,9 +499,7 @@ class FloatingBall(QWidget):
                     spm = _icon_pixmap(state_avatar, _AVATAR_DRAW_SIZE.width())
                     if not spm.isNull():
                         p.save(); p.setClipPath(path)
-                        x = rect.x() + (rect.width() - spm.width()) // 2
-                        y = rect.y() + (rect.height() - spm.height()) // 2 + 1 + y_shift
-                        p.drawPixmap(x, y, spm); p.restore(); drawn_avatar = True
+                        p.drawPixmap(avatar_x, avatar_y, spm); p.restore(); drawn_avatar = True
 
             # idle 状态：用沉思女仆赫萝 WebP 动画
             if not drawn_avatar and self._movie is not None:
@@ -515,9 +507,7 @@ class FloatingBall(QWidget):
                 if not pm.isNull():
                     p.save(); p.setClipPath(path)
                     scaled = pm.scaled(_AVATAR_DRAW_SIZE, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                    x = rect.x() + (rect.width() - scaled.width()) // 2
-                    y = rect.y() + (rect.height() - scaled.height()) // 2 + 1 + y_shift
-                    p.drawPixmap(x, y, scaled); p.restore(); drawn_avatar = True
+                    p.drawPixmap(avatar_x, avatar_y, scaled); p.restore(); drawn_avatar = True
 
             # fallback：🐺 emoji（赫萝贤狼）
             if not drawn_avatar and self._movie_fallback_emoji:
@@ -595,7 +585,12 @@ class FloatingBall(QWidget):
                 threshold = QApplication.startDragDistance() + 2  # 再加 2px 防抖动
                 if (dx * dx + dy * dy) > threshold * threshold:
                     self._did_drag = True
-            self.move(e.globalPosition().toPoint() - self._drag_pos)
+            # 计算目标位置，并限制在屏幕可用区域内（防止拖出屏幕）
+            new_pos = e.globalPosition().toPoint() - self._drag_pos
+            geo = self._screen_available()
+            clamped_x = max(geo.left(), min(new_pos.x(), geo.right() - self._size))
+            clamped_y = max(geo.top(), min(new_pos.y(), geo.bottom() - self._size))
+            self.move(clamped_x, clamped_y)
             e.accept()
             return
         try:

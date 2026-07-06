@@ -142,16 +142,100 @@ class VariableEngine:
         def replace_dollar(m: re.Match) -> str:
             return "{" + m.group(1) + "}"
 
-        # 表达式 {= ...} 优先（花括号里是表达式，里面的 {} 不匹配外层，不会与 ${var} 冲突）
+        # 表达式 {= ...} 优先。注意：表达式内部可能含有嵌套花括号 {var}/${var}，正则非贪婪
+        # 遇到第一个 } 就会停，因此不能用 re.sub，改用手动扫描+花括号平衡计数法。
         expr_placeholders: Dict[str, Any] = {}
 
-        def replace_expr(m: re.Match) -> str:
-            raw = m.group(1)
+        def _value_to_python_literal(val: Any) -> str:
+            """把变量值转换成合法的 Python 字面量字符串，用于拼到 {= expr} 表达式内部。
+            - int/float/bool/None → 直接 str()
+            - str → repr() 自动加引号+转义
+            - list/dict/tuple → json.dumps（json语法就是Python合法子集）
+            - 其他类型 → repr() 兜底"""
+            import json as _json
+            if isinstance(val, bool):
+                return "True" if val else "False"
+            if val is None:
+                return "None"
+            if isinstance(val, (int, float)):
+                return str(val)
+            if isinstance(val, str):
+                return repr(val)
+            if isinstance(val, (list, dict, tuple)):
+                try:
+                    return _json.dumps(val, ensure_ascii=False)
+                except Exception:
+                    return repr(val)
+            return repr(val)
+
+        def _pre_interpolate_vars_inside_expr(expr_raw: str) -> str:
+            """在 eval 表达式之前，先把内部 {var} / ${var} 替换成值的 Python 字面量。
+            注意：只处理变量占位，不处理表达式（避免 {= 递归）。"""
+            # 1) 先把 ${x} 统一成 {x}
+            norm = _PATTERN_BRACE_DOLLAR.sub(lambda m: "{" + m.group(1) + "}", expr_raw)
+            # 2) 逐个替换 {name}
+            def _sub_one(m2: re.Match) -> str:
+                name = m2.group(1).strip()
+                if not name:
+                    return m2.group(0)
+                # 保护：如果 name 里有 = 或者 __EXPR_ 前缀（表达式占位符），不处理
+                if "=" in name or name.startswith("__EXPR_"):
+                    return m2.group(0)
+                resolved = self._resolve_var(name, disable_all_vars=disable_all_vars)
+                if isinstance(resolved, MissingVar):
+                    # 变量找不到：保留原样（会导致后续 eval 语法错误，但用户能看到是哪个变量缺失）
+                    return m2.group(0)
+                return _value_to_python_literal(resolved)
+            return _PATTERN_BRACE_BARE.sub(_sub_one, norm)
+
+        def _process_one_expr_block(expr_inner: str) -> str:
+            """处理一个 {= ...} 块，返回 {__EXPR_N__} 占位串"""
+            try:
+                cooked = _pre_interpolate_vars_inside_expr(expr_inner)
+            except Exception:
+                cooked = expr_inner
             key = f"__EXPR_{len(expr_placeholders)}__"
-            expr_placeholders[key] = self._safe_eval(raw, disable_all_vars=disable_all_vars)
+            expr_placeholders[key] = self._safe_eval(cooked, disable_all_vars=disable_all_vars)
             return "{" + key + "}"
 
-        stage1 = _PATTERN_EXPR.sub(replace_expr, s)
+        # 手动扫描 + 括号平衡匹配：找所有 {= ... }，支持内部任意层嵌套花括号
+        stage1_chars: List[str] = []
+        i = 0
+        n = len(s)
+        while i < n:
+            if s[i] == "{" and i + 1 < n and s[i + 1] == "=":
+                # 找到 {= 起始；表达式内容从 {= 后面第一个非空白字符开始
+                j = i + 2
+                # 跳过表达式前面的 \s*（允许 {=   expr...）
+                while j < n and s[j] in " \t\r\n":
+                    j += 1
+                start_idx = j
+                depth = 1  # 已经消耗了一层 {（即 {= 的那个 {）
+                while j < n and depth > 0:
+                    ch = s[j]
+                    if ch == "{":
+                        depth += 1
+                    elif ch == "}":
+                        depth -= 1
+                        if depth == 0:
+                            # 这个 } 是 {= 对应的结束花括号
+                            end_idx = j
+                            # 再剥掉表达式末尾的空白：{= expr  } 中  expr  右边可能有空格
+                            inner_raw = s[start_idx:end_idx]
+                            inner_stripped = inner_raw.rstrip(" \t\r\n")
+                            repl = _process_one_expr_block(inner_stripped)
+                            stage1_chars.append(repl)
+                            i = j + 1
+                            break
+                    j += 1
+                else:
+                    # 没找到闭合 }：整个字符串不合法，把当前 { 当普通字符保留
+                    stage1_chars.append(s[i])
+                    i += 1
+            else:
+                stage1_chars.append(s[i])
+                i += 1
+        stage1 = "".join(stage1_chars)
         stage2 = _PATTERN_BRACE_DOLLAR.sub(replace_dollar, stage1)
 
         # 解析所有 {xxx} 占位，把表达式 placeholder 直接回填，其他按变量名解析

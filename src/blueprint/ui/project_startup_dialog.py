@@ -119,8 +119,9 @@ class ProjectStartupDialog(QDialog):
         v.addStretch(1)
         btn = QPushButton("✅ 创建并打开该工程")
         btn.setMinimumHeight(36)
+        btn.setMinimumWidth(180)
         btn.setStyleSheet(
-            "QPushButton { background:#238636; color:white; border-radius:6px; font-weight:600; }"
+            "QPushButton { background:#238636; color:white; border-radius:6px; font-weight:600; padding: 4px 16px; }"
             " QPushButton:hover { background:#2EA043; }"
         )
         btn.clicked.connect(self._on_create)
@@ -194,8 +195,9 @@ class ProjectStartupDialog(QDialog):
         v.addStretch(1)
         btn = QPushButton("📂 打开选中的工程")
         btn.setMinimumHeight(36)
+        btn.setMinimumWidth(180)
         btn.setStyleSheet(
-            "QPushButton { background:#0969DA; color:white; border-radius:6px; font-weight:600; }"
+            "QPushButton { background:#0969DA; color:white; border-radius:6px; font-weight:600; padding: 4px 16px; }"
             " QPushButton:hover { background:#1F6FEB; }"
         )
         btn.clicked.connect(self._on_open)
@@ -260,8 +262,9 @@ class ProjectStartupDialog(QDialog):
 
         btn_del_sel = QPushButton("🗑 删除工程")
         btn_del_sel.setMinimumHeight(36)
+        btn_del_sel.setMinimumWidth(140)
         btn_del_sel.setStyleSheet(
-            "QPushButton { background:#DA3633; color:white; border-radius:6px; font-weight:600; }"
+            "QPushButton { background:#DA3633; color:white; border-radius:6px; font-weight:600; padding: 4px 16px; }"
             " QPushButton:hover { background:#F85149; }"
         )
         btn_del_sel.setToolTip("将工程目录整个移动到回收站（可恢复），并从最近工程列表里移除")
@@ -270,8 +273,9 @@ class ProjectStartupDialog(QDialog):
 
         btn_open_sel = QPushButton("🗂 打开工程")
         btn_open_sel.setMinimumHeight(36)
+        btn_open_sel.setMinimumWidth(140)
         btn_open_sel.setStyleSheet(
-            "QPushButton { background:#0969DA; color:white; border-radius:6px; font-weight:600; }"
+            "QPushButton { background:#0969DA; color:white; border-radius:6px; font-weight:600; padding: 4px 16px; }"
             " QPushButton:hover { background:#1F6FEB; }"
         )
         btn_open_sel.clicked.connect(lambda _=False: self._on_open_recent(double_click=False))

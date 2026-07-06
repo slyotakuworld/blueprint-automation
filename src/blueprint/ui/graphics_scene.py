@@ -334,8 +334,8 @@ class NodeScene(QGraphicsScene):
         for e in self.graph.edges.values():
             if e.from_node == fn and e.to_node == tn and e.from_port == fp and e.to_port == tp:
                 return None
-        # 关键约束：INPUT 端口只能连一根线（一对多不行，被占用就直接拒绝）
-        if to_pi.port.direction == PortDirection.IN and self._is_input_port_occupied(tn, tp):
+        # 关键约束：DATA 类型的 INPUT 端口只能连一根线；EXEC 类型允许多根（如循环节点回环）
+        if to_pi.port.direction == PortDirection.IN and not to_pi.is_exec() and self._is_input_port_occupied(tn, tp):
             # 如果用户就是要接这个已占用 input，可以让它先自动断开旧的再连新的？这里按用户要求不允许，直接拒绝。
             # 底部日志面板提示一下用户
             try:
@@ -532,11 +532,12 @@ class NodeScene(QGraphicsScene):
                 if a.port.direction != PortDirection.OUT:
                     a, b = b, a
                 # 关键：如果最终要接到的那个 INPUT 端口已经被占了，也判定为不兼容
-                if b.port.direction == PortDirection.IN:
+                # 但 EXEC 类型 INPUT 允许多根连线（如循环节点回环、多上游触发同一节点）
+                if b.port.direction == PortDirection.IN and not b.is_exec():
                     occupied = self._is_input_port_occupied(b.node_item().node.id, b.port_name())
                     if occupied:
                         target_ok = False
-                        target_hint = "（该输入端口已被占用，请先断开旧线）"
+                        target_hint = "（该数据输入端口已被占用，请先断开旧线）"
                     else:
                         target_ok = True
                 else:

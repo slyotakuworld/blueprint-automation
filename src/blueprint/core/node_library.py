@@ -385,6 +385,22 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
                      '● 模板匹配(template)：直接做像素归一化相关。速度最快，像素级精度最高；但参考图和屏幕只要有缩放、旋转、轻微形变或压缩失真就会匹配失败。适合尺寸固定、画面清晰的UI按钮/图标。\n'
                      '● 特征匹配(feature)：提取SIFT/ORB局部特征点做匹配。抗缩放、旋转、部分遮挡和光照变化；但对于大面积纯色、缺少纹理的图片（如纯色方块）会找不到特征点而失败，速度也稍慢。',
             ),
+            # 找图范围模式
+            ParamDef(name="search_mode", editor=EDITOR_ENUM, default="relative",
+                     options=["relative", "absolute"],
+                     option_labels={"relative": "相对目标程序", "absolute": "全屏模式"},
+                     label="找图范围",
+                     help="相对目标程序(relative)：仅在目标程序窗口范围内截图找图，输出坐标也是相对窗口的（配合鼠标节点「相对绑定窗口」模式使用）；\n全屏模式(absolute)：截取整个屏幕找图，输出坐标为绝对屏幕坐标（配合鼠标节点「绝对屏幕坐标」模式使用）。"),
+            # 临时目标程序（仅 search_mode=relative 时生效）
+            ParamDef(name="temp_target_title", editor=EDITOR_STRING, default="",
+                     label="临时目标·标题",
+                     help="仅「相对目标程序」模式生效。\n填了就用这个窗口作为截图范围和坐标基准（不影响全局目标程序），留空=用全局目标程序。\n支持 {变量} 插值。\n点上方「🎯 拾取临时窗口」按钮可自动填充。"),
+            ParamDef(name="temp_target_exe", editor=EDITOR_STRING, default="",
+                     label="临时目标·程序名",
+                     help="仅「相对目标程序」模式生效。程序名子串匹配（如 notepad.exe）。\n留空=不按程序名匹配。"),
+            ParamDef(name="temp_target_class", editor=EDITOR_STRING, default="",
+                     label="临时目标·类名",
+                     help="仅「相对目标程序」模式生效。窗口类名精确匹配。\n留空=不按类名匹配。"),
             ParamDef(name="threshold", editor=EDITOR_FLOAT, default=0.75, label="匹配阈值", min=0.3, max=1.0, step=0.01,
                      help="相似度阈值，越高越严格。模板匹配/混合模式=相关系数；特征匹配=内点比例。"),
             ParamDef(name="timeout_seconds", editor=EDITOR_FLOAT, default=10.0, label="超时(秒)", min=0.5, max=600.0, step=0.5,
@@ -396,7 +412,7 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
             # 未找到时尝试滚动
             ParamDef(name="auto_scroll", editor=EDITOR_BOOL, default=False,
                      label="未找到时尝试滚动",
-                     help="勾选=找图失败后自动把鼠标移到屏幕中心并滚动一次，然后继续重试，直到超时。"),
+                     help="勾选=找图失败后在当前鼠标位置滚动一次，然后继续重试，直到超时。"),
             ParamDef(name="scroll_dy", editor=EDITOR_INT, default=-500, label="垂直滚动量(负=向下)", min=-5000, max=5000, step=10,
                      help="pyautogui.scroll 的垂直 clicks 值，典型值：向下翻页=-500；向上翻页=500。仅勾选「未找到时尝试滚动」才生效。"),
             ParamDef(name="scroll_dx", editor=EDITOR_INT, default=0, label="水平滚动量(正=向右)", min=-5000, max=5000, step=10,
@@ -417,8 +433,29 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
                 help="找到目标后要自动做的动作。建议用默认「左键单击」直接点击目标；不需要鼠标操作则选「不执行」仅把位置传给下游Mouse节点。",
             ),
             ParamDef(name="offset", editor=EDITOR_TUPLE2, default=(0, 0), label="点击偏移",
-                     pick_coord=True,
-                     help="找到目标后，相对目标中心的像素偏移 (X, Y)。X 正值向右，负值向左；Y 正值向下，负值向上。点右侧 📍 按钮可在屏幕上拾取坐标（取绝对坐标；如需相对模板中心可手动微调）。"),
+                     help="找到目标后，相对模板中心的像素偏移 (X, Y)。X 正值向右，负值向左；Y 正值向下，负值向上。\n例如找到的图片中心在窗口(100,200)，偏移设(10,-5)，则实际点击位置为(110,195)。\nout_pos 输出的是「模板中心+偏移」后的最终坐标。"),
+            # ===== 特征识别辅助 =====
+            ParamDef(name="use_feature_assist", editor=EDITOR_BOOL, default=False,
+                     label="特征识别辅助",
+                     help="勾选后，当直接模板匹配失败时，自动改用「特征列表」方式匹配：\n将模板拆成多个小特征图独立匹配，再根据每个特征在模板中的相对位置交叉验证，\n确保特征出现在正确位置才算命中。适用于整张模板因缩放/遮挡/复杂背景无法直接匹配的场景。"),
+            ParamDef(name="features_json", editor=EDITOR_MULTILINE, default="[]",
+                     label="特征列表(JSON)",
+                     help="特征数据JSON数组，每项包含: b64(特征图base64), rel_x/rel_y(相对模板左上角), w/h(特征宽高)。\n通常通过面板上方「✂ 从模板截取特征」按钮自动生成，无需手填。"),
+            ParamDef(name="feature_tolerance", editor=EDITOR_INT, default=15, min=1, max=200, step=1,
+                     label="位置容差(像素)",
+                     help="特征位置验证的允许误差。实际位置与推算位置的欧几里得距离在此值内算通过。\n值越小越严格，建议 10-20。"),
+            ParamDef(name="feature_min_hits", editor=EDITOR_INT, default=2, min=1, max=20, step=1,
+                     label="最少命中特征数",
+                     help="至少多少个特征同时命中且位置验证通过才算整体匹配成功。\n至少需要2个才能做位置交叉验证。设1则退化为单特征匹配（不推荐）。"),
+            ParamDef(name="feature_capture_width", editor=EDITOR_INT, default=0, min=0, max=99999, step=1,
+                     label="截图时窗口宽",
+                     help="截取特征时目标窗口的宽度，用于分辨率不匹配时的缩放回退计算。通常自动记录，无需手填。"),
+            ParamDef(name="feature_template_w", editor=EDITOR_INT, default=0, min=0, max=99999, step=1,
+                     label="模板总宽",
+                     help="原始模板图片的总宽度（像素），用于推算模板中心和out_pos。自动记录。"),
+            ParamDef(name="feature_template_h", editor=EDITOR_INT, default=0, min=0, max=99999, step=1,
+                     label="模板总高",
+                     help="原始模板图片的总高度（像素），用于推算模板中心和out_pos。自动记录。"),
         ],
         type_short_name="image",
     ),
@@ -447,10 +484,9 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
             ParamDef(name="press_enter", editor=EDITOR_BOOL, default=False, label="末尾按回车",
                      help="【输入文本模式】输入完文本后再按一次回车键。"),
             # --- 按键组合模式参数 ---
-            ParamDef(name="key_name", editor=EDITOR_STRING, default="", label="组合键",
-                     required=False,
-                     placeholder="如: enter, ctrl+c, alt+f4, win+r, shift+1",
-                     help="【按键组合模式】按键名，多键用 + 连接。如: enter, ctrl+c, alt+f4, win+r, shift+1。\n单键: enter, space, esc, a, 1, up, f1 等。"),
+            ParamDef(name="key_combo", editor=EDITOR_STRING, default="[]",
+                     label="按键组合",
+                     help="【按键组合模式】按键数组JSON，如 [\"ctrl\",\"c\"]。通过面板下拉框选择，无需手填。"),
             ParamDef(name="count", editor=EDITOR_INT, default=1, label="次数", min=1, max=1000, step=1,
                      help="【按键组合模式】重复按几次。"),
             ParamDef(name="hold_ms", editor=EDITOR_INT, default=50, label="保持(ms)", min=1, max=5000, step=1,
@@ -482,6 +518,16 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
                      option_labels={"relative": "相对绑定窗口", "absolute": "绝对屏幕坐标"},
                      label="坐标参考系",
                      help="相对绑定窗口(relative)：坐标基于绑定窗口左上角，拾取时自动扣除窗口偏移；\n绝对屏幕坐标(absolute)：坐标基于屏幕左上角。"),
+            # 1.5) 临时目标程序（仅 coord_mode=relative 时生效）
+            ParamDef(name="temp_target_title", editor=EDITOR_STRING, default="",
+                     label="临时目标·标题",
+                     help="仅「相对绑定窗口」模式生效。\n填了就用这个窗口作为坐标偏移基准（不影响全局目标程序），留空=用全局目标程序。\n支持 {变量} 插值。\n点上方「🎯 拾取临时窗口」按钮可自动填充标题/程序名/类名。"),
+            ParamDef(name="temp_target_exe", editor=EDITOR_STRING, default="",
+                     label="临时目标·程序名",
+                     help="仅「相对绑定窗口」模式生效。程序名子串匹配（如 notepad.exe）。\n留空=不按程序名匹配。"),
+            ParamDef(name="temp_target_class", editor=EDITOR_STRING, default="",
+                     label="临时目标·类名",
+                     help="仅「相对绑定窗口」模式生效。窗口类名精确匹配。\n留空=不按类名匹配。"),
             # 2) 动作类型（第二位）
             ParamDef(name="action", editor=EDITOR_ENUM, default="click",
                      options=["click", "press", "release", "move", "drag", "scroll"],
@@ -768,6 +814,22 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
                      '● 模板匹配(template)：直接做像素归一化相关。速度最快，像素级精度最高；但参考图和屏幕只要有缩放、旋转、轻微形变或压缩失真就会匹配失败。适合尺寸固定、画面清晰的UI按钮/图标。\n'
                      '● 特征点匹配(feature)：提取SIFT/ORB局部特征点做匹配。抗缩放、旋转、部分遮挡和光照变化；但对于大面积纯色、缺少纹理的图片（如纯色方块）会找不到特征点而失败，速度也稍慢。',
             ),
+            # 检测范围模式
+            ParamDef(name="search_mode", editor=EDITOR_ENUM, default="relative",
+                     options=["relative", "absolute"],
+                     option_labels={"relative": "相对目标程序", "absolute": "全屏模式"},
+                     label="检测范围",
+                     help="相对目标程序(relative)：仅在目标程序窗口范围内截图检测，确保所有模板都在同一个窗口内找到，避免跨窗口误匹配；\n全屏模式(absolute)：截取整个屏幕检测，可能把不同窗口的相似图案误判为同一目标。"),
+            # 临时目标程序（仅 search_mode=relative 时生效）
+            ParamDef(name="temp_target_title", editor=EDITOR_STRING, default="",
+                     label="临时目标·标题",
+                     help="仅「相对目标程序」模式生效。\n填了就用这个窗口作为检测范围（不影响全局目标程序），留空=用全局目标程序。\n支持 {变量} 插值。"),
+            ParamDef(name="temp_target_exe", editor=EDITOR_STRING, default="",
+                     label="临时目标·程序名",
+                     help="仅「相对目标程序」模式生效。程序名子串匹配（如 notepad.exe）。\n留空=不按程序名匹配。"),
+            ParamDef(name="temp_target_class", editor=EDITOR_STRING, default="",
+                     label="临时目标·类名",
+                     help="仅「相对目标程序」模式生效。窗口类名精确匹配。\n留空=不按类名匹配。"),
             ParamDef(
                 name="threshold",
                 editor=EDITOR_FLOAT,
@@ -816,6 +878,22 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
             _exec_out("no", label="超时"),
         ],
         params=[
+            # 截图范围模式
+            ParamDef(name="search_mode", editor=EDITOR_ENUM, default="relative",
+                     options=["relative", "absolute"],
+                     option_labels={"relative": "相对目标程序", "absolute": "全屏模式"},
+                     label="截图范围",
+                     help="相对目标程序(relative)：ROI 坐标基于目标窗口左上角，窗口移动ROI跟着移动；\n全屏模式(absolute)：ROI 坐标基于屏幕左上角，固定不变。"),
+            # 临时目标程序（仅 search_mode=relative 时生效）
+            ParamDef(name="temp_target_title", editor=EDITOR_STRING, default="",
+                     label="临时目标·标题",
+                     help="仅「相对目标程序」模式生效。\n填了就用这个窗口作为 ROI 坐标基准（不影响全局目标程序），留空=用全局目标程序。\n支持 {变量} 插值。"),
+            ParamDef(name="temp_target_exe", editor=EDITOR_STRING, default="",
+                     label="临时目标·程序名",
+                     help="仅「相对目标程序」模式生效。程序名子串匹配。\n留空=不按程序名匹配。"),
+            ParamDef(name="temp_target_class", editor=EDITOR_STRING, default="",
+                     label="临时目标·类名",
+                     help="仅「相对目标程序」模式生效。窗口类名精确匹配。\n留空=不按类名匹配。"),
             ParamDef(
                 name="stillness_seconds",
                 editor=EDITOR_FLOAT,
@@ -951,6 +1029,10 @@ def parse_varswitch_conditions(raw: str) -> List[Dict[str, Any]]:
     每行格式：变量名 运算符 值（空格可选，与 SetVariable 的 gg=1 一样紧凑写也合法）
     支持运算符：==  !=  >  <  >=  <=
     空行、以 # 或 // 开头的整行视为注释，跳过。
+
+    ★ 支持【简写语法】：如果行首直接是运算符（>= 60 / == 42 等），自动补 __INPUTS__0 前缀。
+       这样用户把数据连到 in_0 端口后，条件里不用重复写 __INPUTS__0。
+
     返回：[{"label": str(该条件可读文本), "var": str, "op": str, "value": Any, "raw_line": str, "line_no": int, "error": str}]
     解析失败的行 error 非空。
     """
@@ -958,13 +1040,30 @@ def parse_varswitch_conditions(raw: str) -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
     if not raw or not isinstance(raw, str):
         return results
+
+    # ---- 预处理：简写语法（行首直接运算符 == 42 / >= 60）补 __INPUTS__0 前缀 ----
+    _op_prefix = re.compile(r'^\s*(==|!=|>=|<=|>|<)\s*(.+)')
+    _normalized_lines = []
+    if isinstance(raw, str):
+        for line in raw.split("\n"):
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or stripped.startswith("//"):
+                _normalized_lines.append(line)
+                continue
+            m = _op_prefix.match(line)
+            if m:
+                _normalized_lines.append(f"__INPUTS__0 {m.group(1)} {m.group(2)}")
+            else:
+                _normalized_lines.append(line)
+    raw_normalized = "\n".join(_normalized_lines)
+
     # 整行正则：^\s* (合法变量名) \s* (双字符运算符优先 == != >= <= | 单字符 > <) \s* (值) \s*$
     # 注意：运算符顺序必须双字符在前，否则 "==" 会被错拆成 "=" + "="
     line_re = re.compile(
         r'^\s*([A-Za-z_][A-Za-z0-9_]*)\s*(==|!=|>=|<=|>|<)\s*(.+?)\s*$',
         re.DOTALL,
     )
-    for idx, line in enumerate(raw.split("\n"), 1):
+    for idx, line in enumerate(raw_normalized.split("\n"), 1):
         ln = line.rstrip()
         s = ln.strip()
         if not s or s.startswith("#") or s.startswith("//"):
@@ -1103,7 +1202,7 @@ def _resolve_input_ports_default(node_type: str, params: Optional[Dict[str, Any]
     # -------- 动态端口节点的默认输入 --------
     if node_type == "VarSwitch":
         # 固定有一个执行输入 in_exec，后面跟 num_data_inputs 个 in_0 / in_1 ... 数据输入
-        n = max(0, min(20, int(params.get("num_data_inputs", 1) or 1)))
+        n = max(0, min(20, int(params.get("num_data_inputs", 1))))
         ins: List[Port] = [
             Port(name="in_exec", type=PortType.EXEC, direction=PortDirection.IN, label="▶"),
         ]
@@ -1113,7 +1212,7 @@ def _resolve_input_ports_default(node_type: str, params: Optional[Dict[str, Any]
         return ins
     if node_type == "SetVariable":
         # 固定有一个执行输入 in_exec，后面跟 num_data_inputs 个 in_0 / in_1 ... 数据输入
-        n = max(0, min(20, int(params.get("num_data_inputs", 0) or 0)))
+        n = max(0, min(20, int(params.get("num_data_inputs", 0))))
         ins: List[Port] = [
             Port(name="in_exec", type=PortType.EXEC, direction=PortDirection.IN, label="▶"),
         ]
