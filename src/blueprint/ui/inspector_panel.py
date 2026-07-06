@@ -3745,17 +3745,14 @@ class InspectorPanel(QWidget):
                 # 对 +/- 按钮容器，直接监听内部按钮的点击事件（不做连接，实际信号由 param_changed 触发 inspector 刷新）
                 continue
             if isinstance(w, QSpinBox):
-                try: w.valueChanged.disconnect()
+                try: w.valueChanged.connect(_refresh)
                 except Exception: pass
-                w.valueChanged.connect(_refresh)
             elif isinstance(w, QLineEdit):
-                try: w.textChanged.disconnect()
+                try: w.textChanged.connect(_refresh)
                 except Exception: pass
-                w.textChanged.connect(_refresh)
             elif isinstance(w, QPlainTextEdit):
-                try: w.textChanged.disconnect()
+                try: w.textChanged.connect(_refresh)
                 except Exception: pass
-                w.textChanged.connect(_refresh)
 
     # ---------------- 编辑器 ----------------
     def _clear_form(self):

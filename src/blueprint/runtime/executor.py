@@ -2438,7 +2438,7 @@ def execute_Sequence(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
         return {"out_done_path": None, "out_num_paths": num_paths}, ["else"], msg
 
     if mode == "complete":
-        # 完全求值模式：所有分支都必须成功才走 out_done，任一失败走 else
+        # 完全求值模式：所有分支都跑完，全部成功才走 out_done，任一失败走 else
         all_success = True
         last_reason = ""
         for path_i in range(1, num_paths + 1):
@@ -2456,8 +2456,9 @@ def execute_Sequence(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
             last_reason = reason
             if not success:
                 all_success = False
-                ctx.log(f"[Sequence] 路径#{path_i} 失败：{reason}，完全模式→else", "DEBUG")
-                break
+                ctx.log(f"[Sequence] 路径#{path_i} 失败：{reason}，完全模式继续跑剩余分支", "DEBUG")
+            else:
+                ctx.log(f"[Sequence] 路径#{path_i} 成功：{reason}，完全模式继续跑剩余分支", "DEBUG")
         if all_success and ctx.is_running:
             note = f"完全模式：全部 {num_paths} 条路径成功 → out_done"
             ctx.log(f"[Sequence] {node.id[:6]} {note}", "INFO")
@@ -2502,8 +2503,8 @@ def execute_Sequence(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
             annotate_step(ctx, node, "seq", note=f"✗OR全失败→else；{last_reason[:40]}")
             return {"out_done_path": None, "out_num_paths": num_paths}, ["else"], ""
     else:
-        # 短路模式：任一分支成功即完成
-        path_ok: Optional[int] = None
+        # 短路模式（AND短路）：任一分支失败即立即退出，全部成功才走 out_done
+        path_fail: Optional[int] = None
         last_reason = ""
         for path_i in range(1, num_paths + 1):
             if not ctx.is_running:
@@ -2514,24 +2515,25 @@ def execute_Sequence(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
                     wait_if_paused(ctx)
                     time.sleep(0.05)
             port_name = str(path_i)
-            ctx.log(f"[Sequence] {node.id[:6]} 尝试路径 #{path_i}/{num_paths}  (出口端口={port_name})", "DEBUG")
-            annotate_step(ctx, node, "seq", note=f"try #{path_i}/{num_paths} -> {port_name}")
+            ctx.log(f"[Sequence] {node.id[:6]} 短路(AND) 尝试路径 #{path_i}/{num_paths}  (出口端口={port_name})", "DEBUG")
+            annotate_step(ctx, node, "seq", note=f"短路AND #{path_i}/{num_paths} -> {port_name}")
             success, reason = _walk_branch_until_end(ctx, graph, runner, node.id, port_name)
             last_reason = reason
             if success:
-                path_ok = path_i
-                break
+                ctx.log(f"[Sequence] 短路(AND)：路径#{path_i} 成功，继续下一条。", "DEBUG")
             else:
-                ctx.log(f"[Sequence] 路径#{path_i} 失败：{reason}，继续尝试下一条。", "DEBUG")
-        if path_ok is not None:
-            note = f"短路成功：路径#{path_ok}/{num_paths} 命中 → out_done；原因：{last_reason}"
+                path_fail = path_i
+                ctx.log(f"[Sequence] 短路(AND)：路径#{path_i} 失败：{reason} → 立即退出→else", "DEBUG")
+                break
+        if path_fail is None:
+            note = f"短路(AND)成功：全部{num_paths}条路径通过 → out_done；末因：{last_reason}"
             ctx.log(f"[Sequence] {node.id[:6]} {note}", "INFO")
-            annotate_step(ctx, node, "seq", note=f"✓短路#{path_ok}→out_done")
-            return {"out_done_path": path_ok, "out_num_paths": num_paths}, ["out_done"], ""
+            annotate_step(ctx, node, "seq", note=f"✓短路AND全{num_paths}→out_done")
+            return {"out_done_path": num_paths, "out_num_paths": num_paths}, ["out_done"], ""
         else:
-            note = f"全部失败：{num_paths} 条路径无命中 → else；最后原因：{last_reason}"
+            note = f"短路(AND)：路径#{path_fail} 失败 → else；原因：{last_reason}"
             ctx.log(f"[Sequence] {node.id[:6]} {note}", "WARN")
-            annotate_step(ctx, node, "seq", note=f"✗全失败→else；末因：{last_reason[:40]}")
+            annotate_step(ctx, node, "seq", note=f"✗短路AND#{path_fail}→else；{last_reason[:40]}")
             return {"out_done_path": None, "out_num_paths": num_paths}, ["else"], ""
 
 
@@ -2657,7 +2659,7 @@ def execute_IfImageDetect(ctx: ExecutionContext, node: Node, inputs: Dict[str, A
     - 无 timeout（只查一次，与 FindImage 区分）
     - eval_mode:
       * complete（完全求值 AND）：全部命中 -> yes；缺任何一张 -> no；每张都测并输出分数，便于调试
-      * short_circuit（短路 AND）：从左到右检测，只要有一张不匹配就立刻返回 no
+      * short_circuit（短路 AND）：依次检测只要有一张不匹配就立刻返回 no
       * or_true（一真即真 OR）：只要有一张匹配就立刻返回 yes；全部不匹配才返回 no
     - images_json 每项：{path, b64}，优先用 runtime_attrs["_pil_images"] 缓存
     """

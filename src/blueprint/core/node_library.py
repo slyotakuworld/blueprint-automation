@@ -277,7 +277,7 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         type="Sequence",
         category=CATEGORY_LOGIC,
         title="顺序执行",
-        description="按顺序一条条试路径~短路和一真即真只要一条跑成功就收工走完成；完全模式得条条都成功才过；全败了就走失败口，每两条之间还能歇一会儿哟。",
+        description="按顺序一条条试路径~短路模式只要一条失败就立马退出走失败口；完全模式得条条都跑完才判；一真即真只要一条成功就收工走完成；每两条之间还能歇一会儿哟。",
         color="#57606A",
         accent="#58A6FF",
         inputs=[_exec_in()],
@@ -293,7 +293,7 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
                      options=["short_circuit", "complete", "or_true"],
                      option_labels={"short_circuit": "短路模式", "complete": "完全求值", "or_true": "一真即真"},
                      label="模式",
-                     help="短路模式(short_circuit)：任一分支走到成功语义出口(yes/success/out/found)即立即走 out_done 完成；失败语义出口(no/fail/timeout/not_found)则自动尝试下一条；全部失败走 else。\n完全模式(complete)：所有分支都必须走到成功语义出口才算通过，走 out_done；任一分支失败则走 else。\n一真即真(or_true)（逻辑或）：按顺序尝试各条分支，只要有任意一条分支返回成功语义就立即结束并走 out_done；全部失败才走 else。"),
+                     help="短路模式(short_circuit)（AND短路）：任一分支失败即立即退出走 else；全部成功才走 out_done。与完全模式的区别：完全模式会跑完所有分支再判定，短路模式遇到第一个失败就停。\n完全模式(complete)：所有分支都必须跑到成功语义出口才算通过，走 out_done；任一分支失败则走 else。\n一真即真(or_true)（逻辑或）：按顺序尝试各条分支，只要有任意一条分支返回成功语义就立即结束并走 out_done；全部失败才走 else。"),
             ParamDef(name="num_paths", editor=EDITOR_INT, default=3, label="路径数",
                      min=1, max=50, step=1, required=True,
                      help="分支路径数量（1~50）。建议用属性面板的 +/- 按钮调整，避免误操作"),
@@ -852,7 +852,7 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
                 },
                 label="求值模式",
                 help="完全求值=不管中间是否失败，都会检测所有参考图并在日志输出每张分数，便于调试；全部匹配才走yes。\n"
-                     "短路模式=从左到右依次检测（AND语义），只要有一张不匹配就立刻返回no，省时间。\n"
+                     "短路模式=依次检测（AND语义），只要有一张不匹配就立刻返回no，省时间。\n"
                      "一真即真(or_true)（逻辑或）= 只要有任意一张图匹配成功就立刻返回yes；全部都不匹配才走no。",
             ),
             ParamDef(
