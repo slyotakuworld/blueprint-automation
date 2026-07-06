@@ -4,7 +4,7 @@ import json
 import os
 import shutil
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .models import BlueprintGraph
 
@@ -275,6 +275,25 @@ class BlueprintStore:
                         node.runtime_attrs.update(ra)
                 except Exception:
                     pass
+
+            # ---- 加载完整性校验：同一 INPUT 端口如果有 2+ 根连线 → WARN ----
+            # 规则：每个节点的每个 INPUT 端口（data 或 exec）只允许一根上游线。
+            #      如果用户手动改 JSON 或老蓝图有脏数据，执行层只会取"遍历顺序的第一条"，其余全部静默丢弃。
+            #      这里显式打 WARN，让用户知道「看起来连了其实没生效」。
+            in_port_edge_counter: Dict[Tuple[str, str], List[str]] = {}
+            for eid, edge in g.edges.items():
+                key = (edge.to_node, edge.to_port)
+                in_port_edge_counter.setdefault(key, []).append(eid)
+            for (to_nid, to_port), eids in in_port_edge_counter.items():
+                if len(eids) > 1:
+                    target_node = g.nodes.get(to_nid)
+                    node_title = target_node.type if target_node else f"???"
+                    BlueprintStore._emit_log(
+                        f"[WARN] 端口冲突：「节点 {to_nid}({node_title}).{to_port}」连了 {len(eids)} 根输入线"
+                        f"（边ID: {', '.join(eids)}）。INPUT 端口只允许 1 根线，运行时只会保留"
+                        f"「{eids[0]}」生效，其余 {len(eids)-1} 根线会被静默忽略！请手动断开多余的线。",
+                        level="WARN",
+                    )
             return g
         except Exception as e:
             BlueprintStore._emit_log(f"[Error] BlueprintStore.load 异常: {e}", level="ERROR")

@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..core.models import BlueprintGraph, Edge, Node, PortDirection
-from ..core.node_library import create_node, NODE_LIBRARY
+from ..core.node_library import create_node, NODE_LIBRARY, NODE_TYPES_ORDERED
 from .graphics_items import EdgeItem, NodeItem, PortItem
 
 
@@ -310,6 +310,16 @@ class NodeScene(QGraphicsScene):
             self.node_selected.emit(node_id)
 
     # ---------------- 连线增删 ----------------
+    def _is_input_port_occupied(self, to_node_id: str, to_port_name: str) -> bool:
+        """检查某个节点的 INPUT 端口（按名）是否已经被占用（即已连过一根线进来）。
+        所有 INPUT 端口默认只允许一根输入线。"""
+        if self.graph is None:
+            return False
+        for e in self.graph.edges.values():
+            if e.to_node == to_node_id and e.to_port == to_port_name:
+                return True
+        return False
+
     def connect_ports(self, from_pi: PortItem, to_pi: PortItem) -> Optional[Edge]:
         if self.graph is None:
             return None
@@ -318,12 +328,26 @@ class NodeScene(QGraphicsScene):
             from_pi, to_pi = to_pi, from_pi
         if not from_pi.compatible_with(to_pi):
             return None
-        # 去重：同一对端口不要建两次
         fn, tn = from_pi.node_item().node.id, to_pi.node_item().node.id
         fp, tp = from_pi.port_name(), to_pi.port_name()
+        # 去重：同一对端口不要建两次
         for e in self.graph.edges.values():
             if e.from_node == fn and e.to_node == tn and e.from_port == fp and e.to_port == tp:
                 return None
+        # 关键约束：INPUT 端口只能连一根线（一对多不行，被占用就直接拒绝）
+        if to_pi.port.direction == PortDirection.IN and self._is_input_port_occupied(tn, tp):
+            # 如果用户就是要接这个已占用 input，可以让它先自动断开旧的再连新的？这里按用户要求不允许，直接拒绝。
+            # 底部日志面板提示一下用户
+            try:
+                from_node_title = getattr(from_pi.node_item(), "_title_label", None)
+                from_title = from_node_title.text() if from_node_title else from_pi.node_item().node.type
+                to_node_title = getattr(to_pi.node_item(), "_title_label", None)
+                to_title = to_node_title.text() if to_node_title else to_pi.node_item().node.type
+                msg = f"[连线被拒] 端口「{to_title}.{tp}」已连过一根输入线，每个INPUT端口只能接一根上游线。请先断开旧线，或改连其他空输入端口。"
+                print(msg)
+            except Exception:
+                pass
+            return None
         edge = Edge(
             id=uuid.uuid4().hex[:12],
             from_node=fn, from_port=fp,
@@ -501,17 +525,28 @@ class NodeScene(QGraphicsScene):
             # 检查悬停端口
             target_pi = self._find_port_at(pos, ignore_pi=from_p)
             target_ok = False
+            target_hint = ""
             if target_pi is not None and from_p.compatible_with(target_pi):
-                target_ok = True
+                # 先统一成 OUT->IN 方向，判断目标是否是 INPUT 端口
+                a, b = from_p, target_pi
+                if a.port.direction != PortDirection.OUT:
+                    a, b = b, a
+                # 关键：如果最终要接到的那个 INPUT 端口已经被占了，也判定为不兼容
+                if b.port.direction == PortDirection.IN:
+                    occupied = self._is_input_port_occupied(b.node_item().node.id, b.port_name())
+                    if occupied:
+                        target_ok = False
+                        target_hint = "（该输入端口已被占用，请先断开旧线）"
+                    else:
+                        target_ok = True
+                else:
+                    target_ok = True
             # 设置颜色：兼容绿/不兼容红/暗淡灰（连线中默认暗淡）
             if target_pi is None:
-                # 悬停空白：暗淡灰（连线中状态）
                 self._connecting_edge.set_base_color(QColor("#6E7681"))
             elif target_ok:
-                # 兼容端口：亮绿（可以连接）
                 self._connecting_edge.set_base_color(QColor("#3FB950"))
             else:
-                # 不兼容端口：红色（不能连接）
                 self._connecting_edge.set_base_color(QColor("#F85149"))
             # 方案B：无论 from_p 是输入还是输出端口，临时连线都从 from_p 出发画到鼠标位置
             if from_p.port.direction == PortDirection.OUT:
@@ -742,12 +777,13 @@ class NodeView(QGraphicsView):
         )
         self._cb_search_type = QComboBox()
         self._cb_search_type.setStyleSheet(combo_style)
-        self._cb_search_type.setToolTip("按节点类型过滤（全部=不过滤）")
+        self._cb_search_type.setToolTip("按节点类型过滤（全部=不过滤，顺序与左侧节点库一致）")
         self._cb_search_type.addItem("全部类型")
-        for ntype in sorted(NODE_LIBRARY.keys()):
+        for ntype in NODE_TYPES_ORDERED:
             meta = NODE_LIBRARY.get(ntype)
-            title = meta.title if meta else ntype
-            self._cb_search_type.addItem(title, ntype)
+            if not meta:
+                continue
+            self._cb_search_type.addItem(meta.title, ntype)
         self._cb_search_type.currentIndexChanged.connect(self._on_search_changed)
         bar.addWidget(self._cb_search_type)
 

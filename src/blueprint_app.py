@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QDockWidget,
     QFileDialog,
+    QFrame,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -119,6 +120,115 @@ class NoWheelComboBox(QComboBox):
         event.ignore()
 
 
+# ============================================================
+# 通知节点：主窗口右上角非阻塞 Toast 浮层
+#   - 完全不阻塞蓝图执行（QTimer.singleShot 到时自动销毁）
+#   - 支持堆叠：多张 toast 自动从上向下铺
+#   - INFO 蓝 / WARN 黄 / ERROR 红，三种配色 + 三种图标字符
+# ============================================================
+class _NotifyToastCard(QFrame):
+    """单张 Notify Toast，附着在主窗口上，position 由父窗口 _relayout_toasts 统一管理。"""
+
+    def __init__(
+        self,
+        parent: QMainWindow,
+        title: str,
+        body: str,
+        level: str,
+        duration_sec: float,
+        on_destroyed_cb,
+    ):
+        super().__init__(parent)
+        self._on_destroyed_cb = on_destroyed_cb
+        level = (level or "INFO").upper()
+        if level not in ("INFO", "WARN", "ERROR", "DEBUG"):
+            level = "INFO"
+        # ---- 配色 ----
+        if level == "ERROR":
+            bg, bd, ic, tx = "#3B1314", "#DA3633", "#F85149", "#FFE3E4"
+            icon_txt = "✕"
+        elif level == "WARN":
+            bg, bd, ic, tx = "#3B2A00", "#9A6700", "#F0B429", "#FFF3CD"
+            icon_txt = "!"
+        else:
+            bg, bd, ic, tx = "#0B3A5C", "#1F6FEB", "#58A6FF", "#D9ECFF"
+            icon_txt = "ℹ" if level == "INFO" else "ⓓ"
+
+        self.setObjectName("NotifyToast")
+        self.setWindowFlags(Qt.ToolTip | Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground, False)
+        self.setAttribute(Qt.WA_DeleteOnClose, True)
+
+        self.setStyleSheet(
+            f"QFrame#NotifyToast {{ background:{bg}; color:{tx};"
+            f"  border:1px solid {bd}; border-radius:8px; padding:10px; }}"
+            f"QLabel {{ background:transparent; color:{tx}; }}"
+            f"QToolButton {{ background:transparent; color:{ic}; border:none;"
+            f"  font-size:14px; font-weight:700; padding:0px 4px; }}"
+            f"QToolButton:hover {{ color:#FFFFFF; }}"
+        )
+        self.setMinimumWidth(300)
+        self.setMaximumWidth(420)
+
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(12, 10, 8, 10)
+        outer.setSpacing(10)
+
+        # 左侧图标（色块 + 字符）
+        icon_lbl = QLabel(icon_txt)
+        icon_lbl.setAlignment(Qt.AlignCenter)
+        icon_lbl.setStyleSheet(
+            f"QLabel {{ background:{ic}; color:#1C2128; border-radius:12px;"
+            f"  font-size:14px; font-weight:800; min-width:24px; min-height:24px; max-width:24px; max-height:24px; }}"
+        )
+        outer.addWidget(icon_lbl, 0, Qt.AlignTop)
+
+        # 中间：标题 + 内容
+        mid = QVBoxLayout()
+        mid.setSpacing(4)
+        title_s = title.strip() if isinstance(title, str) else ""
+        body_s = body.strip() if isinstance(body, str) else ""
+        if len(body_s) > 600:
+            body_s = body_s[:600] + "\n…（截断，完整内容看日志面板）"
+
+        if title_s:
+            t_lbl = QLabel(title_s)
+            tf = t_lbl.font()
+            tf.setBold(True)
+            tf.setPointSize(tf.pointSize() + 1 if tf.pointSize() > 0 else 10)
+            t_lbl.setFont(tf)
+            t_lbl.setWordWrap(True)
+            t_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            mid.addWidget(t_lbl)
+        if body_s:
+            b_lbl = QLabel(body_s)
+            b_lbl.setWordWrap(True)
+            b_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            mid.addWidget(b_lbl)
+        outer.addLayout(mid, 1)
+
+        # 右侧：手动关闭按钮
+        close_btn = QToolButton()
+        close_btn.setText("✕")
+        close_btn.setToolTip("关闭提示")
+        close_btn.setCursor(Qt.PointingHandCursor)
+        close_btn.clicked.connect(self.close)
+        outer.addWidget(close_btn, 0, Qt.AlignTop | Qt.AlignRight)
+
+        # 定时自动关闭
+        dur_ms = max(500, int(float(duration_sec or 3.0) * 1000))
+        QTimer.singleShot(dur_ms, self.close)
+
+    def closeEvent(self, e):
+        cb = self._on_destroyed_cb
+        super().closeEvent(e)
+        try:
+            if cb is not None:
+                cb(self)
+        except Exception:
+            pass
+
+
 class BlueprintMainWindow(QMainWindow):
     """蓝图编辑器主窗口：左节点面板 / 中画布 / 右Inspector / 底日志。"""
 
@@ -126,6 +236,7 @@ class BlueprintMainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("蓝图自动化工具")
         self.resize(1560, 920)
+        self._toasts: List[_NotifyToastCard] = []
         self._current_path: Optional[str] = None
         self._graph: Optional[BlueprintGraph] = None
         self._last_saved_graph_hash: Optional[str] = None  # 上一次保存/加载时的蓝图哈希，None=从未落盘
@@ -1535,27 +1646,21 @@ class BlueprintMainWindow(QMainWindow):
         node.params[param_name] = value
         ni = self._scene.node_item(node_id)
         if ni is not None:
-            # 动态端口节点（仅 Sequence，它端口数会变）：关键参数变化时，重建端口集
-            # 注意：VarSwitch 现在 has_dynamic_ports=False，yes/no 端口固定，不能进这里！
-            #       否则每次打字 set_node 会把正在发 textChanged 信号的 QPlainTextEdit 删掉，
-            #       导致 0xC0000005 ACCESS_VIOLATION 闪退。
+            # 动态端口节点：关键参数变化时，重建端口集（输入/输出都可能变）
+            # 注意：每次端口变化后，必须延迟刷新 inspector，退出当前信号栈再重建 UI，防止 sender 控件被中途删除导致 0xC0000005 ACCESS_VIOLATION
             try:
-                if node.type in ("Sequence",) and param_name in (
-                    "num_paths"
-                ):
+                need_refresh_ports = False
+                # ---- Sequence：num_paths 变 → 输出端口数变 ----
+                if node.type == "Sequence" and param_name == "num_paths":
                     from src.blueprint.core.node_library import _resolve_output_ports_default
                     p = dict(node.params or {})
                     new_out = _resolve_output_ports_default(node.type, p)
                     cur_out_names = [pp.name for pp in node.outputs]
                     new_out_names = [pp.name for pp in new_out]
                     if cur_out_names != new_out_names:
-                        # Sequence：端口增减前，先删除「被移除端口」上的关联边
-                        # 注意：Edge 的字段名是 from_node/from_port/to_node/to_port，不要写成 target_* 或 source_*
                         removed_out_set = set(cur_out_names) - set(new_out_names)
                         removed_in_set = set()
-                        # 目前只有输出端口会变（输入端口保持不变），输入兼容判断只是兜底
-                        new_in_names = [pp.name for pp in _resolve_output_ports_default
-                                        and []]  # placeholder，实际输入没变化
+                        new_in_names = []
                         if removed_out_set or removed_in_set:
                             edges_to_remove = []
                             for edge in list(self._graph.edges.values()):
@@ -1566,28 +1671,53 @@ class BlueprintMainWindow(QMainWindow):
                                 if self._scene is not None:
                                     self._scene.remove_edge(eid, _emit_will=False)
                         node.outputs = list(new_out)
-                        # 重建 PortItem（会全删旧的、新建同名的）
-                        ni.sync_from_node()
-                        # 重建后：所有关联的 EdgeItem 的 _from_port/_to_port 还指向旧的已删除 PortItem
-                        # 必须按端口名重新挂到新 PortItem，并刷新路径，否则看起来就像"保留连线反而断了找不到端口"
-                        if self._scene is not None:
-                            self._scene.reconnect_node_edges(node_id)
-                        # 端口变了 → 延迟刷新 inspector（必须退出当前信号栈再重建 UI，防止 sender 控件被中途删除闪退）
-                        if (
-                            getattr(self, "_inspector", None) is not None
-                            and self._inspector._current_node is not None
-                            and self._inspector._current_node.id == node.id
-                        ):
-                            nid_refresh = node.id
-                            def _deferred_setnode(nid=nid_refresh):
-                                try:
-                                    if self._graph and nid in self._graph.nodes and \
-                                       self._inspector._current_node and \
-                                       self._inspector._current_node.id == nid:
-                                        self._inspector.set_node(self._graph.nodes[nid])
-                                except Exception as e:
-                                    print(f"[WARN] _deferred_setnode 异常: {e}")
-                            QTimer.singleShot(0, _deferred_setnode)
+                        need_refresh_ports = True
+                # ---- VarSwitch / SetVariable：num_data_inputs 变 → 输入端口数变 ----
+                if node.type in ("VarSwitch", "SetVariable") and param_name == "num_data_inputs":
+                    from src.blueprint.core.node_library import _resolve_input_ports_default
+                    p = dict(node.params or {})
+                    new_in = _resolve_input_ports_default(node.type, p)
+                    cur_in_names = [pp.name for pp in node.inputs]
+                    new_in_names = [pp.name for pp in new_in]
+                    if cur_in_names != new_in_names:
+                        # 清理被移除输入端口上的关联连线
+                        removed_in_set = set(cur_in_names) - set(new_in_names)
+                        removed_out_set = set()
+                        if removed_in_set or removed_out_set:
+                            edges_to_remove = []
+                            for edge in list(self._graph.edges.values()):
+                                if (edge.to_node == node_id and edge.to_port in removed_in_set) or \
+                                   (edge.from_node == node_id and edge.from_port in removed_out_set):
+                                    edges_to_remove.append(edge.id)
+                            for eid in edges_to_remove:
+                                if self._scene is not None:
+                                    self._scene.remove_edge(eid, _emit_will=False)
+                        node.inputs = list(new_in)
+                        need_refresh_ports = True
+
+                if need_refresh_ports:
+                    # 重建 PortItem（会全删旧的、新建同名的）
+                    ni.sync_from_node()
+                    # 重建后：所有关联的 EdgeItem 的 _from_port/_to_port 还指向旧的已删除 PortItem
+                    # 必须按端口名重新挂到新 PortItem，并刷新路径，否则看起来就像"保留连线反而断了找不到端口"
+                    if self._scene is not None:
+                        self._scene.reconnect_node_edges(node_id)
+                    # 端口变了 → 延迟刷新 inspector（必须退出当前信号栈再重建 UI，防止 sender 控件被中途删除闪退）
+                    if (
+                        getattr(self, "_inspector", None) is not None
+                        and self._inspector._current_node is not None
+                        and self._inspector._current_node.id == node.id
+                    ):
+                        nid_refresh = node.id
+                        def _deferred_setnode(nid=nid_refresh):
+                            try:
+                                if self._graph and nid in self._graph.nodes and \
+                                   self._inspector._current_node and \
+                                   self._inspector._current_node.id == nid:
+                                    self._inspector.set_node(self._graph.nodes[nid])
+                            except Exception as e:
+                                print(f"[WARN] _deferred_setnode 异常: {e}")
+                        QTimer.singleShot(0, _deferred_setnode)
             except Exception as e:
                 print(f"[WARN] _on_param_changed 端口刷新异常: {e}")
                 import traceback; traceback.print_exc()
@@ -2052,6 +2182,7 @@ class BlueprintMainWindow(QMainWindow):
         runner.finished.connect(lambda: self._on_runner_ended())
         self._runner = runner
         runner.pause_changed.connect(self._apply_pause_state_to_ui)
+        runner.notify_toast.connect(self._show_notify_toast, Qt.QueuedConnection)
         self._scene.clear_running()
         self._act_run.setEnabled(False)
         self._act_pause.setEnabled(True)
@@ -2137,6 +2268,89 @@ class BlueprintMainWindow(QMainWindow):
                                 )
                 except Exception:
                     pass
+        except Exception:
+            pass
+
+    # ================ 通知节点 Toast 浮层 ================
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        try:
+            self._relayout_toasts()
+        except Exception:
+            pass
+
+    def _relayout_toasts(self):
+        """把所有活跃 toast 堆在主窗口右上角，从上往下依次排。"""
+        toasts = getattr(self, "_toasts", None)
+        if not toasts:
+            return
+        try:
+            geo = self.geometry()
+            margin_x = 20
+            margin_y = 24
+            spacing = 10
+            # 从窗口右上角向下铺
+            cur_y = geo.y() + margin_y + self.frameGeometry().height() - self.geometry().height() + 16
+            # 更简单：用 self.rect() 映射到全局坐标
+            top_right_local = self.rect().topRight()
+            global_pt = self.mapToGlobal(top_right_local)
+            base_x = global_pt.x() - margin_x
+            base_y = global_pt.y() + margin_y
+            cur_y = base_y
+            for t in list(toasts):
+                try:
+                    if not t.isVisible():
+                        continue
+                    # 先调大小，让 layout 把高度算出来
+                    t.adjustSize()
+                    if t.width() < 320:
+                        t.resize(320, t.height())
+                    w = t.width()
+                    h = t.height()
+                    t.move(base_x - w, cur_y)
+                    cur_y += h + spacing
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    def _show_notify_toast(self, title: str, body: str, level: str, duration_sec: float):
+        """接收 BlueprintRunner 的 notify_toast Signal → 在主窗口右上角弹非阻塞浮层。
+        即使蓝图在后台跑 / 用户切到别的窗口，只要主窗口没最小化，也能看得到提示。"""
+        try:
+            card = _NotifyToastCard(
+                self,
+                title or "",
+                body or "",
+                level or "INFO",
+                duration_sec if duration_sec and duration_sec > 0 else 3.0,
+                on_destroyed_cb=self._on_toast_destroyed,
+            )
+            self._toasts.append(card)
+            card.show()
+            # 下一帧重新布局（等 show 完窗口大小才稳定）
+            QTimer.singleShot(0, self._relayout_toasts)
+            # 也在日志面板打一行，让最小化窗口时仍可在日志里看到
+            try:
+                lv = (level or "INFO").upper()
+                safe_body = (body or "")
+                if len(safe_body) > 120:
+                    safe_body = safe_body[:120] + "…"
+                self._log.append_log(f"[通知][{lv}] {title or ''} {safe_body}", lv if lv in ("INFO","WARN","ERROR","DEBUG","SUCCESS") else "INFO")
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _on_toast_destroyed(self, card):
+        try:
+            ts = getattr(self, "_toasts", None)
+            if ts is not None and card in ts:
+                ts.remove(card)
+        except Exception:
+            pass
+        try:
+            self._relayout_toasts()
         except Exception:
             pass
 

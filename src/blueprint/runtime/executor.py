@@ -142,19 +142,28 @@ def _apply_target_hwnd(ctx: ExecutionContext, hwnd, res_w=1920, res_h=1080):
 def _resolve_data_inputs(graph: BlueprintGraph, ctx: ExecutionContext, node: Node) -> Dict[str, Any]:
     """
     解析节点所有 DATA 输入端口的值：
-      - 若端口被连线：取上游 last_outputs
+      - 若端口被连线：取上游 last_outputs（注意：同一INPUT端口多根线只会取遍历顺序第一条，其余静默忽略并打WARN）
       - 否则：取 node.params 同名值
     """
     resolved: Dict[str, Any] = {}
     for p in node.inputs:
         if p.type != PortType.DATA:
             continue
-        found_edge = None
+        # 收集所有指向该输入端口的边（如果>=2条，说明有冲突）
+        all_edges: List[Any] = []
         for e in graph.edges.values():
             if e.to_node == node.id and e.to_port == p.name:
-                found_edge = e
-                break
-        if found_edge:
+                all_edges.append(e)
+        if all_edges:
+            if len(all_edges) > 1:
+                ctx.log(
+                    f"[WARN] 输入端口「{node.type}.{p.name}」连了 {len(all_edges)} 根线！"
+                    f"INPUT 端口只允许一根线，运行时只会保留边「{all_edges[0].id}」生效，"
+                    f"其余 {len(all_edges)-1} 根（{', '.join(e.id for e in all_edges[1:])}）会被静默丢弃。"
+                    f"请手动断开多余的线。",
+                    "WARN",
+                )
+            found_edge = all_edges[0]
             upstream = ctx.last_outputs.get(found_edge.from_node, {})
             resolved[p.name] = upstream.get(found_edge.from_port)
         else:
@@ -1268,9 +1277,38 @@ def execute_Clipboard(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any])
         return {"out_text": ""}, ["err"], str(e)
 
 
+def _decode_cmd_output(data: bytes) -> str:
+    """安全解码子进程输出：按 UTF-8 → GBK → UTF-8(replace) 顺序 fallback，避免 UnicodeDecodeError"""
+    if data is None:
+        return ""
+    if isinstance(data, str):
+        return data
+    if not isinstance(data, (bytes, bytearray)):
+        try:
+            return str(data)
+        except Exception:
+            return ""
+    raw = bytes(data)
+    if len(raw) == 0:
+        return ""
+    for enc in ("utf-8", "gbk"):
+        try:
+            return raw.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    try:
+        return raw.decode("utf-8", errors="replace")
+    except Exception:
+        try:
+            return raw.decode("gbk", errors="replace")
+        except Exception:
+            return ""
+
+
 def execute_Command(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
     """执行shell命令/外部程序"""
     import subprocess
+    import shlex
 
     params = dict(node.params or {})
     cmd_template = str(params.get("command", "") or "")
@@ -1296,12 +1334,17 @@ def execute_Command(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
         # 解析 shell 模式
         if shell_mode == "no_shell":
             use_shell = False
-            args = command
+            # no_shell 下 args 必须是 list（程序+参数），不能是 str，
+            # 否则整个字符串会被当作可执行文件名导致 FileNotFoundError
+            try:
+                args = shlex.split(command, posix=(os.name != "nt"))
+            except Exception:
+                # shlex 解析失败时 fallback 到空白字符拆分
+                args = command.split()
         elif shell_mode == "powershell":
-            use_shell = True
+            use_shell = False
             # 包装成 powershell -Command
             args = ["powershell", "-NoProfile", "-Command", command]
-            use_shell = False
         else:  # cmd_c 默认
             use_shell = False
             args = ["cmd", "/c", command]
@@ -1325,18 +1368,19 @@ def execute_Command(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
                 return {"stdout": "", "stderr": str(e), "exit_code": -1}, ["err"], str(e)
 
         # 捕获模式：等待执行完
+        # 注意：不用 text=True，改用 bytes 捕获后手动解码，避免后台线程抛 UnicodeDecodeError
         timeout_s = (timeout_ms / 1000.0) if timeout_ms > 0 else None
         try:
             result = subprocess.run(
                 args, shell=use_shell, cwd=cwd,
-                capture_output=True, text=True, timeout=timeout_s,
+                capture_output=True, timeout=timeout_s,
             )
-            stdout_val = result.stdout or ""
-            stderr_val = result.stderr or ""
+            stdout_val = _decode_cmd_output(result.stdout)
+            stderr_val = _decode_cmd_output(result.stderr)
             exit_code = int(result.returncode)
         except subprocess.TimeoutExpired as te:
-            stdout_val = te.stdout or "" if isinstance(te.stdout, str) else ""
-            stderr_val = f"(TIMEOUT after {timeout_ms}ms) " + (te.stderr or "" if isinstance(te.stderr, str) else "")
+            stdout_val = _decode_cmd_output(te.stdout)
+            stderr_val = f"(TIMEOUT after {timeout_ms}ms) " + _decode_cmd_output(te.stderr)
             exit_code = -999
             ctx.log(f"[Command] 超时 {timeout_ms}ms cmd={command[:60]}", "ERROR")
             annotate_step(ctx, node, "cmd_timeout", note=f"timeout {timeout_ms}ms")
@@ -1577,10 +1621,48 @@ def execute_HttpRequest(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any
 
 
 # ---------------- 变量节点 ----------------
+def _collect_inputs_array(inputs: Optional[Dict[str, Any]]) -> List[Any]:
+    """从 inputs 字典里收集所有 `in_数字` 命名的 DATA 端口值，按数字排序返回列表（双存策略用）。
+    兼容老蓝图命名：如果有旧名 `in_left` 也把它塞在 inputs_list[0]（仅当 in_0 不存在时）。"""
+    if not inputs:
+        return []
+    import re as _re
+    _num_re = _re.compile(r"^in_(\d+)$")
+    indexed: Dict[int, Any] = {}
+    max_idx = -1
+    for k, v in inputs.items():
+        m = _num_re.match(k)
+        if m:
+            idx = int(m.group(1))
+            indexed[idx] = v
+            if idx > max_idx:
+                max_idx = idx
+    if max_idx < 0:
+        # 没找到任何 in_N → 兼容老的 in_left 端口名（VarSwitch 旧蓝图用）
+        if "in_left" in inputs:
+            return [inputs["in_left"]]
+        return []
+    # 按 0..max_idx 顺序填充（中间缺的填 None 保持索引正确）
+    return [indexed.get(i) for i in range(max_idx + 1)]
+
+
+def _inject_inputs_temp_vars(engine, inputs_list: List[Any]):
+    """注入临时变量：__INPUTS__（完整数组） + __INPUTS__0 / __INPUTS__1 ...（按索引单值）。
+    只保留统一通用名，不再用别名前缀（__VS_LEFT__ / __SET_IN__）降低理解成本。"""
+    inputs_list = list(inputs_list or [])
+    engine.set("__INPUTS__", list(inputs_list))
+    for i, v in enumerate(inputs_list):
+        engine.set(f"__INPUTS__{i}", v)
+
+
 def execute_SetVariable(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
     from src.blueprint.core.variable_engine import parse_batch_var_lines, VariableEngine
 
+    # ① 先注入多端口临时变量（batch_text 里写 {__INPUTS__0} / {__INPUTS__1} 即可引用）
     engine = getattr(ctx, "var_engine", None) or VariableEngine(ctx.variables)
+    inputs_list = _collect_inputs_array(inputs)
+    _inject_inputs_temp_vars(engine, inputs_list)
+
     set_count = 0
     first_err = ""
     note_parts: list = []
@@ -1603,14 +1685,18 @@ def execute_SetVariable(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any
             if len(note_parts) < 6:
                 note_parts.append(f"{k}={repr(final_val)[:40]}")
 
-    if not set_count and not batch_raw.strip():
-        first_err = first_err or "SetVariable 未设置任何变量：batch_text 为空"
+    if not set_count and not batch_raw.strip() and not inputs_list:
+        first_err = first_err or "SetVariable 未设置任何变量：batch_text 为空且没有连数据输入端口"
 
     if set_count:
         note = "SetVar(" + str(set_count) + ") " + "; ".join(note_parts)
+        if inputs_list:
+            note += f" [端口={len(inputs_list)} 个]"
         ctx.log(f"[Var] {note}", "DEBUG")
     else:
         note = "SetVar(0)"
+        if inputs_list:
+            note += f" [端口={len(inputs_list)} 个]"
         ctx.log(f"[Var] {note} {first_err}".rstrip(), "WARN" if first_err else "DEBUG")
     annotate_step(ctx, node, "var", note=note)
     return {}, ["out_exec"], first_err or ""
@@ -1734,10 +1820,41 @@ def _varswitch_eval_condition(cond: Dict[str, Any], engine) -> Tuple[bool, str]:
 def execute_VarSwitch(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
     from src.blueprint.core.variable_engine import VariableEngine
     from src.blueprint.core.node_library import parse_varswitch_conditions
+    import re as _re
 
+    # ① 先收集多端口输入 + 注入临时变量（统一通用名 __INPUTS__N）
     engine = getattr(ctx, "var_engine", None) or VariableEngine(ctx.variables)
+    inputs_list = _collect_inputs_array(inputs)
+    _inject_inputs_temp_vars(engine, inputs_list)
+    in_left_val = inputs_list[0] if inputs_list else None
+
     raw = node.params.get("cases", "") or ""
-    conditions = parse_varswitch_conditions(raw if isinstance(raw, str) else "")
+
+    # ---- 预处理：简写语法（行首直接运算符 >= 60）补 __INPUTS__0 前缀 ----
+    _op_prefix = _re.compile(r'^\s*(==|!=|>=|<=|>|<)\s*(.+)')
+    processed_lines = []
+    shorthand_count = 0
+    if isinstance(raw, str):
+        for line in raw.split("\n"):
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or stripped.startswith("//"):
+                processed_lines.append(line)
+                continue
+            m = _op_prefix.match(line)
+            if m:
+                shorthand_count += 1
+                processed_lines.append(f"__INPUTS__0 {m.group(1)} {m.group(2)}")
+            else:
+                processed_lines.append(line)
+    processed_raw = "\n".join(processed_lines)
+
+    if shorthand_count and (in_left_val is None and not inputs_list):
+        ctx.log(
+            f"[VarSwitch] {shorthand_count} 条简写条件需要连线 in_0 端口提供左值（当前未连线，简写条件将视为 '__INPUTS__0'=None 比较）",
+            "WARN",
+        )
+
+    conditions = parse_varswitch_conditions(processed_raw if isinstance(processed_raw, str) else "")
     valid_conditions = [c for c in conditions if not c.get("error")]
     notes = []
     all_true = True
@@ -1749,11 +1866,10 @@ def execute_VarSwitch(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any])
     if valid_conditions:
         port = "yes" if all_true else "no"
     else:
-        # 没有任何条件，兜底走 no
         port = "no"
-    note = f"VarSwitch → {port}  ({'; '.join(notes[:3])}{' …' if len(notes) > 3 else ''})"
+    note = f"VarSwitch → {port} ({len(inputs_list)}入; {'; '.join(notes[:3])}{' …' if len(notes) > 3 else ''})"
     ctx.log(f"[VarSwitch] {note}", "DEBUG")
-    annotate_step(ctx, node, "condition", note=f"→ {port} ({len(valid_conditions)} 条件 AND)")
+    annotate_step(ctx, node, "condition", note=f"→ {port} ({len(valid_conditions)} 条件 AND, {len(inputs_list)} 输入)")
     return {}, [port], ""
 
 
@@ -1893,8 +2009,20 @@ def execute_Notify(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
 
     engine = getattr(ctx, "var_engine", None) or VariableEngine(ctx.variables)
 
-    title_raw = str(node.params.get("title", "") or "")
-    msg_raw = str(node.params.get("message", "") or "")
+    # --- 端口优先：in_title / in_message 非空则用连线值，否则回落 params ---
+    def _take(key_in, fallback):
+        v = inputs.get(key_in) if inputs else None
+        if v is None:
+            return fallback
+        if isinstance(v, str) and v == "":
+            return fallback
+        return v
+
+    title_raw = _take("in_title", str(node.params.get("title", "") or ""))
+    msg_raw = _take("in_message", str(node.params.get("message", "") or ""))
+    title_raw = str(title_raw) if not isinstance(title_raw, str) else title_raw
+    msg_raw = str(msg_raw) if not isinstance(msg_raw, str) else msg_raw
+
     level_raw = str(node.params.get("level", "INFO") or "INFO").upper()
     show_popup = bool(node.params.get("show_popup", False))
     play_sound = bool(node.params.get("play_sound", False))
@@ -1950,6 +2078,21 @@ def execute_Notify(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
             _win32_popup(str(title_final), str(msg_final), level_final)
         except Exception as e:
             ctx.log(f"[Notify] 弹窗失败: {e}", "WARN")
+
+    # 应用内非阻塞 Toast（不管 show_popup 是否勾选都会发）：
+    #   关掉系统弹窗时，用户仍能在主窗口右上角看到浮动提示，避免完全无提示
+    #   开了系统弹窗时也发，双保险
+    try:
+        runner_ref = getattr(ctx, "_runner_ref", None)
+        if runner_ref is not None and hasattr(runner_ref, "notify_toast"):
+            runner_ref.notify_toast.emit(
+                str(title_final),
+                str(msg_final),
+                str(level_final),
+                float(duration_sec),
+            )
+    except Exception:
+        pass
 
     note = f"Notify {level_final} {duration_sec:g}s: {str(title_final)[:50]}"
     annotate_step(ctx, node, "notify", note=note)
@@ -2540,6 +2683,9 @@ class BlueprintRunner(QThread):
     finished_err = Signal(str)
     progress_step = Signal(int, str)
     pause_changed = Signal(bool)
+    # 通知节点：非阻塞式应用内 Toast 提示（title, body, level, duration_sec）
+    # 即使 show_popup=False（系统弹窗关了）也会发，保证关掉系统弹窗时用户至少能看到主窗口的浮动提示
+    notify_toast = Signal(str, str, str, float)
     # 当前执行节点变更（每次进入一个新节点前发射，参数: node_id, node_type）
     #  供搜索栏「📍下一断点/定位执行点」按钮标签实时显示 📍执行中: TypeX id=xx
     #  以及命中断点/暂停后快速跳画布

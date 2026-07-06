@@ -102,10 +102,13 @@ class Node:
         }
         if self.comment:
             out["comment"] = self.comment
-        # 3. 动态端口：只有 has_dynamic_ports=True 的节点额外写 outputs（inputs静态从不写）
+        # 3. 动态端口：has_dynamic_ports=True 的节点额外写 inputs/outputs（完整数组（保留用户自定义的 in_N 端口）
         has_dynamic = bool(meta is not None and getattr(meta, "has_dynamic_ports", False))
-        if has_dynamic and self.outputs:
-            out["outputs"] = [p.to_dict() for p in self.outputs]
+        if has_dynamic:
+            if self.inputs:
+                out["inputs"] = [p.to_dict() for p in self.inputs]
+            if self.outputs:
+                out["outputs"] = [p.to_dict() for p in self.outputs]
         return out
 
     @staticmethod
@@ -144,7 +147,12 @@ class Node:
         if "inputs" in d and isinstance(d["inputs"], list):
             inputs = [Port.from_dict(p) for p in d["inputs"]]
         elif meta is not None:
-            inputs = [Port(**p.__dict__) for p in meta.inputs]
+            from .node_library import _resolve_input_ports_default
+            try:
+                defaults = _resolve_input_ports_default(ba_type, params)
+                inputs = [Port(**p.__dict__) for p in defaults]
+            except Exception:
+                inputs = [Port(**p.__dict__) for p in meta.inputs]
         else:
             inputs = []
         if "outputs" in d and isinstance(d["outputs"], list):

@@ -245,6 +245,7 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         accent="#F78166",
         inputs=[
             _exec_in(),
+            _data_in("in_0", "any", label="#1 输入"),
         ],
         outputs=[
             _exec_out("yes", label="满足"),
@@ -252,16 +253,25 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         ],
         params=[
             ParamDef(
+                name="num_data_inputs",
+                editor=EDITOR_INT,
+                default=1,
+                min=0,
+                max=20,
+                label="数据输入端口数",
+                help="动态增减数据输入端口（+/- 按钮调整），每个端口对应一个输入值。\n临时变量名（所有节点统一写法，就这一种）：\n- 完整数组：__INPUTS__（list类型，可写 {__INPUTS__[0]} 索引）\n- 按索引单值：__INPUTS__0（第1个端口）、__INPUTS__1（第2个）、...、__INPUTS__19\n简写语法示例（行首直接写运算符，左值自动=__INPUTS__0）：\n  == 1             → __INPUTS__0 == 1\n  == {id}          → __INPUTS__0 == 变量 id\n  >= {min_score}   → __INPUTS__0 >= 及格线"
+            ),
+            ParamDef(
                 name="cases",
                 editor=EDITOR_MULTILINE,
                 default="",
                 label="批量设置",
-                placeholder="hp >= 30\nhp <= 100\nscore >= 60\ngender != \"female\"\nlevel > {min_level}",
-                help='每行写一个条件：变量名 运算符 值（全部 AND 逻辑，同时满足才走 yes）\n运算符：== 等于、!= 不等于、> 大于、< 小于、>= 大于等于、<= 小于等于\n值：字符串需加引号 "abc" 或 \'abc\'；数字直接写；布尔写 true/false；支持 {变量} 插值\n空行 和 // 或 # 开头的行 作为注释忽略'
+                placeholder="hp >= 30\nhp <= 100\nscore >= 60\ngender != \"female\"\nlevel > {min_level}\n# ↓ 多端口用法：__INPUTS__0=第1个、__INPUTS__1=第2个端口值\n== 1\n== {id}\n>= {min_score}\n# 复杂表达式：\n__INPUTS__0 >= {min_score} AND __INPUTS__1 != {exclude_status}",
+                help='每行写一个条件（全部 AND 逻辑，同时满足才走 yes）\n\n两种写法，推荐简写：\n① 完整写法：「变量名 运算符 值」例：score >= 60、level > {min_level}\n   多输入端口引用就这一种：__INPUTS__0=第1个、__INPUTS__1=第2个、...\n② 【简写语法】（连了第1个输入端口时用）：行首直接写运算符，省掉左变量名\n   左值自动 = __INPUTS__0（想主动写表达式时直接写这个名）\n   例：\n     == 1              → 意思：第1个输入 == 数字 1\n     == {id}           → 意思：第1个输入 == 变量 id\n     != {exclude}      → 意思：第1个输入 != 变量 exclude\n     >= {min_score}    → 意思：第1个输入 >= 变量 min_score\n\n运算符：== 等于、!= 不等于、> 大于、< 小于、>= 大于等于、<= 小于等于\n值：字符串加引号 "abc" 或 \'abc\'；数字直接写；布尔写 true/false；支持 {变量} / ${变量} / {= expr} 插值\n空行 和 // 或 # 开头的行 作为注释忽略'
             ),
         ],
         type_short_name="var_switch",
-        has_dynamic_ports=False,
+        has_dynamic_ports=True,
     ),
     "Sequence": NodeMeta(
         type="Sequence",
@@ -544,10 +554,21 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         ],
         outputs=[_exec_out()],
         params=[
+            ParamDef(
+                name="num_data_inputs",
+                editor=EDITOR_INT,
+                default=0,
+                min=0,
+                max=20,
+                label="数据输入端口数",
+                help="动态增减数据输入端口（+/- 按钮调整），每个端口对应一个输入值。\n临时变量名（所有节点统一写法，就这一种）：\n- 完整数组：__INPUTS__（list类型，可写 {__INPUTS__[0]} 索引）\n- 按索引单值：__INPUTS__0（第1个端口）、__INPUTS__1（第2个）、...、__INPUTS__19\n用法示例（写在下方「批量设置」里）：\n  cmd_out   = {__INPUTS__0}     # 第1个端口接的 Command stdout 存 cmd_out\n  clip_text = {__INPUTS__1}     # 第2个端口接的 Clipboard 存 clip_text\n  total     = {= {__INPUTS__0} + {__INPUTS__1}}"
+            ),
             ParamDef(name="batch_text", editor=EDITOR_MULTILINE, default="", label="批量设置",
-                     help="每行 name=value。value 支持 {var}/${var}/{= expr} 插值。\n示例：\nuser = Alice\nport = 8080\nresult = {= {port} * 2}"),
+                     placeholder="# 用法1：字面量\nuser = Alice\nport = 8080\n\n# 用法2：多输入端口数组（先在上方加端口数 N，再连 N 条线）\ncmd_out   = {__INPUTS__0}\nclip_text = {__INPUTS__1}\ntotal     = {= {__INPUTS__0} + {__INPUTS__1}}",
+                     help="每行 name=value。value 支持 {var}/${var}/{= expr} 插值。\n【多输入端口用法】\n- 先调整上方「数据输入端口数」加需要的 N 个端口，连线到上游节点\n- 每个端口按顺序存为临时变量，就这一种写法：\n  __INPUTS__0（第1个端口）、__INPUTS__1（第2个端口）、__INPUTS__2 ...\n- 示例：\n  cmd_out   = {__INPUTS__0}      # 把第1个端口接的 Command stdout 存成变量 cmd_out\n  clip_text = {__INPUTS__1}      # 把第2个端口接的 Clipboard 存成 clip_text\n  total     = {= {__INPUTS__0} + {__INPUTS__1}}\n- 也可以直接在表达式里写：{= {__INPUTS__2} * 2}"),
         ],
         type_short_name="set_var",
+        has_dynamic_ports=True,
     ),
     # ---------------- 通知 ----------------
     "Notify": NodeMeta(
@@ -557,13 +578,17 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         description="想提醒点啥就用咱~要么写在日志里，要么弹系统小窗口，还能放提示音，内容里塞变量也没问题哟。",
         color="#0B3A5C",
         accent="#58A6FF",
-        inputs=[_exec_in()],
+        inputs=[
+            _exec_in(),
+            _data_in("in_title", "any", label="标题(连线优先)"),
+            _data_in("in_message", "any", label="内容(连线优先)"),
+        ],
         outputs=[_exec_out()],
         params=[
             ParamDef(name="title", editor=EDITOR_STRING, default="通知", label="标题",
-                     help="通知标题，支持 {var} 插值"),
+                     help="通知标题。【优先级】若 in_title 连线非空则优先用连线值，否则用本参数。支持 {var} 插值"),
             ParamDef(name="message", editor=EDITOR_MULTILINE, default="", label="内容",
-                     help="通知正文，支持 {var}/${var}/{= expr} 插值；{ALL_VARS} 展开所有变量"),
+                     help="通知正文。【优先级】若 in_message 连线非空则优先用连线值，否则用本参数。支持 {var}/${var}/{= expr} 插值；{ALL_VARS} 展开所有变量"),
             ParamDef(
                 name="level",
                 editor=EDITOR_ENUM,
@@ -576,7 +601,8 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
                      min=0.5, max=3600.0, step=0.5,
                      help="系统弹窗/通知显示持续时间（秒）"),
             ParamDef(name="show_popup", editor=EDITOR_BOOL, default=False, label="系统弹窗",
-                     help="勾选后弹出系统原生弹窗（阻塞），否则只写日志"),
+                     help="勾选后额外弹出系统原生阻塞弹窗（用于打断用户注意，会阻塞蓝图直到关闭）；\n"
+                          "不勾选时（默认）：右上角主窗口弹非阻塞浮动Toast + 日志面板记录（不卡蓝图执行，推荐）"),
             ParamDef(name="play_sound", editor=EDITOR_BOOL, default=False, label="提示音",
                      help="勾选后播放系统提示音"),
         ],
@@ -1065,6 +1091,45 @@ def _resolve_output_ports_default(node_type: str, params: Optional[Dict[str, Any
     return list(meta.outputs)
 
 
+def _resolve_input_ports_default(node_type: str, params: Optional[Dict[str, Any]] = None) -> List[Port]:
+    """返回给定节点类型的默认输入端口列表（动态端口节点按参数生成 in_N 数据输入端口）。
+
+    供 Node.from_dict / create_node 自动生成端口，以及参数变化时重建端口集。
+    """
+    meta = NODE_LIBRARY.get(node_type)
+    if meta is None:
+        return []
+    params = params or {}
+    # -------- 动态端口节点的默认输入 --------
+    if node_type == "VarSwitch":
+        # 固定有一个执行输入 in_exec，后面跟 num_data_inputs 个 in_0 / in_1 ... 数据输入
+        n = max(0, min(20, int(params.get("num_data_inputs", 1) or 1)))
+        ins: List[Port] = [
+            Port(name="in_exec", type=PortType.EXEC, direction=PortDirection.IN, label="▶"),
+        ]
+        for i in range(n):
+            ins.append(Port(name=f"in_{i}", type=PortType.DATA, direction=PortDirection.IN,
+                            data_type="any", label=f"#{i+1} 输入"))
+        return ins
+    if node_type == "SetVariable":
+        # 固定有一个执行输入 in_exec，后面跟 num_data_inputs 个 in_0 / in_1 ... 数据输入
+        n = max(0, min(20, int(params.get("num_data_inputs", 0) or 0)))
+        ins: List[Port] = [
+            Port(name="in_exec", type=PortType.EXEC, direction=PortDirection.IN, label="▶"),
+        ]
+        for i in range(n):
+            ins.append(Port(name=f"in_{i}", type=PortType.DATA, direction=PortDirection.IN,
+                            data_type="any", label=f"#{i+1} 输入"))
+        return ins
+    if node_type == "Sequence":
+        # Sequence 输入固定，只有 in_exec
+        return [
+            Port(name="in_exec", type=PortType.EXEC, direction=PortDirection.IN, label="▶"),
+        ]
+    # -------- 默认：返回 NodeMeta 静态 inputs --------
+    return list(meta.inputs)
+
+
 # ============================================================
 # 工厂：按 type 实例化一个 Node（自动装配端口 + 默认参数）
 # ============================================================
@@ -1076,13 +1141,21 @@ def create_node(node_type: str, pos=(0, 0), node_id: Optional[str] = None) -> No
     if meta is None:
         raise ValueError(f"未知节点类型: {node_type}")
     nid = node_id or _uuid.uuid4().hex[:12]
+    params = meta.default_params()
+    has_dynamic = bool(getattr(meta, "has_dynamic_ports", False))
+    if has_dynamic:
+        inputs = [Port(**p.__dict__) for p in _resolve_input_ports_default(node_type, params)]
+        outputs = [Port(**p.__dict__) for p in _resolve_output_ports_default(node_type, params)]
+    else:
+        inputs = [Port(**p.__dict__) for p in meta.inputs]
+        outputs = [Port(**p.__dict__) for p in meta.outputs]
     return Node(
         id=nid,
         type=node_type,
         pos=pos,
-        params=meta.default_params(),
-        inputs=[Port(**p.__dict__) for p in meta.inputs],
-        outputs=[Port(**p.__dict__) for p in meta.outputs],
+        params=params,
+        inputs=inputs,
+        outputs=outputs,
     )
 
 

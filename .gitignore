@@ -25,6 +25,7 @@ debug/
 screenshots/
 templates/
 projects/
+log/
 
 # ==========================================================
 # PyInstaller 打包产物

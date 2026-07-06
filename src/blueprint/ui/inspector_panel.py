@@ -495,24 +495,32 @@ class InspectorPanel(QWidget):
         # ================================================================
         # 节点专属后处理：参数渲染完成后，追加增强 UI
         # ================================================================
-        # 1) 通用：动态端口节点 → 追加"当前输出端口列表"Label
+        # 1) 通用：动态端口节点 → 追加"当前输入/输出端口列表"Label
         # 注意：Sequence虽然 has_dynamic_ports=True（为了画布刷新端口），但不要求在 Inspector 里显示端口Label、+/-按钮 等UI，所以这里排除它。
         is_dynamic = bool(meta is not None and getattr(meta, "has_dynamic_ports", False))
         if node.type == "Sequence":
             is_dynamic = False
         if is_dynamic:
             try:
-                from ..core.node_library import _resolve_output_ports_default
-                ports = _resolve_output_ports_default(node.type, dict(node.params or {}))
-                names = [p.name for p in ports]
-                lab = QLabel("🔌 当前输出端口：" + "  →  ".join(names))
+                from ..core.node_library import _resolve_input_ports_default, _resolve_output_ports_default
+                in_ports = _resolve_input_ports_default(node.type, dict(node.params or {}))
+                out_ports = _resolve_output_ports_default(node.type, dict(node.params or {}))
+                in_names = [p.name for p in in_ports if p.type.value == "data"]
+                out_names = [p.name for p in out_ports]
+                parts = []
+                if in_names:
+                    parts.append("📥 数据输入：" + "  ←  ".join(in_names))
+                if out_names:
+                    parts.append("📤 输出：" + "  →  ".join(out_names))
+                txt = "  |  ".join(parts) if parts else "（无动态端口）"
+                lab = QLabel("🔌 " + txt)
                 lab.setWordWrap(True)
                 lab.setStyleSheet(
                     "color:#58A6FF; background:#0B3A5C33; padding:6px 8px;"
                     "border:1px dashed #0B3A5C; border-radius:4px; font-size:9px;"
                 )
                 self._form.addRow(lab)
-                # 实时更新：如果存在 num_paths / cases / templates 控件，连信号刷新端口列表
+                # 实时更新：如果存在 num_data_inputs / num_paths 控件，连信号刷新端口列表
                 self._bind_dynamic_ports_refresh(node, lab, rows_added)
             except Exception:
                 pass
@@ -601,16 +609,18 @@ class InspectorPanel(QWidget):
             except Exception as e:
                 print(f"[Inspector] Clipboard UI 出错: {e}")
 
-        # 11) SetVariable 专属：追加检查格式按钮
+        # 11) SetVariable 专属：num_data_inputs 改用 +/- 按钮调整 + 追加检查格式按钮
         if node.type == "SetVariable":
             try:
+                self._replace_num_data_inputs_with_buttons()
                 self._append_setvar_save_button()
             except Exception as e:
                 print(f"[Inspector] SetVariable UI 出错: {e}")
 
-        # 11.5) VarSwitch 专属：追加检查格式按钮
+        # 11.5) VarSwitch 专属：num_data_inputs 改用 +/- 按钮调整 + 追加检查格式按钮
         if node.type == "VarSwitch":
             try:
+                self._replace_num_data_inputs_with_buttons()
                 self._append_varswitch_check_button()
             except Exception as e:
                 print(f"[Inspector] VarSwitch UI 出错: {e}")
@@ -2210,6 +2220,68 @@ class InspectorPanel(QWidget):
         btn_minus.clicked.connect(lambda _=False: _update_val(-1))
         btn_plus.clicked.connect(lambda _=False: _update_val(1))
 
+    def _replace_num_data_inputs_with_buttons(self):
+        """VarSwitch / SetVariable：num_data_inputs 输入框替换为 +/- 按钮组合（复用 Sequence 逻辑）。"""
+        if self._current_node is None or self._current_node.type not in ("VarSwitch", "SetVariable"):
+            return
+        w_ndi = self._widgets.get("num_data_inputs")
+        if w_ndi is None:
+            return
+        # 找到 num_data_inputs 在 form 中的行
+        target_row = -1
+        for row_i in range(self._form.rowCount()):
+            fld_item = self._form.itemAt(row_i, QFormLayout.FieldRole)
+            fld_w = fld_item.widget() if fld_item else None
+            if fld_w is w_ndi:
+                target_row = row_i
+                break
+        if target_row < 0:
+            return
+        # 创建 +/- 按钮组合
+        container = QWidget()
+        hlay = QHBoxLayout(container)
+        hlay.setContentsMargins(0, 0, 0, 0)
+        hlay.setSpacing(4)
+        default_val = 1 if self._current_node.type == "VarSwitch" else 0
+        cur_val = int(self._current_node.params.get("num_data_inputs", default_val) or default_val)
+        val_label = QLabel(str(cur_val))
+        val_label.setStyleSheet("color:#F778BA; font-weight:bold; font-size:11px; min-width:30px;")
+        val_label.setAlignment(Qt.AlignCenter)
+        btn_minus = QPushButton("－")
+        btn_minus.setFixedSize(28, 24)
+        btn_minus.setStyleSheet(self._btn_style("#57606A", "#6E7681"))
+        btn_plus = QPushButton("＋")
+        btn_plus.setFixedSize(28, 24)
+        btn_plus.setStyleSheet(self._btn_style("#238636", "#2EA043"))
+        hlay.addWidget(btn_minus)
+        hlay.addWidget(val_label)
+        hlay.addWidget(btn_plus)
+        hlay.addStretch(1)
+        # 替换 form 中的 widget
+        self._form.removeRow(target_row)
+        new_label = QLabel("数据输入端口数")
+        new_label.setStyleSheet("color: #C9D1D9; font-size: 9px;")
+        new_label.setToolTip("数据输入端口数量（0~20），点击 +/- 增减端口，每个端口对应一个输入值\n临时变量名（所有节点统一写法，就这一种）：\n- 完整数组：__INPUTS__（list类型，可写 {__INPUTS__[0]}）\n- 按索引单值：__INPUTS__0 / __INPUTS__1 / __INPUTS__2 ...")
+        self._form.insertRow(target_row, new_label, container)
+        self._widgets["num_data_inputs"] = container
+        container._val_label = val_label  # type: ignore[attr-defined]
+
+        min_val = 0
+        max_val = 20
+
+        def _update_val(delta: int):
+            if self._current_node is None:
+                return
+            cur = int(self._current_node.params.get("num_data_inputs", default_val) or default_val)
+            new_v = max(min_val, min(max_val, cur + delta))
+            if new_v == cur:
+                return
+            val_label.setText(str(new_v))
+            self.param_changed.emit(self._current_node.id, "num_data_inputs", new_v)
+
+        btn_minus.clicked.connect(lambda _=False: _update_val(-1))
+        btn_plus.clicked.connect(lambda _=False: _update_val(1))
+
     def _apply_clipboard_mode_visibility(self):
         """Clipboard：根据 mode 隐藏不相关参数
         - read: 显示 output_var_name，隐藏 value
@@ -2358,15 +2430,23 @@ class InspectorPanel(QWidget):
         btn_check.clicked.connect(lambda _=False: _do_check())
 
     def _bind_dynamic_ports_refresh(self, node: Node, label: QLabel, rows_added: List[str]):
-        """监听动态参数控件（num_paths/templates/cases/var_name），实时刷新端口列表 Label"""
-        from ..core.node_library import _resolve_output_ports_default
+        """监听动态参数控件（num_paths/num_data_inputs/templates/cases/var_name），实时刷新端口列表 Label"""
+        from ..core.node_library import _resolve_input_ports_default, _resolve_output_ports_default
 
         def _refresh(*_):
             # 从 UI 控件上取"正在编辑还没保存到params"的值作为候选（更实时）
             p_live: Dict[str, Any] = dict(node.params or {})
-            for pname in ("num_paths", "templates", "cases", "var_name"):
+            for pname in ("num_paths", "num_data_inputs", "templates", "cases", "var_name"):
                 w = self._widgets.get(pname)
                 if w is None: continue
+                # 兼容 +/- 按钮替换后的容器控件
+                val_label = getattr(w, "_val_label", None)
+                if val_label is not None and isinstance(val_label, QLabel):
+                    try:
+                        p_live[pname] = int(val_label.text())
+                        continue
+                    except Exception:
+                        pass
                 if isinstance(w, QSpinBox):
                     p_live[pname] = w.value()
                 elif isinstance(w, QLineEdit):
@@ -2374,19 +2454,32 @@ class InspectorPanel(QWidget):
                 elif isinstance(w, QPlainTextEdit):
                     p_live[pname] = w.toPlainText()
             try:
-                ports = _resolve_output_ports_default(node.type, p_live)
-                names = [p.name for p in ports]
-                label.setText("🔌 当前输出端口：" + "  →  ".join(names))
+                in_ports = _resolve_input_ports_default(node.type, p_live)
+                out_ports = _resolve_output_ports_default(node.type, p_live)
+                in_names = [p.name for p in in_ports if p.type.value == "data"]
+                out_names = [p.name for p in out_ports]
+                parts = []
+                if in_names:
+                    parts.append("📥 数据输入：" + "  ←  ".join(in_names))
+                if out_names:
+                    parts.append("📤 输出：" + "  →  ".join(out_names))
+                txt = "  |  ".join(parts) if parts else "（无动态端口）"
+                label.setText("🔌 " + txt)
             except Exception:
                 pass
 
         # 绑定关键控件
-        triggers = ["num_paths", "templates", "cases", "var_name"]
+        triggers = ["num_paths", "num_data_inputs", "templates", "cases", "var_name"]
         for pname in triggers:
             if pname not in rows_added:
                 continue
             w = self._widgets.get(pname)
             if w is None: continue
+            # 兼容 +/- 按钮容器：从容器的子按钮里取点击信号
+            val_label = getattr(w, "_val_label", None)
+            if val_label is not None:
+                # 对 +/- 按钮容器，直接监听内部按钮的点击事件（不做连接，实际信号由 param_changed 触发 inspector 刷新）
+                continue
             if isinstance(w, QSpinBox):
                 try: w.valueChanged.disconnect()
                 except Exception: pass
