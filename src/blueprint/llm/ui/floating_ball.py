@@ -77,13 +77,19 @@ _THEME = get_theme("day")  # 固定奶茶白日主题
 #   仅使用 Animated WebP：文件更小、alpha 通道平滑（8-bit，边缘无锯齿）
 #   加载失败 → fallback 到 🐺 emoji 自绘（赫萝贤狼）
 # ====================================================================
-def _project_root() -> str:
+def _resolve_img_dir() -> str:
+    try:
+        from src.config.app_paths import INTERNAL_DIR
+        internal = os.path.normpath(os.path.join(INTERNAL_DIR, "images"))
+        if os.path.isdir(internal):
+            return internal
+    except Exception:
+        pass
     here = os.path.abspath(os.path.dirname(__file__))
-    # src/blueprint/llm/ui/__file__ → 回退 4 级到项目根
-    return os.path.normpath(os.path.join(here, "..", "..", "..", ".."))
+    return os.path.normpath(os.path.join(here, "..", "..", "..", "..", "images"))
 
 
-_IMG_DIR = os.path.join(_project_root(), "images")
+_IMG_DIR = _resolve_img_dir()
 _ANIM_AVATAR_WEBP = os.path.join(_IMG_DIR, "沉思女仆赫萝.webp")
 _ANIM_THINKING_WEBP = os.path.join(_IMG_DIR, "搬砖女仆赫萝.webp")
 # 动画人物在 56x56 球里的绘制尺寸（留 6px 的渐变球边缘，不要顶满）

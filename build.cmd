@@ -51,9 +51,14 @@ echo [BUILD] Running PyInstaller (--onedir, single dist layout) ...
   --noconfirm ^
   --clean ^
   --onedir ^
+  --icon "%SCRIPT_DIR%icon.png" ^
   --workpath "%SCRIPT_DIR%dist\build" ^
   --distpath "%SCRIPT_DIR%dist" ^
   --specpath "%SCRIPT_DIR%dist\build" ^
+  --add-data "%SCRIPT_DIR%config\doc;config\doc" ^
+  --add-data "%SCRIPT_DIR%config\llm_defaults.json;config" ^
+  --add-data "%SCRIPT_DIR%images;images" ^
+  --add-data "%SCRIPT_DIR%icon.png;." ^
   "%SCRIPT_DIR%src\blueprint_app.py"
 
 set "EXIT_CODE=%ERRORLEVEL%"
@@ -63,11 +68,11 @@ if exist "BlueprintAutomation.spec" echo [CLEAN] Removing stray spec from root (
 echo.
 if "%EXIT_CODE%"=="0" (
     echo [DONE] Build succeeded!
-    echo   Output layout (single top-level dist/ only):
-    echo     Final EXE      = "%SCRIPT_DIR%dist\BlueprintAutomation\BlueprintAutomation.exe"
-    echo     Work artifacts = "%SCRIPT_DIR%dist\build\"
-    echo   Run it by double-click or:
-    echo     "dist\BlueprintAutomation\BlueprintAutomation.exe"
+    echo   Output layout (single top-level dist/ only)
+    echo     Final EXE      = dist\BlueprintAutomation\BlueprintAutomation.exe
+    echo     Work artifacts = dist\build
+    echo   Run it by double-click or
+    echo     dist\BlueprintAutomation\BlueprintAutomation.exe
 ) else (
     echo [ERROR] Build failed with exit code %EXIT_CODE%
     echo   See the PyInstaller log above for details.

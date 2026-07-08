@@ -60,12 +60,20 @@ _QSS = build_qss(_THEME_NAME)
 _LABEL_FIXED_W = 132   # 表单标签统一固定宽度，保证输入框左对齐基线
 _CONTROL_H = 36        # 表单控件统一高度（LineEdit/ComboBox/SpinBox）
 
-# LLM 默认配置 JSON（与 _icon_loader 同风格：ui/_icon_loader.py 向上 4 层到项目根 /config/）
-# 注：JSON 必须存在且结构完整（ui / blueprint / persona 三个顶层域），否则直接报错。
-_LLM_DEFAULTS_JSON = os.path.normpath(os.path.join(
-    os.path.abspath(os.path.dirname(__file__)),
-    "..", "..", "..", "..", "config", "llm_defaults.json",
-))
+def _resolve_llm_defaults_json() -> str:
+    try:
+        from src.config.app_paths import INTERNAL_DIR
+        internal = os.path.normpath(os.path.join(INTERNAL_DIR, "config", "llm_defaults.json"))
+        if os.path.isfile(internal):
+            return internal
+    except Exception:
+        pass
+    return os.path.normpath(os.path.join(
+        os.path.abspath(os.path.dirname(__file__)),
+        "..", "..", "..", "..", "config", "llm_defaults.json",
+    ))
+
+_LLM_DEFAULTS_JSON = _resolve_llm_defaults_json()
 
 
 # =====================================================================

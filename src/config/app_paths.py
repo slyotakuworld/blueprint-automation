@@ -1,7 +1,8 @@
+import json
 import os
 import shutil
 import sys
-from typing import Callable, Optional
+from typing import Any, Callable, Dict, Optional
 
 
 # ============================================================
@@ -241,3 +242,59 @@ def clear_all_project_caches() -> None:
         pass
     # 2) 未来新增任何模块级缓存，都在此处统一清理（TemplateMatcher的内存缓存是实例级的，
     #    且 BlueprintRunner 每次运行都会重建，无需在这里清）
+
+
+def _default_user_config_content() -> Dict[str, Any]:
+    """首次启动时写入 config.json 的默认模板（空 recent_projects + 默认热键）。"""
+    try:
+        from .user_settings import _DEFAULT_SETTINGS
+        base = dict(_DEFAULT_SETTINGS)
+    except Exception:
+        base = {
+            "hotkeys": {
+                "capture_target": "<f8>",
+                "run_blueprint": "<f5>",
+                "pause_blueprint": "<f6>",
+                "stop_blueprint": "<f7>",
+            },
+            "ui": {"theme": "dark"},
+        }
+    base["recent_projects"] = []
+    return base
+
+
+def ensure_user_config_file() -> bool:
+    """打包后（或开发模式）启动时调用：若 exe 目录（APP_DIR）下没有 config.json，
+    就用默认模板创建一个空的，保证用户设置能正常读写。
+
+    优先级（只拷贝/写入，从不覆盖用户已有的文件）：
+      1. USER_CONFIG_FILE 已存在 → 直接 True 不动
+      2. INTERNAL_DIR/config/config.default.json 有模板 → 拷一份到 USER_CONFIG_FILE
+      3. 否则用代码内置的 _default_user_config_content() 写一份
+
+    返回 True 表示文件已存在或创建成功，False 表示创建失败。
+    """
+    try:
+        if USER_CONFIG_FILE and os.path.isfile(USER_CONFIG_FILE):
+            return True
+        parent = os.path.dirname(USER_CONFIG_FILE) if USER_CONFIG_FILE else APP_DIR
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        # 2) 内部模板
+        tpl = os.path.join(INTERNAL_DIR, "config", "config.default.json")
+        if os.path.isfile(tpl):
+            try:
+                shutil.copy2(tpl, USER_CONFIG_FILE)
+                if os.path.isfile(USER_CONFIG_FILE):
+                    return True
+            except Exception:
+                pass
+        # 3) 代码内置默认
+        try:
+            with open(USER_CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(_default_user_config_content(), f, ensure_ascii=False, indent=2)
+            return os.path.isfile(USER_CONFIG_FILE)
+        except Exception:
+            return False
+    except Exception:
+        return False

@@ -8,10 +8,20 @@ from functools import lru_cache
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QIcon, QPixmap, QPainter, QPainterPath, QPen, QColor
 
-_ICON_DIR = os.path.normpath(os.path.join(
-    os.path.abspath(os.path.dirname(__file__)),
-    "..", "..", "..", "..", "images", "llm_icons",
-))
+def _resolve_icon_dir() -> str:
+    try:
+        from src.config.app_paths import INTERNAL_DIR
+        internal = os.path.normpath(os.path.join(INTERNAL_DIR, "images", "llm_icons"))
+        if os.path.isdir(internal):
+            return internal
+    except Exception:
+        pass
+    return os.path.normpath(os.path.join(
+        os.path.abspath(os.path.dirname(__file__)),
+        "..", "..", "..", "..", "images", "llm_icons",
+    ))
+
+_ICON_DIR = _resolve_icon_dir()
 
 def icon_path(filename: str) -> str:
     return os.path.join(_ICON_DIR, filename).replace("\\", "/")

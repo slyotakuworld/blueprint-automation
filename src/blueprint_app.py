@@ -3607,14 +3607,41 @@ class BlueprintMainWindow(QMainWindow):
 
 
 def main() -> int:
+    # ============================================================
+    # 打包 --windowed 模式下 sys.stdout/stderr 为 None，print() 会抛异常
+    # 安装一个空的 writer 兜底（开发模式有控制台不受影响）
+    # ============================================================
+    if sys.platform.startswith("win") and getattr(sys, "frozen", False):
+        import io as _io
+        if sys.stdout is None:
+            sys.stdout = _io.StringIO()
+        if sys.stderr is None:
+            sys.stderr = _io.StringIO()
+
     # Windows 控制台默认编码是 GBK/CP936，print 中文时可能乱码（尤其关闭时 flush 缓冲区）
-    # 强制 stdout/stderr 使用 UTF-8
+    # 强制 stdout/stderr 使用 UTF-8（打包 --windowed 模式下 sys.stdout 可能为 None，需检查）
     try:
         if sys.platform.startswith("win"):
-            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+            if sys.stdout is not None and hasattr(sys.stdout, "reconfigure"):
+                sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+            if sys.stderr is not None and hasattr(sys.stderr, "reconfigure"):
+                sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
+
+    # ============================================================
+    # 打包后首次启动：确保 exe 同级（APP_DIR）有 config.json（外置用户配置）
+    #   - 必须在任何 read_user_settings / ProjectManager / save_user_settings 之前调用
+    # ============================================================
+    try:
+        from src.config.app_paths import ensure_user_config_file, USER_CONFIG_FILE
+        ok = ensure_user_config_file()
+        if ok:
+            print(f"[BOOT] ✅ 用户配置文件就绪：{USER_CONFIG_FILE}")
+        else:
+            print(f"[BOOT] ⚠️  无法创建用户配置文件：{USER_CONFIG_FILE}（后续读写可能失败）")
+    except Exception as e:
+        print(f"[BOOT] ⚠️  ensure_user_config_file 异常：{type(e).__name__}: {e}")
 
     app = QApplication.instance() or QApplication(sys.argv)
     app.setStyle("Fusion")
@@ -3631,12 +3658,21 @@ def main() -> int:
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(my_appid)
     except Exception:
         pass
-    # 加载项目根目录下的 icon.png（用户指定的图标）
+    # 加载 icon.png：开发模式在项目根目录；打包后优先从 INTERNAL_DIR（_MEIPASS）找
     try:
-        # 当前 blueprint_app.py 在 src/ 下，上一级就是项目根目录 e:\BlueprintAutomation
-        project_root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        icon_png = os.path.join(project_root_dir, "icon.png")
-        if os.path.isfile(icon_png):
+        def _resolve_icon_png() -> Optional[str]:
+            try:
+                from src.config.app_paths import INTERNAL_DIR
+                internal_png = os.path.join(INTERNAL_DIR, "icon.png")
+                if os.path.isfile(internal_png):
+                    return internal_png
+            except Exception:
+                pass
+            project_root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            dev_png = os.path.join(project_root_dir, "icon.png")
+            return dev_png if os.path.isfile(dev_png) else None
+        icon_png = _resolve_icon_png()
+        if icon_png and os.path.isfile(icon_png):
             from PySide6.QtGui import QIcon, QPixmap, Qt as _Qt
             # ============================================================
             # 解决 Windows 任务栏图标太小/模糊：QIcon 必须包含多种尺寸
