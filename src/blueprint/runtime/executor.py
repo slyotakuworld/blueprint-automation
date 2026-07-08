@@ -3146,8 +3146,24 @@ def _capture_sound_blocking(device: str, duration_sec: float, sr: int = 44100):
     try:
         import soundcard as sc
         if device == "default_loopback":
+            # soundcard 的 Speaker 对象没有 .loopback 属性，需要通过 get_microphone + include_loopback=True 获取环回设备
+            # 先尝试用 default_speaker 的 ID 查找环回麦克风
             spk = sc.default_speaker()
-            loopback = spk.loopback
+            spk_id = str(spk.id)
+            try:
+                loopback = sc.get_microphone(id=spk_id, include_loopback=True)
+            except Exception:
+                # speaker ID 可能不匹配 microphone ID，改为遍历所有 loopback 设备找第一个
+                all_mics = sc.all_microphones(include_loopback=True)
+                lb_mics = [m for m in all_mics if "loopback" in str(getattr(m, "id", "")).lower()
+                           or "Loopback" in str(getattr(m, "name", ""))
+                           or str(getattr(m, "id", "")) == spk_id]
+                if not lb_mics:
+                    # 最后兜底：取第一个带 include_loopback 返回的设备
+                    lb_mics = all_mics
+                if not lb_mics:
+                    raise RuntimeError("找不到任何环回音频设备")
+                loopback = lb_mics[0]
         else:
             # 按ID或名查找，包含 loopback 设备
             loopback = sc.get_microphone(id=device, include_loopback=True)
@@ -3155,39 +3171,48 @@ def _capture_sound_blocking(device: str, duration_sec: float, sr: int = 44100):
             data = rec.record(numframes=int(sr * max(0.01, duration_sec)))
         if data.ndim == 2:
             data = data.mean(axis=1)
-        return np.asarray(data, dtype=np.float32)
+        arr = np.asarray(data, dtype=np.float32)
+        # 检查是否为全零数据（静音 = 采集失败的特征）
+        if arr.size > 0 and float(np.max(np.abs(arr))) < 1e-7:
+            return None
+        return arr
     except Exception:
         pass
-    # 2) PyAudio 兜底
-    try:
-        import pyaudio
-        p = pyaudio.PyAudio()
-        stream = p.open(
-            format=pyaudio.paFloat32,
-            channels=1,
-            rate=sr,
-            input=True,
-            frames_per_buffer=1024,
-        )
-        frames: List[Any] = []
-        total = int(sr * max(0.01, duration_sec))
-        chunk = 1024
-        while len(frames) * chunk < total:
-            try:
-                raw = stream.read(chunk, exception_on_overflow=False)
-                frames.append(np.frombuffer(raw, dtype=np.float32))
-            except Exception:
-                break
+    # 2) PyAudio 兜底（仅对非 default_loopback 设备使用，避免用麦克风代替系统环回）
+    if device != "default_loopback":
         try:
-            stream.stop_stream()
-            stream.close()
-            p.terminate()
+            import pyaudio
+            p = pyaudio.PyAudio()
+            stream = p.open(
+                format=pyaudio.paFloat32,
+                channels=1,
+                rate=sr,
+                input=True,
+                frames_per_buffer=1024,
+            )
+            frames: List[Any] = []
+            total = int(sr * max(0.01, duration_sec))
+            chunk = 1024
+            while len(frames) * chunk < total:
+                try:
+                    raw = stream.read(chunk, exception_on_overflow=False)
+                    frames.append(np.frombuffer(raw, dtype=np.float32))
+                except Exception:
+                    break
+            try:
+                stream.stop_stream()
+                stream.close()
+                p.terminate()
+            except Exception:
+                pass
+            if frames:
+                arr = np.concatenate(frames)
+                # 同样检查全零数据
+                if float(np.max(np.abs(arr))) < 1e-7:
+                    return None
+                return arr
         except Exception:
-            pass
-        if frames:
-            return np.concatenate(frames)
-    except Exception:
-        return None
+            return None
     return None
 
 
@@ -3248,6 +3273,9 @@ def execute_SoundDetect(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any
     debug_viz = bool(p.get("debug_visual", False))
     sr = 44100
 
+    mode_cn = "检测声音" if mode == "detect_sound" else "检测静音"
+    ctx.log(f"[if_sound] 模式={mode_cn}(raw={mode_raw}) 阈值={thr_db}dB 采样={sample_ms}ms 设备={device} 超时={timeout_s}s", "INFO")
+
     t0 = time.time()
     timeout_cap_s = timeout_s if timeout_s > 0 else (86400.0 * 365)
     sample_s = sample_ms / 1000.0
@@ -3276,6 +3304,9 @@ def execute_SoundDetect(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any
         mean_db = float(20.0 * np.log10(mean))
         out_db = peak_db
 
+        # 每次采集都输出（INFO），方便排查采集问题
+        ctx.log(f"[if_sound] 采集结果: peak={peak_db:.1f}dB mean={mean_db:.1f}dB thr={thr_db:.0f}dB mode={mode}", "INFO")
+
         yes = False
         if mode == "detect_sound":
             # 检测声音：只要出现一次峰值/均值超过阈值就算满足
@@ -3291,8 +3322,8 @@ def execute_SoundDetect(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any
                 silence_consec_s += sample_s
             else:
                 silence_consec_s = 0.0
-            # 只要累计静音时长超过一次采样窗口就判定一次
-            yes = sample_is_silent and silence_consec_s >= sample_s
+            # 需要累计静音时长达到采样窗口的 2 倍才判定，避免单次偶然静音误触发
+            yes = sample_is_silent and silence_consec_s >= sample_s * 2
             note = (
                 f"[{mode}] peak={peak_db:.1f}dB mean={mean_db:.1f}dB thr={thr_db:.0f}dB "
                 f"consec_silence={silence_consec_s:.2f}s"

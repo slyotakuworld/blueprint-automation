@@ -1,0 +1,247 @@
+{
+  "title": "赫萝蓝图自动化 · 攻略手册",
+  "version": "1.0.0",
+  "chapters": [
+    {
+      "id": "intro",
+      "title": "🍎 快速上手",
+      "icon": "icon_chat.png",
+      "children": [
+        {
+          "id": "intro_overview",
+          "title": "1. 软件介绍",
+          "file": "01_intro_overview.md"
+        },
+        {
+          "id": "intro_quickstart",
+          "title": "2. 6步快速上手",
+          "file": "02_intro_quickstart.md"
+        },
+        {
+          "id": "intro_interface",
+          "title": "3. 界面总览",
+          "file": "03_intro_interface.md"
+        }
+      ]
+    },
+    {
+      "id": "basic",
+      "title": "📖 基础操作",
+      "icon": "icon_blueprint.png",
+      "children": [
+        {
+          "id": "basic_project",
+          "title": "1. 项目管理",
+          "file": "11_basic_project.md"
+        },
+        {
+          "id": "basic_canvas",
+          "title": "2. 画布操作",
+          "file": "12_basic_canvas.md"
+        },
+        {
+          "id": "basic_node",
+          "title": "3. 节点操作",
+          "file": "13_basic_node.md"
+        },
+        {
+          "id": "basic_connection",
+          "title": "4. 连线操作",
+          "file": "14_basic_connection.md"
+        },
+        {
+          "id": "basic_variable",
+          "title": "5. 变量系统",
+          "file": "15_basic_variable.md"
+        },
+        {
+          "id": "basic_run",
+          "title": "6. 运行与调试",
+          "file": "16_basic_run.md"
+        },
+        {
+          "id": "basic_screenshot",
+          "title": "7. 截图功能",
+          "file": "17_basic_screenshot.md"
+        }
+      ]
+    },
+    {
+      "id": "nodes_app",
+      "title": "🚀 应用控制节点",
+      "icon": "icon_game.png",
+      "children": [
+        {
+          "id": "node_openapp",
+          "title": "启动程序",
+          "file": "node_OpenApp.md"
+        },
+        {
+          "id": "node_bindwindow",
+          "title": "绑定窗口",
+          "file": "node_BindWindow.md"
+        },
+        {
+          "id": "node_webbrowser",
+          "title": "打开网页",
+          "file": "node_WebBrowser.md"
+        },
+        {
+          "id": "node_command",
+          "title": "执行命令",
+          "file": "node_Command.md"
+        },
+        {
+          "id": "node_httprequest",
+          "title": "网络请求",
+          "file": "node_HttpRequest.md"
+        }
+      ]
+    },
+    {
+      "id": "nodes_logic",
+      "title": "🧠 逻辑组件节点",
+      "icon": "icon_code.png",
+      "children": [
+        {
+          "id": "node_start",
+          "title": "开始",
+          "file": "node_Start.md"
+        },
+        {
+          "id": "node_end",
+          "title": "结束",
+          "file": "node_End.md"
+        },
+        {
+          "id": "node_loop",
+          "title": "循环",
+          "file": "node_Loop.md"
+        },
+        {
+          "id": "node_sequence",
+          "title": "顺序执行",
+          "file": "node_Sequence.md"
+        },
+        {
+          "id": "node_setvariable",
+          "title": "设置变量",
+          "file": "node_SetVariable.md"
+        },
+        {
+          "id": "node_varswitch",
+          "title": "条件判断",
+          "file": "node_VarSwitch.md"
+        },
+        {
+          "id": "node_clipboard",
+          "title": "剪贴板",
+          "file": "node_Clipboard.md"
+        },
+        {
+          "id": "node_notify",
+          "title": "通知",
+          "file": "node_Notify.md"
+        }
+      ]
+    },
+    {
+      "id": "nodes_execute",
+      "title": "🎯 执行动作节点",
+      "icon": "icon_screenshot.png",
+      "children": [
+        {
+          "id": "node_mouse",
+          "title": "鼠标操作",
+          "file": "node_Mouse.md"
+        },
+        {
+          "id": "node_presskey",
+          "title": "按键",
+          "file": "node_PressKey.md"
+        },
+        {
+          "id": "node_wait",
+          "title": "等待",
+          "file": "node_Wait.md"
+        }
+      ]
+    },
+    {
+      "id": "nodes_vision",
+      "title": "👁 视觉感知节点",
+      "icon": "icon_image.png",
+      "children": [
+        {
+          "id": "node_findimage",
+          "title": "找图",
+          "file": "node_FindImage.md"
+        },
+        {
+          "id": "node_ifimagedetect",
+          "title": "多图检测",
+          "file": "node_IfImageDetect.md"
+        },
+        {
+          "id": "node_stillnessdetect",
+          "title": "静止检测",
+          "file": "node_StillnessDetect.md"
+        },
+        {
+          "id": "node_sounddetect",
+          "title": "声音检测",
+          "file": "node_SoundDetect.md"
+        }
+      ]
+    },
+    {
+      "id": "advanced",
+      "title": "⚡ 进阶技巧",
+      "icon": "icon_memory.png",
+      "children": [
+        {
+          "id": "adv_template",
+          "title": "1. 找图匹配算法",
+          "file": "31_adv_template.md"
+        },
+        {
+          "id": "adv_variables",
+          "title": "2. 变量与流程控制",
+          "file": "32_adv_variables.md"
+        },
+        {
+          "id": "adv_anti_detect",
+          "title": "3. 拟人化与反检测",
+          "file": "33_adv_anti_detect.md"
+        },
+        {
+          "id": "adv_optimize",
+          "title": "4. 性能优化与调试",
+          "file": "34_adv_optimize.md"
+        }
+      ]
+    },
+    {
+      "id": "faq",
+      "title": "🐺 常见问题",
+      "icon": "avatar_holo_pondering.png",
+      "children": [
+        {
+          "id": "faq_basic",
+          "title": "1. 基础FAQ",
+          "file": "41_faq_basic.md"
+        },
+        {
+          "id": "faq_debug",
+          "title": "2. 排错调试FAQ",
+          "file": "42_faq_debug.md"
+        },
+        {
+          "id": "faq_advanced",
+          "title": "3. 高级FAQ",
+          "file": "43_faq_advanced.md"
+        }
+      ]
+    }
+  ]
+}

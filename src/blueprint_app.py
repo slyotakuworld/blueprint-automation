@@ -260,6 +260,8 @@ class BlueprintMainWindow(QMainWindow):
         # ---- LLM 集成（UI 壳子） ----
         self._llm_settings_dialog_ref = None   # LLM 设置对话框（单例，避免点两次开两窗）
         self._floating_ball = None             # 悬浮球（None=未启用或被隐藏）
+        # ---- 内嵌文档对话框（UI 壳子） ----
+        self._doc_dialog_ref = None            # 文档攻略对话框（单例）
 
         self._build_central()
         self._build_toolbar()
@@ -865,13 +867,29 @@ class BlueprintMainWindow(QMainWindow):
         self._act_split = mk_act("#7C3AED", "✂ 切分UI元素", self._on_open_split_dialog)
         add_toolbtn(self._act_split, bg="#2A1B4F", color="#A371F7", hover_bg="#381E6F", hover_border="#7C3AED")
 
-        # --------------- 右侧: LLM 入口按钮 + 目标程序 全局选择器 ---------------
+        # --------------- 右侧: 文档攻略 + LLM 入口按钮 + 目标程序 全局选择器 ---------------
         tb.addSeparator()
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         tb.addWidget(spacer)
 
-        # ---- LLM 入口按钮（在🎯 目标程序 左边） ----
+        # ---- 📚 文档攻略按钮（LLM 设置 的 左边，符合用户最新要求） ----
+        btn_doc = QPushButton("📚 文档攻略")
+        btn_doc.setCursor(Qt.PointingHandCursor)
+        btn_doc.setStyleSheet(
+            "QPushButton { background:#B62324; color:#FFFFFF; border:1px solid #8B1B1C; border-radius:4px; padding:3px 12px; font-weight:600; }"
+            "QPushButton:hover { background:#8B1B1C; border-color:#FF7B72; }"
+            "QPushButton:pressed { background:#6E1516; }"
+        )
+        btn_doc.setToolTip("打开蓝图自动化使用手册（软件怎么用、功能说明、所有节点的属性与参数详解）")
+        btn_doc.clicked.connect(self._on_doc_guide_clicked)
+        tb.addWidget(btn_doc)
+        # 视觉分隔：和 LLM 设置 之间留点小空隙
+        sep_doc = QLabel("  ")
+        sep_doc.setStyleSheet("color:#30363D;")
+        tb.addWidget(sep_doc)
+
+        # ---- 🤖 LLM 入口按钮（在🎯 目标程序 左边 / 文档攻略 的 右边） ----
         btn_llm = QPushButton("🤖 LLM 设置")
         btn_llm.setCursor(Qt.PointingHandCursor)
         btn_llm.setStyleSheet(
@@ -3400,6 +3418,65 @@ class BlueprintMainWindow(QMainWindow):
         except Exception:
             pass
 
+    # ==================== 内嵌文档攻略 UI 壳子 ====================
+    def _clear_doc_dialog_ref(self):
+        try:
+            self._doc_dialog_ref = None
+        except Exception:
+            pass
+
+    def _on_doc_guide_clicked(self):
+        """工具栏 📚 文档攻略按钮点击 → 打开/激活内嵌手册对话框（单例，不会开多个）。
+
+        对话框内容 = DocViewerPage Widget（之前做的左树+右Markdown查看器），
+        与 FullChatDialog 里复用同一个类，保证样式/文档一致。
+        """
+        if self._doc_dialog_ref is None or not getattr(
+            self._doc_dialog_ref, "isVisible", lambda: False)():
+            try:
+                from PySide6.QtWidgets import QDialog, QVBoxLayout
+                # 文档查看器：蓝图模块通用 UI 组件，不是 LLM 子模块的一部分
+                from src.blueprint.ui.doc_viewer import DocViewerPage
+            except Exception as e:
+                QMessageBox.critical(
+                    self, "模块加载失败",
+                    f"加载文档攻略查看器失败（UI壳子文件缺失或语法错误）：\n{e}"
+                )
+                return
+
+            dlg = QDialog(self, Qt.Window | Qt.WindowCloseButtonHint | Qt.WindowMinMaxButtonsHint)
+            dlg.setObjectName("DocGuideDialog")
+            dlg.setWindowTitle("📚 赫萝蓝图自动化 · 使用手册")
+            dlg.resize(1080, 720)
+            dlg.setMinimumSize(780, 520)
+
+            # DocViewerPage 自己的样式：清爽文档阅读风（独立 QSS 作用域，不影响主窗口 Holo 主题）
+            lay = QVBoxLayout(dlg)
+            lay.setContentsMargins(18, 18, 18, 18)   # 对话框四周边距：18px，别贴着窗口边框
+            lay.setSpacing(0)                         # 内容贴 DocViewerPage 自己的分割线
+            viewer = DocViewerPage(dlg)
+            viewer.setObjectName("docViewerRoot")
+            lay.addWidget(viewer, 1)
+
+            # 关窗自动清引用（防止下一次开又找不到）
+            try:
+                dlg.destroyed.connect(lambda *_: self._clear_doc_dialog_ref())
+            except Exception:
+                pass
+            self._doc_dialog_ref = dlg
+            dlg.show()
+            dlg.raise_()
+            dlg.activateWindow()
+        else:
+            # 已经打开了 → 提到前台（含最小化还原）
+            try:
+                dlg = self._doc_dialog_ref
+                dlg.showNormal()
+                dlg.raise_()
+                dlg.activateWindow()
+            except Exception:
+                pass
+
     # ==================== LLM UI 壳子 ====================
     def _on_llm_settings_clicked(self):
         """工具栏 🤖 LLM 设置按钮点击 → 打开/激活对话框（单例，不会开多个）。"""
@@ -3530,6 +3607,15 @@ class BlueprintMainWindow(QMainWindow):
 
 
 def main() -> int:
+    # Windows 控制台默认编码是 GBK/CP936，print 中文时可能乱码（尤其关闭时 flush 缓冲区）
+    # 强制 stdout/stderr 使用 UTF-8
+    try:
+        if sys.platform.startswith("win"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
     app = QApplication.instance() or QApplication(sys.argv)
     app.setStyle("Fusion")
     # ============================================================

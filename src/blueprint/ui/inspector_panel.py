@@ -2996,40 +2996,6 @@ class InspectorPanel(QWidget):
         bl.addStretch(1)
         self._form.addRow(btn_row)
 
-        # 模式显隐联动：非 spectral_band 模式下隐藏频段上下限
-        self._sound_apply_band_visibility()
-        mode_w = self._widgets.get("judge_mode")
-        if isinstance(mode_w, QComboBox):
-            try: mode_w.currentIndexChanged.disconnect()
-            except Exception: pass
-            mode_w.currentIndexChanged.connect(lambda _i: self._sound_apply_band_visibility())
-
-    def _sound_apply_band_visibility(self):
-        node = self._current_node
-        if node is None or node.type != "SoundDetect":
-            return
-        mode_val = str(node.params.get("judge_mode", "amplitude_max") or "amplitude_max")
-        w_mode = self._widgets.get("judge_mode")
-        if isinstance(w_mode, QComboBox):
-            d = w_mode.currentData()
-            if d:
-                mode_val = str(d)
-        is_band = (mode_val == "spectral_band")
-        for pname in ("spectral_band_low_hz", "spectral_band_high_hz"):
-            w = self._widgets.get(pname)
-            if w is None:
-                continue
-            for row_i in range(self._form.rowCount()):
-                lab_item = self._form.itemAt(row_i, QFormLayout.LabelRole)
-                fld_item = self._form.itemAt(row_i, QFormLayout.FieldRole)
-                fld_w = fld_item.widget() if fld_item else None
-                if fld_w is w:
-                    if lab_item and lab_item.widget():
-                        lab_item.widget().setVisible(is_band)
-                    if fld_w:
-                        fld_w.setVisible(is_band)
-                    break
-
     def _sound_enum_devices(self):
         items: List[str] = ["default_loopback (默认扬声器-录系统播放声)"]
         try:
@@ -3108,12 +3074,12 @@ class InspectorPanel(QWidget):
             f"  Peak   = {peak_db:.1f} dB\n"
             f"  Mean   = {mean_db:.1f} dB\n"
             f"  P99    = {p99_db:.1f} dB\n"
-            f"→ 推荐阈值 = P99 + 6dB = {thr_db:.1f} dB\n\n是否填入并把模式设为 amplitude_max ？"
+            f"→ 推荐阈值 = P99 + 6dB = {thr_db:.1f} dB\n\n是否填入并把模式设为 检测声音 ？"
         )
         ret = QMessageBox.question(self, "📏 校准结果", msg, QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
         if ret != QMessageBox.Yes:
             return
-        merge: Dict[str, Any] = {"threshold_db": round(thr_db, 1), "judge_mode": "amplitude_max"}
+        merge: Dict[str, Any] = {"threshold_db": round(thr_db, 1), "judge_mode": "detect_sound"}
         # 填控件文本
         w_thr = self._widgets.get("threshold_db")
         if isinstance(w_thr, (QDoubleSpinBox, QSpinBox)):
@@ -3121,10 +3087,9 @@ class InspectorPanel(QWidget):
             except Exception: pass
         w_mode = self._widgets.get("judge_mode")
         if isinstance(w_mode, QComboBox):
-            idx = w_mode.findText("amplitude_max")
+            idx = w_mode.findData("detect_sound")
             if idx >= 0: w_mode.setCurrentIndex(idx)
         self.apply_params_merge(merge)
-        self._sound_apply_band_visibility()
 
     def _sound_listen_now(self):
         if not self._sound_check_deps():
@@ -3134,8 +3099,7 @@ class InspectorPanel(QWidget):
             return
         # 取当前控件值（实时编辑未保存也可以生效）
         p: Dict[str, Any] = dict(self._current_node.params or {})
-        for pname in ("device", "sample_ms", "threshold_db", "judge_mode",
-                       "spectral_band_low_hz", "spectral_band_high_hz", "debug_visual"):
+        for pname in ("device", "sample_ms", "threshold_db", "judge_mode", "debug_visual"):
             w = self._widgets.get(pname)
             if w is None:
                 continue
@@ -3150,10 +3114,8 @@ class InspectorPanel(QWidget):
                 p[pname] = w.isChecked()
         device = str(p.get("device", "default_loopback") or "default_loopback")
         sample_ms = max(100, int(p.get("sample_ms", 1000) or 1000))
-        mode = str(p.get("judge_mode", "amplitude_max") or "amplitude_max")
+        mode = str(p.get("judge_mode", "detect_sound") or "detect_sound")
         thr_db = float(p.get("threshold_db", -30.0) or -30.0)
-        band_low = int(p.get("spectral_band_low_hz", 500) or 500)
-        band_high = int(p.get("spectral_band_high_hz", 2000) or 2000)
         sr = 44100
         from src.blueprint.runtime.executor import _capture_sound_blocking, _ascii_waveform
         chunk = _capture_sound_blocking(device, sample_ms / 1000.0, sr)
@@ -3164,33 +3126,19 @@ class InspectorPanel(QWidget):
                 "3. 设备ID是否正确")
             return
         # 执行和 execute_SoundDetect 一样的判定
+        peak = float(np.max(np.abs(chunk)) + 1e-8)
+        mean = float(np.mean(np.abs(chunk)) + 1e-8)
+        peak_db = float(20.0 * np.log10(peak))
+        mean_db = float(20.0 * np.log10(mean))
+
         yes = False
         note = ""
-        if mode == "amplitude_max":
-            peak = float(np.max(np.abs(chunk)) + 1e-8)
-            peak_db = 20.0 * np.log10(peak)
-            yes = peak_db >= thr_db
-            note = f"Peak = {peak_db:.1f} dB   阈值 = {thr_db:.0f} dB"
-        elif mode == "amplitude_mean":
-            mean = float(np.mean(np.abs(chunk)) + 1e-8)
-            mean_db = 20.0 * np.log10(mean)
-            yes = mean_db >= thr_db
-            note = f"Mean = {mean_db:.1f} dB   阈值 = {thr_db:.0f} dB"
-        else:  # spectral_band
-            n = len(chunk)
-            if n < 4:
-                yes = False
-                note = "采样过短"
-            else:
-                win = np.hanning(n).astype(np.float32)
-                spec = np.abs(np.fft.rfft(chunk * win))
-                freqs = np.fft.rfftfreq(n, 1.0 / sr)
-                lo, hi = sorted([band_low, band_high])
-                mask = (freqs >= lo) & (freqs <= hi)
-                band_energy = float(np.mean(spec[mask]) + 1e-8) if np.any(mask) else 0.0
-                thr_amp = (10.0 ** (thr_db / 20.0)) * 0.05
-                yes = band_energy >= thr_amp
-                note = f"频段 {lo}-{hi} Hz 能量 = {band_energy:.4f}   阈值振幅 = {thr_amp:.4f}"
+        if mode == "detect_sound":
+            yes = (peak_db >= thr_db) or (mean_db >= thr_db)
+            note = f"Peak={peak_db:.1f}dB Mean={mean_db:.1f}dB 阈值={thr_db:.0f}dB"
+        else:  # detect_silence
+            yes = (peak_db < thr_db) and (mean_db < thr_db)
+            note = f"Peak={peak_db:.1f}dB Mean={mean_db:.1f}dB 阈值={thr_db:.0f}dB（需全部低于阈值）"
         # ASCII 波形
         wave = _ascii_waveform(chunk, peak_marker_db=thr_db)
         verdict = "✅ YES（触发有声）" if yes else "❌ NO（无声/未达阈值）"

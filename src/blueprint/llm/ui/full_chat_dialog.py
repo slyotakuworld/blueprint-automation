@@ -1042,7 +1042,7 @@ class FullChatDialog(QDialog):
 
         split.addWidget(left)
 
-        # -------- 右侧：QStackedWidget（8 个 Tab 对应 8 页） --------
+        # -------- 右侧：QStackedWidget（7 个 Tab 对应 7 页） --------
         right_wrap = QWidget()
         rl = QVBoxLayout(right_wrap)
         rl.setContentsMargins(0, 0, 0, 0)
