@@ -1199,7 +1199,7 @@ class LLMSettingsDialog(QDialog):
             self.cmb_model.setCurrentText(names_sorted[0])
         QMessageBox.information(
             self, "✅ 拉取成功",
-            f"赫萝：唔姆~ 苹果商人，一共拉到 {len(names)} 个可用模型 🍎\n\n当前服务：{provider}\n已自动填进「对话模型」下拉框里，现在直接选就好~"
+            f"赫萝：唔姆~ 苹果商人，一共拉到 {len(names)} 个可用模型 🍎\n\n当前服务：{self.cmb_provider.currentText()}\n已自动填进「对话模型」下拉框里，现在直接选就好~"
         )
 
     def _on_test_connection(self):

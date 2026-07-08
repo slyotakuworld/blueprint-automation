@@ -473,54 +473,29 @@ def qkeysequence_to_pynput(qks_str: str) -> Optional[str]:
 
 
 # ============================================================
-# LLM 配置（打桩壳子：读写顶层 key "llm"）
-# 真实功能接入后可以继续扩展这里的字段校验逻辑
+# LLM 配置（读写顶层 key "llm"）
 # ============================================================
 _LLM_DEFAULT_PROVIDERS: Dict[str, Dict[str, str]] = {
-    "deepseek": {"base_url": "https://api.deepseek.com/v1",                  "api_key": "", "model": "deepseek-chat",  "nickname": "DeepSeek V3"},
-    "qwen":     {"base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1", "api_key": "", "model": "qwen-plus",      "nickname": "通义千问"},
-    "openai":   {"base_url": "https://api.openai.com/v1",                   "api_key": "", "model": "gpt-4o-mini",    "nickname": "OpenAI GPT"},
-    "ollama":   {"base_url": "http://localhost:11434/v1",                    "api_key": "ollama", "model": "qwen2.5:7b", "nickname": "Ollama 本地"},
-    "custom":   {"base_url": "",                                             "api_key": "", "model": "",               "nickname": "自定义"},
+    "openai": {"base_url": "https://api.openai.com/v1", "model": "gpt-4o-mini", "nickname": "OpenAI GPT"},
+    "ollama": {"base_url": "http://localhost:11434/v1", "model": "qwen2.5:7b", "nickname": "Ollama 本地"},
 }
 
 _LLM_DEFAULT_CFG: Dict[str, Any] = {
-    "_version": 2,   # 配置版本号：v1 时默认 enabled=False，v2 起默认启用悬浮球
     "enabled": True,
-    "active_provider": "deepseek",
+    "active_provider": "openai",
+    "api_key": "",
     "providers": {k: dict(v) for k, v in _LLM_DEFAULT_PROVIDERS.items()},
-    "temperature": 0.2,
-    "max_tokens": 4096,
-    "auto_fix_rounds": 3,
-    "float_always_on_top": True,
-    "float_click_left_full": True,
 }
 
 
-# 升级规则 v1 → v2：旧版本（enabled=False 且缺 _version）都是旧默认值，用户没主动改过，自动打开
-def _upgrade_llm_cfg(data: Dict[str, Any]):
-    """旧用户升级：老版本默认 enabled=False 是设计缺陷，自动修正为 True。"""
-    if not isinstance(data, dict):
-        return
-    ver = data.get("_version", 1)
-    if ver < 2:
-        # v1 老用户：老代码默认 enabled=False，几乎可以确定是"默认未开"而不是"用户主动关闭"
-        # 升级时直接把 enabled 提为 True（若用户真的想关闭，进设置面板一关就好，下次不再升级触发）
-        data["enabled"] = True
-        data["_version"] = 2
-
-
 def get_llm_config() -> Dict[str, Any]:
-    """读取 LLM 配置（缺字段自动补默认值 + 老版本自动升级）。"""
+    """读取 LLM 配置（缺字段自动补默认值）。"""
     try:
         s = read_user_settings()
         llm_raw = s.get("llm") if isinstance(s, dict) else None
         cfg = dict(llm_raw) if isinstance(llm_raw, dict) else {}
     except Exception:
         cfg = {}
-    # ⚠ 先升级（必须在 merge_defaults 之前！否则 merge 会补 _version=2 让升级条件永远不触发）
-    _upgrade_llm_cfg(cfg)
-    # 递归合并默认值（复用现有的 _merge_defaults，只补缺失的键）
     _merge_defaults(cfg, _LLM_DEFAULT_CFG)
     return cfg
 
@@ -533,23 +508,21 @@ def set_llm_config(cfg: Dict[str, Any]) -> bool:
         s = read_user_settings()
     except Exception:
         s = {}
-    # 精简处理：只保留默认 schema 里定义过的合法顶层字段（防用户/未来代码写错）
     cleaned: Dict[str, Any] = {}
     for k, v in cfg.items():
         if k in _LLM_DEFAULT_CFG:
             cleaned[k] = v
-    # providers 永远至少带默认 5 家（没填的补默认条目）
+    # providers 永远至少带默认 2 家（没填的补默认条目）
     if not isinstance(cleaned.get("providers"), dict):
         cleaned["providers"] = {}
     for pk, pv in _LLM_DEFAULT_PROVIDERS.items():
         if pk not in cleaned["providers"]:
             cleaned["providers"][pk] = dict(pv)
         else:
-            # 对已有 provider，保证 4 个必备字段都存在
             merged = dict(pv)
             user_pv = cleaned["providers"][pk]
             if isinstance(user_pv, dict):
-                for fk in ("base_url", "api_key", "model", "nickname"):
+                for fk in ("base_url", "model", "nickname"):
                     if fk in user_pv and isinstance(user_pv[fk], str):
                         merged[fk] = user_pv[fk]
             cleaned["providers"][pk] = merged

@@ -25,7 +25,7 @@ BlueprintAutomation 内置赫萝风格通用 AI 桌面助理，定位为「游�
 2. **配置 JSON 化**：人设预设 / UI 默认值 / 蓝图输出参数全部由 `config/llm_defaults.json` 管理（JSON 必须存在且结构完整，否则直接报错）
 3. **保险机制**：严禁往 `src/` 目录写任何东西，蓝图 JSON 走 `BlueprintStore.save()` 正常路径
 4. **每个 Tab 独立系统提示词**：自由聊天 / 蓝图生成 / 代码助手三个对话型 Tab 各自使用独立的 system prompt，互不干扰
-5. **赫萝风格统一**：固定奶茶白日赫萝主题 + 42 张赫萝主题资源（16 张静态头像 / 23 张功能图标 / 3 张 Animated WebP 动画头像）
+5. **赫萝风格统一**：固定奶茶白日赫萝主题 + 赫萝主题资源（静态头像在 `images/llm_icons/`，Animated WebP 动画头像在 `images/`）
 
 ---
 
@@ -89,7 +89,7 @@ src/blueprint/llm/
     └── llm_settings_panel.py   # LLM 设置面板（5 Tab）
 ```
 
-**资源目录**：`images/llm_icons/` + `images/*.webp`（42 张赫萝主题资源：16 张静态头像 / 23 张功能图标 / 3 张 Animated WebP 动画头像）
+**资源目录**：`images/llm_icons/`（静态头像 + 功能图标）+ `images/*.webp`（Animated WebP 动画头像）
 **配置文件**：`config/llm_defaults.json`（人设预设 + UI 默认值 + 蓝图输出参数）
 
 ---
@@ -102,10 +102,10 @@ src/blueprint/llm/
 
 **关键设计**：
 - 不设 parent（独立顶层窗口，避免主窗口最小化时连带隐藏）
-- 窗口 flags = `Qt.Window | FramelessWindowHint | WindowStaysOnTopHint | Qt.Tool`
-- Win32 双保险：`user32.SetWindowPos(..., HWND_TOPMOST, ...)` + QTimer 500ms 重刷
+- 窗口 flags = `Qt.Window | FramelessWindowHint | WindowStaysOnTopHint | Qt.WindowDoesNotAcceptFocus | Qt.NoDropShadowWindowHint`（不使用 Qt.Tool，避免某些窗口管理器下行为异常）
+- Win32 双保险：`user32.SetWindowPos(..., HWND_TOPMOST, ...)` + QTimer 220ms 重刷
 - `WS_EX_TOOLWINDOW + WS_EX_NOACTIVATE`：不占任务栏、不抢前台焦点
-- Animated WebP 头像 + 1.0↔1.03 呼吸缩放 + ±1° 摇摆
+- Animated WebP 头像（头像静止不动，呼吸/摇摆动画已禁用）
 
 **交互**：
 - 左键单击（无拖动） → 打开 FullChatDialog
@@ -152,9 +152,10 @@ src/blueprint/llm/
 | 6 | 📜 对话历史 | Stub | 会话列表（按时间归档） |
 | 7 | ⚙ 助手设置 | 跳转入口 | 跳转到 LLMSettingsDialog |
 
-**ChatBubble 气泡组件**（`full_chat_dialog.py` 内嵌）：
+**ChatBubble 气泡组件**（`full_chat_dialog.py` 顶层类，被 `quick_chat_bubble.py` 跨模块导入）：
+- `mode` 参数区分模式：`chat` 模式只有复制按钮，`blueprint` 模式有 3 个快捷按钮（重写/导入/复制）
 - 用户气泡：右侧，金棕渐变（赫萝发色），文本色 `maid_black`（深棕黑），圆形 👤 头像
-- 赫萝气泡：左侧，奶白渐变，圆形赫萝头像，右下角 3 个快捷按钮（重写/导入/复制，使用 QStyle 标准图标 + 文字标签）
+- 赫萝气泡：左侧，奶白渐变，圆形赫萝头像，右下角快捷按钮（使用 QStyle 标准图标 + 文字标签）
 - 4 圆角胶囊形（无尖角）
 - 文本垂直居中（短文本）/ 顶边对齐（长文本），`Qt.TextWordWrap | Qt.TextWrapAnywhere` 换行
 - 超长文本安全网：bh 严格限制在 widget 实际分配高度内
@@ -196,7 +197,7 @@ src/blueprint/llm/
 **结构**：
 ```
 顶部总开关卡片：
-  左：96x96 avatar_holo（圆形大头像）
+  左：72x72 avatar_holo_curtsy（圆形头像）
   中：☑ 启用赫萝智能助理
   右：状态胶囊「🐺 待命 / 🛌 关闭」
 
@@ -207,7 +208,8 @@ Tab 1: 🤖 模型服务商
   · 对话模型下拉：拉取后选择
 
 Tab 2: ⚙ 通用参数
-  · 温度 / 最大 tokens / 超时
+  · Temperature（默认 0.7）/ Top P（默认 0.9）/ 频率惩罚（默认 0）/ 存在惩罚（默认 0）
+  · 最大上下文（默认 16384）/ 单次最大输出（默认 2048）
   · stream_output / skip_ssl_verify 由 JSON 管理（无 UI checkbox）
 
 Tab 3: 🎭 赫萝人设
@@ -278,10 +280,10 @@ Tab 5: 💡 使用说明
 ### 4.2 `config/user_settings.py`
 
 **LLM 相关字段**：
-- `enabled: bool`（默认 True，v1 用户 `enabled=False` 自动升级为 True）
+- `enabled: bool`（默认 True）
 - `active_provider: str`
-- `providers: Dict[str, LLMProviderEntry]`（仅 OpenAI / Ollama）
-- `api_key: str`（不读取环境变量）
+- `providers: Dict[str, LLMProviderEntry]`（仅 OpenAI / Ollama，每个 provider 含 base_url / model / nickname 三字段）
+- `api_key: str`（顶层字段，不读取环境变量，切换 provider 时面板自动填充对应 key）
 
 ### 4.3 关键约束
 
@@ -298,7 +300,7 @@ Tab 5: 💡 使用说明
 
 **对外 API**：
 - `get_theme(name: str = "day") -> dict[str, str]`：取色板字典（name 为历史兼容参数，实际固定返回 day）
-- `build_qss(theme_name: str) -> str`：生成通用 QSS 片段
+- `build_qss(name: str = "day") -> str`：生成通用 QSS 片段
 
 **主题**：固定奶茶白日：赫萝金棕发色 + 苹果红强调 + 奶茶背景
 
@@ -323,18 +325,17 @@ Tab 5: 💡 使用说明
 - `icon(filename: str, size: int = 24) -> QIcon`：返回 QIcon
 - `circular_pixmap(filename: str, size: int = 32) -> QPixmap`：圆形裁切 + 1px 奶茶描边
 
-**资源清单**（合计 39 张，均为赫萝主题风格 Q 版原画）：
+**资源清单**（均为赫萝主题风格 Q 版原画）：
 
 | 分类 | 数量 | 文件名 | 用途 |
 |------|------|--------|------|
 | 侧栏 Tab | 7 | `icon_chat / blueprint / image / game / code / history / settings.png` | FullChatDialog 侧栏 Tab 图标 |
 | 状态·情绪 | 2 | `icon_thinking / typing.png` | 悬浮球 thinking 状态 / 打字指示器 |
 | 工具按钮 | 11 | `icon_screenshot / upload / send / clear / retry / import / voice / emoji / fullwindow / close / memory.png` | 输入条 / 顶部操作条 / 设置面板按钮 |
-| **功能图标小计** | **20** | | |
 | 基础头像 | 2 | `avatar_holo.png / avatar_holo_small.png` | 兜底大图 / 小头像缩略 |
 | 情绪·全身头像 | 14 | `avatar_holo_apple / bigapple / blush / crying / curtsy / fullbody / holding / joyful / pondering / sleepy / surprised / tearful / tsundere / wave.png` | 设置看板娘 / 快速气泡及对话框头像 |
 | **静态头像小计** | **16** | | |
-| Animated WebP 动画头像 | 3 | `坐姿女仆赫萝.webp / 沉思女仆赫萝.webp / 搬砖女仆赫萝.webp` | 侧栏大图看板娘 / 悬浮球 idle·thinking / 快速气泡顶部 |
+| Animated WebP 动画头像 | 4 | `坐姿女仆赫萝.webp / 沉思女仆赫萝.webp / 搬砖女仆赫萝.webp / 工作女仆赫萝.webp` | 侧栏大图看板娘 / 悬浮球 idle·thinking / 快速气泡顶部 |
 
 **关键约束**：
 - IconLoader 用 `lru_cache(maxsize=64)` 缓存原始大图，避免重复解码 1.8MB PNG
@@ -357,7 +358,7 @@ Tab 5: 💡 使用说明
 
 | provider | base_url | 备注 |
 |----------|----------|------|
-| OpenAI（含所有兼容实现） | 用户配置 | DeepSeek / 通义 / GPT 等都走这个 |
+| OpenAI | 用户配置 | 含所有 OpenAI 兼容实现 |
 | Ollama | `http://localhost:11434/v1` | 本地部署，免费，隐私好 |
 
 **实现要点**：
@@ -406,7 +407,7 @@ LLMClient.chat()  ← 多轮生成+校验
 ### 7.1 UI 约束
 - LLM 设置面板 TabBar 不允许横向滚动，所有 Tab 一屏可见
 - LLM 设置面板必须含 QScrollArea，确保底部按钮可访问
-- LLM 功能默认启用（`enabled=True`），v1 用户自动升级
+- LLM 功能默认启用（`enabled=True`）
 - 切换启用开关时悬浮球实时显示/隐藏
 - 悬浮球拖动后无吸附功能，停留在用户松开的位置
 - ChatBubble 快捷操作按钮使用 QStyle 标准图标 + 文字标签，不使用赫萝 Icon
