@@ -2,10 +2,27 @@ import ctypes
 import random
 import time
 
-import pydirectinput
-
 SendInput = ctypes.windll.user32.SendInput
 PUL = ctypes.POINTER(ctypes.c_ulong)
+
+# 鼠标按键名称映射
+MOUSE_BUTTON_MAP = {
+    "left": "left",
+    "right": "right",
+}
+
+# 鼠标事件标志
+MOUSEEVENTF_LEFTDOWN = 0x0002
+MOUSEEVENTF_LEFTUP = 0x0004
+MOUSEEVENTF_RIGHTDOWN = 0x0008
+MOUSEEVENTF_RIGHTUP = 0x0010
+MOUSEEVENTF_MOVE = 0x0001
+MOUSEEVENTF_ABSOLUTE = 0x8000
+MOUSEEVENTF_VIRTUALDESK = 0x4000
+MOUSEEVENTF_WHEEL = 0x0800
+WHEEL_DELTA = 120  # 1 格滚轮 = 120 单位（Windows 标准）
+# 对外用像素语义，内部按经验换算成滚轮格数（常见浏览器 3 行 × 14px 字高 ≈ 40px/格）
+SCROLL_PX_PER_DETENT = 40
 
 
 class KeyBdInput(ctypes.Structure):
@@ -226,6 +243,7 @@ class InputActions:
         return True
 
     def _hw_mouse_move(self, x, y):
+        """硬件级鼠标移动到绝对屏幕坐标"""
         SM_XVIRTUALSCREEN = 76
         SM_YVIRTUALSCREEN = 77
         SM_CXVIRTUALSCREEN = 78
@@ -248,6 +266,77 @@ class InputActions:
         cmd = Input(ctypes.c_ulong(0), ii_)
         SendInput(1, ctypes.pointer(cmd), ctypes.sizeof(cmd))
 
+    def _hw_mouse_down(self, button="left"):
+        """硬件级鼠标按下"""
+        if button == "right":
+            flags = MOUSEEVENTF_RIGHTDOWN
+        else:
+            flags = MOUSEEVENTF_LEFTDOWN
+        extra = ctypes.c_ulong(0)
+        ii_ = Input_I()
+        ii_.mi = MouseInput(0, 0, 0, flags, 0, ctypes.pointer(extra))
+        cmd = Input(ctypes.c_ulong(0), ii_)
+        SendInput(1, ctypes.pointer(cmd), ctypes.sizeof(cmd))
+
+    def _hw_mouse_up(self, button="left"):
+        """硬件级鼠标释放"""
+        if button == "right":
+            flags = MOUSEEVENTF_RIGHTUP
+        else:
+            flags = MOUSEEVENTF_LEFTUP
+        extra = ctypes.c_ulong(0)
+        ii_ = Input_I()
+        ii_.mi = MouseInput(0, 0, 0, flags, 0, ctypes.pointer(extra))
+        cmd = Input(ctypes.c_ulong(0), ii_)
+        SendInput(1, ctypes.pointer(cmd), ctypes.sizeof(cmd))
+
+    def _hw_mouse_wheel(self, detents):
+        """硬件级鼠标滚轮滚动。
+        detents 正=向前(上) 负=向后(下) 1=滚轮咔哒1格
+        为了体感渐进（不瞬移），拆成 1 格/次 SendInput，每格间隔 ~25ms 模拟人类连续滚动。
+        """
+        if detents == 0:
+            return
+        direction = 1 if detents > 0 else -1  # 单格方向 +1/-1
+        total_steps = abs(int(detents))
+        one_step = WHEEL_DELTA * direction
+        for i in range(total_steps):
+            if not self._running():
+                return  # 蓝图停止/暂停时立即中止后续滚动
+            extra = ctypes.c_ulong(0)
+            ii_ = Input_I()
+            ii_.mi = MouseInput(0, 0, one_step, MOUSEEVENTF_WHEEL, 0, ctypes.pointer(extra))
+            cmd = Input(ctypes.c_ulong(0), ii_)
+            SendInput(1, ctypes.pointer(cmd), ctypes.sizeof(cmd))
+            # 间隔 20~30ms 让系统逐帧渲染，呈现渐进翻页体感
+            time.sleep(0.02 + 0.005 * random.random())
+
+    def _mouse_move(self, x, y):
+        """公开的鼠标移动方法（供 drag 等使用）"""
+        self._hw_mouse_move(int(x), int(y))
+
+    def scroll(self, pos, dy_px=0):
+        """在指定位置滚动鼠标滚轮。dy_px 对外是像素估算值，内部会换算成滚轮格数再发事件。"""
+        if not self._running():
+            return
+        if pos:
+            if len(pos) == 4:
+                x, y, w, h = pos
+                cx = int(x) + int(w) // 2
+                cy = int(y) + int(h) // 2
+            else:
+                cx, cy = int(pos[0]), int(pos[1])
+            self._hw_mouse_move(cx, cy)
+            time.sleep(0.03)
+        if dy_px != 0:
+            # 像素 → 滚轮格数（每格经验值 40px）；极小值保证至少 ±1 格，让小距离也有体感
+            import math
+            detents_raw = dy_px / SCROLL_PX_PER_DETENT
+            detents = int(round(detents_raw))
+            if detents == 0 and dy_px != 0:
+                detents = 1 if dy_px > 0 else -1
+            self._hw_mouse_wheel(detents)
+
     @staticmethod
     def _apply_random_offset(pos, radius):
         if not pos or radius <= 0:
@@ -264,6 +353,7 @@ class InputActions:
         hold_ms_range=(30, 80),
         post_delay_range=(80, 200),
         repeat=1,
+        button="left",
     ):
         if not self._running() or not pos:
             return None
@@ -293,9 +383,9 @@ class InputActions:
                     return None
                 hold_ms = random.randint(int(hold_ms_range[0]), int(hold_ms_range[1]))
                 last_hold = hold_ms
-                pydirectinput.mouseDown()
+                self._hw_mouse_down(button)
                 time.sleep(hold_ms / 1000.0)
-                pydirectinput.mouseUp()
+                self._hw_mouse_up(button)
                 if i < click_count - 1:
                     time.sleep(0.08)
             post_delay_ms = random.randint(int(post_delay_range[0]), int(post_delay_range[1]))
@@ -303,12 +393,6 @@ class InputActions:
             if r < repeat_n - 1:
                 time.sleep(post_delay_ms / 1000.0)
 
-        if self.safe_region and len(self.safe_region) == 4:
-            gx, gy, _, _ = self.safe_region
-            self._hw_mouse_move(gx + 5, gy + 5)
-        else:
-            self._hw_mouse_move(5, 5)
-        time.sleep(0.05)
         repeat_txt = f" x{repeat_n}" if repeat_n > 1 else ""
         self._log(
             f"[Input] 点击 ({base_pos[0]},{base_pos[1]}) double={double}{repeat_txt} "

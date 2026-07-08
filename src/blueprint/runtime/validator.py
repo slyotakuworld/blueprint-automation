@@ -109,8 +109,18 @@ def _check_required_params(n: Node, issues: List[ValidationIssue]):
             if not _not_empty(n.params.get("text")):
                 issues.append(ValidationIssue("WARN", "PRESS_NO_TEXT", "PressKey.text 为空（输入文本模式）。", n.id))
         else:
-            if not _not_empty(n.params.get("key_name")):
-                issues.append(ValidationIssue("ERROR", "PRESS_NO_KEY", "PressKey.key_name 不能为空（按键组合模式）。", n.id))
+            # 按键组合模式：检查 key_combo（JSON数组）是否为空
+            key_combo_raw = str(n.params.get("key_combo", "[]") or "[]")
+            has_keys = False
+            try:
+                import json as _json
+                kc = _json.loads(key_combo_raw) if isinstance(key_combo_raw, str) else key_combo_raw
+                if isinstance(kc, list) and any(k.strip() for k in kc if isinstance(k, str)):
+                    has_keys = True
+            except Exception:
+                pass
+            if not has_keys:
+                issues.append(ValidationIssue("ERROR", "PRESS_NO_KEY", "PressKey 按键组合为空（请至少选择一个按键）。", n.id))
     elif t == "SetVariable":
         has_batch = bool(str(n.params.get("batch_text", "") or "").strip())
         if not has_batch:

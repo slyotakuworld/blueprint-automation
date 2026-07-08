@@ -115,11 +115,14 @@ def bring_window_to_front(hwnd: int, log_fn: Optional[Callable[[str, str], None]
         if not win32gui.IsWindow(hwnd):
             log(f"[WindowUtils] HWND {hwnd} 已失效", "WARN")
             return False
+        # 只在窗口最小化时才 SW_RESTORE（恢复到之前的状态：最大化或普通）
+        # 最大化的窗口保持最大化不动，避免尺寸变化导致坐标错位
         try:
-            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            if win32gui.IsIconic(hwnd):
+                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+                time.sleep(0.05)
         except Exception:
             pass
-        time.sleep(0.05)
         try:
             win32gui.SetForegroundWindow(hwnd)
         except Exception:

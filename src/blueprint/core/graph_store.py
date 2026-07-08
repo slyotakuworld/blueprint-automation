@@ -120,15 +120,15 @@ def _hydrate_params_after_load(node_type: str, params: Dict[str, Any]) -> Dict[s
     if isinstance(tpl_path, str) and tpl_path and os.path.exists(tpl_path):
         pil = _path_to_pil(tpl_path)
         if pil is not None:
-            runtime_attrs["_pil_image"] = pil
+            runtime_attrs["_pil_template"] = pil
             return runtime_attrs
-    # b64：几个常见 key 都试一遍（常见格式 b64 / b64_preview，其他：image_b64 / roi_preview_b64）
-    for k in ("image_b64", "b64", "b64_preview", "roi_preview_b64"):
+    # b64：几个常见 key 都试一遍（常见格式 b64 / b64_preview，其他：image_b64 / roi_preview_b64 / template_b64）
+    for k in ("image_b64", "b64", "b64_preview", "roi_preview_b64", "template_b64"):
         v = params.get(k)
         if isinstance(v, str) and v:
             pil = _b64_to_pil(v)
             if pil is not None:
-                runtime_attrs["_pil_image"] = pil
+                runtime_attrs["_pil_template"] = pil
                 break
     # IfImageDetect: images_json[] 数组，逐个缓存
     if node_type == "IfImageDetect":

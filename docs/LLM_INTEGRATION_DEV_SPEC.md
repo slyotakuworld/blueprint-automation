@@ -114,7 +114,7 @@ src/blueprint/llm/
 
 **LLM 设置面板入口**：通过 FullChatDialog 的「助手设置」Tab 跳转
 
-**状态切换 API**（预留）：`set_avatar_state(state)`，state ∈ `idle / thinking / happy / sleep / sad`
+**状态切换 API**（预留）：`set_avatar_state(state)`，state ∈ `idle / thinking`
 
 ### 3.2 完整对话大窗口（`full_chat_dialog.py`）
 
@@ -323,18 +323,18 @@ Tab 5: 💡 使用说明
 - `icon(filename: str, size: int = 24) -> QIcon`：返回 QIcon
 - `circular_pixmap(filename: str, size: int = 32) -> QPixmap`：圆形裁切 + 1px 奶茶描边
 
-**资源清单**（合计 42 张，均为赫萝主题风格 Q 版原画）：
+**资源清单**（合计 39 张，均为赫萝主题风格 Q 版原画）：
 
 | 分类 | 数量 | 文件名 | 用途 |
 |------|------|--------|------|
 | 侧栏 Tab | 7 | `icon_chat / blueprint / image / game / code / history / settings.png` | FullChatDialog 侧栏 Tab 图标 |
-| 状态·情绪 | 5 | `icon_thinking / happy / sleep / sad / typing.png` | 悬浮球状态 / 打字指示器 |
+| 状态·情绪 | 2 | `icon_thinking / typing.png` | 悬浮球 thinking 状态 / 打字指示器 |
 | 工具按钮 | 11 | `icon_screenshot / upload / send / clear / retry / import / voice / emoji / fullwindow / close / memory.png` | 输入条 / 顶部操作条 / 设置面板按钮 |
-| **功能图标小计** | **23** | | |
+| **功能图标小计** | **20** | | |
 | 基础头像 | 2 | `avatar_holo.png / avatar_holo_small.png` | 兜底大图 / 小头像缩略 |
-| 情绪·全身头像 | 14 | `avatar_holo_apple / bigapple / blush / crying / curtsy / fullbody / holding / joyful / pondering / sleepy / surprised / tearful / tsundere / wave.png` | 设置看板娘 / 悬浮球非 idle 状态 / 气泡头像 |
+| 情绪·全身头像 | 14 | `avatar_holo_apple / bigapple / blush / crying / curtsy / fullbody / holding / joyful / pondering / sleepy / surprised / tearful / tsundere / wave.png` | 设置看板娘 / 快速气泡及对话框头像 |
 | **静态头像小计** | **16** | | |
-| Animated WebP 动画头像 | 3 | `坐姿女仆赫萝.webp / 沉思女仆赫萝.webp / 工作女仆赫萝.webp` | 侧栏大图看板娘 / 悬浮球 idle·thinking / 快速气泡顶部 |
+| Animated WebP 动画头像 | 3 | `坐姿女仆赫萝.webp / 沉思女仆赫萝.webp / 搬砖女仆赫萝.webp` | 侧栏大图看板娘 / 悬浮球 idle·thinking / 快速气泡顶部 |
 
 **关键约束**：
 - IconLoader 用 `lru_cache(maxsize=64)` 缓存原始大图，避免重复解码 1.8MB PNG

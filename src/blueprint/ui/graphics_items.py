@@ -410,15 +410,15 @@ class NodeItem(QGraphicsObject):
             coord_txt = "相对" if coord_mode == "relative" else "绝对"
             action = str(p.get("action", "click") or "click")
             action_map = {
-                "click": "点击", "press": "按住", "release": "释放",
+                "click": "点击",
                 "move": "移动", "drag": "拖拽", "scroll": "滚动",
             }
             action_txt = action_map.get(action, action)
             # 附加关键信息
             extra = ""
-            if action in ("click", "press", "release", "drag"):
+            if action in ("click", "drag"):
                 btn = str(p.get("button", "left") or "left")
-                btn_map = {"left": "左", "right": "右", "middle": "中", "x1": "侧1", "x2": "侧2"}
+                btn_map = {"left": "左", "right": "右"}
                 extra = btn_map.get(btn, btn)
                 if action == "click":
                     cnt = int(p.get("click_count", 1) or 1)
@@ -426,10 +426,10 @@ class NodeItem(QGraphicsObject):
                         extra += f"x{cnt}"
             elif action == "scroll":
                 dy = int(p.get("scroll_dy", 0) or 0)
-                extra = f"{'上' if dy > 0 else '下'}{abs(dy)}格"
+                extra = f"{'上' if dy > 0 else '下'}{abs(dy)}px"
             # 坐标点
             pos_txt = ""
-            if action in ("click", "press", "move", "scroll"):
+            if action in ("click", "move", "scroll"):
                 pos_val = p.get("pos", (0, 0))
                 if isinstance(pos_val, (tuple, list)) and len(pos_val) == 2:
                     pos_txt = f" ({int(pos_val[0])},{int(pos_val[1])})"
@@ -456,10 +456,19 @@ class NodeItem(QGraphicsObject):
                     preview += "…"
                 return f"[输入文本]{tag_txt} {preview}".strip()
             else:
-                key_name = str(p.get("key_name", "") or "").strip()
+                # 读 key_combo（JSON数组）
+                keys_display = ""
+                key_combo_raw = str(p.get("key_combo", "[]") or "[]")
+                try:
+                    import json as _json
+                    kc = _json.loads(key_combo_raw) if isinstance(key_combo_raw, str) else key_combo_raw
+                    if isinstance(kc, list) and any(k.strip() for k in kc if isinstance(k, str)):
+                        keys_display = "+".join(k.strip() for k in kc if k.strip())
+                except Exception:
+                    pass
                 count = int(p.get("count", 1) or 1)
                 cnt_txt = f" x{count}" if count > 1 else ""
-                return f"[按键组合] {key_name}{cnt_txt}"
+                return f"[按键组合] {keys_display}{cnt_txt}"
         if t == "Wait":
             delay_type = str(p.get("delay_type", "fixed") or "fixed")
             if delay_type == "random":
@@ -507,23 +516,15 @@ class NodeItem(QGraphicsObject):
             return lines
         if t == "FindImage":
             algo = str(p.get("match_strategy", "hybrid") or "hybrid")
-            algo_map = {"hybrid": "智能混合", "template": "模板匹配", "feature": "特征匹配"}
+            algo_map = {"hybrid": "智能混合", "template": "模板匹配", "gray": "灰度匹配", "feature": "特征匹配"}
             algo_txt = algo_map.get(algo, algo)
-            thr = float(p.get("threshold", 0.75) or 0.75)
+            thr = float(p.get("threshold", 0.9) or 0.9)
             tout = float(p.get("timeout_seconds", 10.0) or 10.0)
-            auto = bool(p.get("auto_scroll", False))
-            # 显示 scroll_dy / scroll_dx 具体数值
+            auto = (int(p.get("scroll_dy", 0) or 0) != 0)
+            # 显示 scroll_dy 具体数值
             if auto:
-                sdy = int(p.get("scroll_dy", -500) or -500)
-                sdx = int(p.get("scroll_dx", 0) or 0)
-                scroll_parts = []
-                if sdy != 0:
-                    scroll_parts.append(f"Δy{sdy}")
-                if sdx != 0:
-                    scroll_parts.append(f"Δx{sdx}")
-                if not scroll_parts:
-                    scroll_parts.append("0")
-                scroll_note = "滚动:ON(" + ",".join(scroll_parts) + ")"
+                sdy = int(p.get("scroll_dy", 0) or 0)
+                scroll_note = f"滚动:ON(Δy{sdy})"
             else:
                 scroll_note = "滚动:OFF"
             act = str(p.get("after_action", "none") or "none")
@@ -561,7 +562,7 @@ class NodeItem(QGraphicsObject):
             else:
                 mode_txt = "短路模式"
             algo = str(p.get("match_strategy", "hybrid") or "hybrid")
-            algo_map = {"hybrid": "混合匹配", "template": "模板匹配", "feature": "特征匹配"}
+            algo_map = {"hybrid": "智能混合", "template": "模板匹配", "gray": "灰度匹配", "feature": "特征匹配"}
             algo_txt = algo_map.get(algo, algo)
             thr = float(p.get("threshold", 0.9) or 0.9)
             # 图片数

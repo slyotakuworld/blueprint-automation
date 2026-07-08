@@ -24,11 +24,10 @@ class TemplateMatcher:
         self._log = log_fn or (lambda *a, **k: None)
         self._is_running = is_running_fn or (lambda: True)
         self.regions = {}
-        self.last_positions = {}
         self.template_cache = {}
         self.template_gray_cache = {}
         self.scaled_template_cache = {}
-        self.file_template_cache = {}
+        self._akaze_cache = {}  # 实例级缓存，每次运行重建
         self.match_calibration = {}
         self.config = {}
         self.use_split_candidates = False
@@ -55,14 +54,31 @@ class TemplateMatcher:
         self.set_region("全界面", rect)
 
     # ---------- 模板加载 + 缓存 ----------
+    @staticmethod
+    def _cv_read(actual_path, flags):
+        """兼容 Windows 中文路径的 cv2.imread 替代：np.fromfile + cv2.imdecode"""
+        if not isinstance(actual_path, str) or not actual_path:
+            return None
+        try:
+            if not os.path.exists(actual_path):
+                return None
+        except Exception:
+            return None
+        try:
+            arr = np.fromfile(actual_path, dtype=np.uint8)
+            if arr.size == 0:
+                return None
+            return cv2.imdecode(arr, flags)
+        except Exception:
+            return None
+
     def load_template(self, template_path):
         actual_path = get_img_path(template_path)
         cache_key = actual_path
         if cache_key in self.template_cache:
             return self.template_cache[cache_key], actual_path
-        tpl = cv2.imread(actual_path, cv2.IMREAD_COLOR)
-        if tpl is not None:
-            self.template_cache[cache_key] = tpl
+        tpl = self._cv_read(actual_path, cv2.IMREAD_COLOR)
+        self.template_cache[cache_key] = tpl
         return tpl, actual_path
 
     def load_template_gray(self, template_path):
@@ -70,9 +86,8 @@ class TemplateMatcher:
         cache_key = ("gray", actual_path)
         if cache_key in self.template_gray_cache:
             return self.template_gray_cache[cache_key]
-        tpl = cv2.imread(actual_path, cv2.IMREAD_GRAYSCALE)
-        if tpl is not None:
-            self.template_gray_cache[cache_key] = tpl
+        tpl = self._cv_read(actual_path, cv2.IMREAD_GRAYSCALE)
+        self.template_gray_cache[cache_key] = tpl
         return tpl
 
     def get_images_root_dir(self):
@@ -127,16 +142,17 @@ class TemplateMatcher:
 
         for s in [
             preferred_scale, *hinted_scales,
+            # 高精度微调（离 1.0 近的优先）
             preferred_scale * 0.995, preferred_scale * 1.005,
             preferred_scale * 0.99, preferred_scale * 1.01,
             preferred_scale * 0.985, preferred_scale * 1.015,
-            1.0, 0.99, 1.01, 0.985, 1.015, 0.97, 1.03, 0.95, 1.05,
+            1.0, 0.99, 1.01, 0.985, 1.015,
+            # 中范围：Qflow 的 0.8~1.2 核心区间必须在 fast_mode 内覆盖到
+            0.97, 1.03, 0.95, 1.05, 0.92, 1.08, 0.9, 1.1, 0.88, 1.12,
+            # 大范围：极端缩放情形
+            0.85, 1.15, 0.8, 0.75, 0.7,
         ]:
             add_scale(s)
-        for s in [0.92, 1.08, 0.9, 1.1, 0.88, 1.12, 0.85, 1.15, 0.8, 0.75, 0.7]:
-            add_scale(s)
-        if fast_mode:
-            return scales[:16]
         return scales
 
     def get_calibrated_gray_threshold(self, threshold):
@@ -161,11 +177,6 @@ class TemplateMatcher:
             return self.scaled_template_cache[mem_key], actual_path
 
         scale_key = str(round(scale, 3))
-        if rel_key in self.file_template_cache:
-            tpl = self.file_template_cache[rel_key].get(scale_key)
-            if tpl is not None:
-                self.scaled_template_cache[mem_key] = tpl
-                return tpl, actual_path
 
         template_orig, actual_path = self.load_template(template_path)
         if template_orig is None:
@@ -183,6 +194,12 @@ class TemplateMatcher:
     def find_image_in_screen(self, screen_bgr, template_path, region=None, threshold=0.75, fast_mode=True):
         try:
             scales_to_try = self.get_scales_to_try(fast_mode=fast_mode)
+            best_score = 0.0
+            best_left = -1
+            best_top = -1
+            best_w = -1
+            best_h = -1
+            best_scale = 1.0
             for scale in scales_to_try:
                 tpl_c, _ = self.get_scaled_template(template_path, scale)
                 if tpl_c is None:
@@ -194,17 +211,41 @@ class TemplateMatcher:
                     continue
                 res = cv2.matchTemplate(screen_bgr, tpl_c, cv2.TM_CCOEFF_NORMED)
                 _, max_val, _, max_loc = cv2.minMaxLoc(res)
+                if max_val > best_score:
+                    best_score = float(max_val)
+                    best_left = max_loc[0]
+                    best_top = max_loc[1]
+                    best_w = w
+                    best_h = h
+                    best_scale = scale
                 if max_val >= threshold:
-                    pos = (
-                        max_loc[0] + w // 2 + (region[0] if region else 0),
-                        max_loc[1] + h // 2 + (region[1] if region else 0),
-                    )
-                    self.last_positions[template_path] = pos
+                    left = best_left + (region[0] if region else 0)
+                    top = best_top + (region[1] if region else 0)
+                    cx = left + best_w // 2
+                    cy = top + best_h // 2
                     self.log(
                         f"[ImageMatch] 命中: {template_path} | "
                         f"得分: {max_val:.3f} (阈值 {threshold}) | 缩放: {scale:.3f}"
                     )
-                    return pos
+                    return {
+                        "left": left, "top": top,
+                        "width": best_w, "height": best_h,
+                        "score": float(max_val), "cx": cx, "cy": cy,
+                    }
+            if best_score >= threshold:
+                left = best_left + (region[0] if region else 0)
+                top = best_top + (region[1] if region else 0)
+                cx = left + best_w // 2
+                cy = top + best_h // 2
+                self.log(
+                    f"[ImageMatch] 命中(最佳匹配): {template_path} | "
+                    f"得分: {best_score:.3f} (阈值 {threshold}) | 缩放: {best_scale:.3f}"
+                )
+                return {
+                    "left": left, "top": top,
+                    "width": best_w, "height": best_h,
+                    "score": float(best_score), "cx": cx, "cy": cy,
+                }
             return None
         except Exception as e:
             self.log(f"find_image_in_screen 异常: {e}", "WARN")
@@ -252,7 +293,14 @@ class TemplateMatcher:
             if tpl_gray_raw is None:
                 return None
             best_score = 0.0
-            best_position = None
+            best_left = -1
+            best_top = -1
+            best_w = -1
+            best_h = -1
+            best_scale = 1.0
+            best_inverted = False
+            reg_x = region[0] if region else 0
+            reg_y = region[1] if region else 0
             for scale in scales_to_try:
                 tpl_gray = tpl_gray_raw
                 if scale != 1.0:
@@ -264,32 +312,71 @@ class TemplateMatcher:
                 _, max_val, _, max_loc = cv2.minMaxLoc(res)
                 if max_val > best_score:
                     best_score = float(max_val)
-                    best_position = (
-                        max_loc[0] + w // 2 + (region[0] if region else 0),
-                        max_loc[1] + h // 2 + (region[1] if region else 0),
-                    )
+                    best_left = max_loc[0]
+                    best_top = max_loc[1]
+                    best_w = w
+                    best_h = h
+                    best_scale = scale
+                    best_inverted = False
                 if max_val >= effective_threshold:
+                    left = best_left + reg_x
+                    top = best_top + reg_y
+                    cx = left + best_w // 2
+                    cy = top + best_h // 2
                     self.log(
                         f"[GrayMatch] 命中: {template_path} | 得分: {max_val:.3f} "
                         f"(阈值 {effective_threshold}) | 缩放: {scale:.3f}"
                     )
-                    return (
-                        max_loc[0] + w // 2 + (region[0] if region else 0),
-                        max_loc[1] + h // 2 + (region[1] if region else 0),
-                    )
+                    return {
+                        "left": left, "top": top,
+                        "width": best_w, "height": best_h,
+                        "score": float(max_val), "cx": cx, "cy": cy,
+                    }
                 if invert_mode:
                     tpl_inv = 255 - tpl_gray
                     res_inv = cv2.matchTemplate(screen_gray, tpl_inv, cv2.TM_CCOEFF_NORMED)
                     _, max_val_inv, _, max_loc_inv = cv2.minMaxLoc(res_inv)
+                    if max_val_inv > best_score:
+                        best_score = float(max_val_inv)
+                        best_left = max_loc_inv[0]
+                        best_top = max_loc_inv[1]
+                        best_w = w
+                        best_h = h
+                        best_scale = scale
+                        best_inverted = True
                     if max_val_inv >= effective_threshold:
+                        left = max_loc_inv[0] + reg_x
+                        top = max_loc_inv[1] + reg_y
+                        cx = left + w // 2
+                        cy = top + h // 2
                         self.log(
                             f"[GrayMatch] 命中(反相): {template_path} | 得分: {max_val_inv:.3f} "
                             f"(阈值 {effective_threshold}) | 缩放: {scale:.3f}"
                         )
-                        return (
-                            max_loc_inv[0] + w // 2 + (region[0] if region else 0),
-                            max_loc_inv[1] + h // 2 + (region[1] if region else 0),
-                        )
+                        return {
+                            "left": left, "top": top,
+                            "width": w, "height": h,
+                            "score": float(max_val_inv), "cx": cx, "cy": cy,
+                            "inverted": True,
+                        }
+            if best_score >= effective_threshold:
+                left = best_left + reg_x
+                top = best_top + reg_y
+                cx = left + best_w // 2
+                cy = top + best_h // 2
+                inv_note = "(反相)" if best_inverted else ""
+                self.log(
+                    f"[GrayMatch] 命中{inv_note}(最佳匹配): {template_path} | "
+                    f"得分: {best_score:.3f} (阈值 {effective_threshold}) | 缩放: {best_scale:.3f}"
+                )
+                result = {
+                    "left": left, "top": top,
+                    "width": best_w, "height": best_h,
+                    "score": float(best_score), "cx": cx, "cy": cy,
+                }
+                if best_inverted:
+                    result["inverted"] = True
+                return result
             return None
         except Exception as e:
             self.log(f"find_image_gray 异常: {e}", "WARN")
@@ -309,6 +396,140 @@ class TemplateMatcher:
             return None
         except Exception as e:
             self.log(f"find_any_image_gray 异常: {e}", "WARN")
+            return None
+
+    # ---------- AKAZE 特征点匹配 ----------
+
+    def _load_akaze_features(self, template_path):
+        """加载模板图并提取 AKAZE 特征点，带缓存。返回 (kp, des, tpl_h, tpl_w) 或 None。"""
+        actual_path = get_img_path(template_path)
+        cache_key = ("akaze", actual_path)
+        if cache_key in self._akaze_cache:
+            return self._akaze_cache[cache_key]
+        tpl = self._cv_read(actual_path, cv2.IMREAD_GRAYSCALE)
+        if tpl is None:
+            self._akaze_cache[cache_key] = None
+            return None
+        akaze = cv2.AKAZE_create()
+        kp, des = akaze.detectAndCompute(tpl, None)
+        if des is None or len(kp) < 4:
+            # 特征点太少，AKAZE 无法可靠匹配
+            self.log(f"[AKAZE] 模板特征点不足({len(kp) if kp else 0}个)，需≥4个: {template_path}", "WARN")
+            self._akaze_cache[cache_key] = None
+            return None
+        result = (kp, des, tpl.shape[0], tpl.shape[1])
+        self._akaze_cache[cache_key] = result
+        return result
+
+    def find_image_akaze(self, template_path, region=None, threshold=0.15):
+        """AKAZE 特征点匹配。
+
+        抗颜色变化、光照变化、局部遮挡（选中框）、轻微旋转/缩放。
+        行为与 Qflow 对齐：
+        - min_matches 恒为 4（不再按模板特征数量的百分比阶梯提高要求）
+        - 唯一硬门槛：inliers < 4 拒绝（RANSAC 几何约束下限）
+        - threshold 仅作日志参考，不阻断匹配（Qflow 不检查内点比例，confidence 不传入）
+        - score 公式与 Qflow 一致: min(1.0, len(good)/4*0.5 + 0.5)，good≥4 即满分
+        """
+        if not self.is_running:
+            return None
+        try:
+            feat = self._load_akaze_features(template_path)
+            if feat is None:
+                return None
+            tpl_kp, tpl_des, tpl_h, tpl_w = feat
+
+            # 截图
+            screen_bgr = self.capture_region(region)
+            screen_gray = cv2.cvtColor(screen_bgr, cv2.COLOR_BGR2GRAY)
+
+            # 提取屏幕特征点
+            akaze = cv2.AKAZE_create()
+            scr_kp, scr_des = akaze.detectAndCompute(screen_gray, None)
+            if scr_des is None or len(scr_kp) < 4:
+                self.log(f"[AKAZE] 屏幕特征点不足({len(scr_kp) if scr_kp else 0}个)", "DEBUG")
+                return None
+
+            # BFMatcher + Lowe 比率检验
+            bf = cv2.BFMatcher(cv2.NORM_HAMMING)
+            raw_matches = bf.knnMatch(tpl_des, scr_des, k=2)
+            good = []
+            for match_pair in raw_matches:
+                if len(match_pair) < 2:
+                    continue
+                m, n = match_pair[0], match_pair[1]
+                if m.distance < 0.75 * n.distance:
+                    good.append(m)
+
+            # 对齐 Qflow：恒为 4 个 good 匹配起步，不再按特征总数百分比额外加压
+            min_matches = 4
+            if len(good) < min_matches:
+                self.log(
+                    f"[AKAZE] 匹配点不足: good={len(good)} < {min_matches} "
+                    f"(tpl={len(tpl_kp)}, scr={len(scr_kp)})",
+                    "DEBUG",
+                )
+                return None
+
+            # RANSAC 求单应矩阵
+            src_pts = np.float32([tpl_kp[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+            dst_pts = np.float32([scr_kp[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+            M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+            if M is None or mask is None:
+                self.log("[AKAZE] RANSAC 求单应矩阵失败", "DEBUG")
+                return None
+
+            inliers = int(mask.sum())
+            inlier_ratio = inliers / len(good) if len(good) > 0 else 0.0
+
+            # 与 Qflow 对齐：只要有成功的单应矩阵 + good≥4 就视为匹配成功
+            # - inliers < 4: RANSAC 无法形成有效几何约束，拒绝（唯一硬门槛）
+            # - inlier_ratio < threshold: 仅记日志，不阻断（Qflow 不检查内点比例）
+            match_score = min(1.0, len(good) / 4.0 * 0.5 + 0.5)  # Qflow score 公式
+            if inliers < 4:
+                self.log(
+                    f"[AKAZE] 内点过少拒绝: inliers={inliers}/{len(good)} "
+                    f"ratio={inlier_ratio:.2f}（RANSAC 无法形成有效几何约束）",
+                    "DEBUG",
+                )
+                return None
+            if inlier_ratio < float(threshold):
+                self.log(
+                    f"[AKAZE] 内点比例偏低(仅记日志): inliers={inliers}/{len(good)} "
+                    f"ratio={inlier_ratio:.2f} < threshold={threshold:.2f}；放行（与 Qflow 一致）",
+                    "DEBUG",
+                )
+
+            # 计算模板四角在屏幕上的投影位置（全部4角，避免旋转/透视时低估尺寸）
+            corners = np.float32([[0, 0], [tpl_w, 0], [0, tpl_h], [tpl_w, tpl_h]]).reshape(-1, 1, 2)
+            dst = cv2.perspectiveTransform(corners, M).reshape(-1, 2)
+
+            left = int(dst[:, 0].min())
+            top = int(dst[:, 1].min())
+            right = int(dst[:, 0].max())
+            bottom = int(dst[:, 1].max())
+            w = max(1, right - left)
+            h = max(1, bottom - top)
+
+            # 加上 region 偏移（如果 region 模式截图，坐标是相对 region 的）
+            if region:
+                left += region[0]
+                top += region[1]
+
+            cx = left + w // 2
+            cy = top + h // 2
+            self.log(
+                f"[AKAZE] 命中: {template_path} | good={len(good)} 内点={inliers}/{len(good)} "
+                f"(ratio={inlier_ratio:.2f} score={match_score:.2f}) | 模板={tpl_w}x{tpl_h} → "
+                f"屏幕矩形=({left},{top},{w},{h}) 中心=({cx},{cy})",
+            )
+            return {
+                "left": left, "top": top, "width": w, "height": h,
+                "score": match_score, "cx": cx, "cy": cy,
+            }
+
+        except Exception as e:
+            self.log(f"find_image_akaze 异常: {e}", "WARN")
             return None
 
     # ---------- 等待版 ----------

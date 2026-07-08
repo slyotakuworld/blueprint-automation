@@ -3,6 +3,7 @@ import os
 import tempfile
 import time
 import traceback
+import contextlib
 from collections import deque
 from datetime import datetime
 from typing import Any, Deque, Dict, List, Optional, Tuple
@@ -21,7 +22,6 @@ from ..core.models import (
 )
 from ..core.node_library import NODE_LIBRARY
 from .debug_annotator import annotate_step
-from .hotkey_manager import HotkeyManager
 from .input_actions import InputActions
 from .screen_capture import ScreenCapture
 from .template_matcher import TemplateMatcher
@@ -684,10 +684,18 @@ def execute_BindWindow(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]
 
 
 # ---------------- 特征识别辅助 ----------------
-def _findimage_feature_match(ctx, params: Dict[str, Any], region, win_origin, search_mode: str,
-                             timeout_s: float, auto_scroll: bool, scroll_dy: int, scroll_dx: int,
-                             strategy: str, base_threshold: float, offset_x: int, offset_y: int):
-    """特征识别辅助匹配：将模板拆成多个小特征独立匹配，再交叉验证位置。
+def _findimage_feature_match(ctx, params: Dict[str, Any], region,
+                             timeout_s: float, auto_scroll: bool, scroll_dy: int,
+                             base_threshold: float, offset_x: int, offset_y: int,
+                             strategy: str = "template", template_pos: dict = None):
+    """特征识别辅助匹配。
+
+    验证模式（template_pos 不为 None）：模板已找到，在模板命中位置附近的小区域内
+    逐一验证特征是否存在。避免全屏搜索小图导致的误匹配。
+
+    兜底模式（template_pos 为 None）：模板未找到，全屏搜索特征并交叉验证位置，
+    尝试通过特征反推模板位置。
+
     返回 (abs_cx, abs_cy, avg_score) 或 None。
     """
     import json as _json
@@ -743,57 +751,135 @@ def _findimage_feature_match(ctx, params: Dict[str, Any], region, win_origin, se
     valid_count = sum(1 for p in feat_paths if p is not None)
     ctx.log(f"[FindImage·特征] 共{len(features)}个特征，有效{valid_count}个，容差={tolerance}px，最少命中={min_hits}", "DEBUG")
 
-    # 匹配阈值用略低的值，因为特征图小，匹配可能不够稳定
-    feat_threshold = max(0.6, base_threshold - 0.1)
+    # 阈值计算：验证模式用与主策略相同的阈值（不降低），兜底模式适当降低
+    if strategy == "gray" and ctx.matcher is not None and hasattr(ctx.matcher, "get_calibrated_gray_threshold"):
+        calibrated = ctx.matcher.get_calibrated_gray_threshold(base_threshold)
+        if template_pos is not None:
+            # 验证模式：小窗口搜索，不需要降低阈值
+            feat_threshold = max(0.55, min(0.97, float(calibrated)))
+        else:
+            # 兜底模式：全屏搜索小图，适当降低阈值
+            feat_threshold = max(0.55, min(0.97, float(calibrated) - 0.1))
+    else:
+        if template_pos is not None:
+            feat_threshold = max(0.5, float(base_threshold))
+        else:
+            feat_threshold = max(0.5, float(base_threshold) - 0.1)
 
+    def _cleanup():
+        for cp in cleanup_paths:
+            try:
+                os.unlink(cp)
+            except Exception:
+                pass
+
+    def _match_one(fpath, search_region):
+        """在指定区域内匹配单个特征，返回 pos dict 或 None。"""
+        try:
+            if strategy == "gray":
+                return ctx.matcher.find_image_gray(fpath, region=search_region, threshold=feat_threshold, fast_mode=True)
+            else:
+                return ctx.matcher.find_image(fpath, region=search_region, threshold=feat_threshold, fast_mode=True)
+        except Exception:
+            return None
+
+    # ================================================================
+    # 验证模式：模板已找到，在模板命中位置附近验证特征
+    # ================================================================
+    if template_pos is not None and isinstance(template_pos, dict):
+        tpl_left = int(template_pos.get("left", 0))
+        tpl_top = int(template_pos.get("top", 0))
+        tpl_w = int(template_pos.get("width", 0))
+        tpl_h = int(template_pos.get("height", 0))
+
+        # 从模板匹配结果推算实际缩放比例
+        if template_w > 0 and tpl_w > 0:
+            scale = tpl_w / template_w
+        else:
+            scale = 1.0
+
+        ctx.log(f"[FindImage·特征] 验证模式：模板位置=({tpl_left},{tpl_top},{tpl_w},{tpl_h}) scale={scale:.3f}", "DEBUG")
+
+        verified = 0
+        total = 0
+        scores = []
+        for i, fpath in enumerate(feat_paths):
+            if fpath is None:
+                continue
+            total += 1
+            rx, ry, fw, fh = feat_info[i]
+            # 特征在屏幕上的期望位置（考虑缩放）
+            exp_x = tpl_left + int(rx * scale)
+            exp_y = tpl_top + int(ry * scale)
+            # 在期望位置附近开一个小窗口搜索（容差的2倍，最少30px）
+            search_pad = max(tolerance * 2, 30)
+            search_w = int(fw * scale) + search_pad * 2
+            search_h = int(fh * scale) + search_pad * 2
+            search_region = (exp_x - search_pad, exp_y - search_pad, search_w, search_h)
+
+            fpos = _match_one(fpath, search_region)
+            if fpos is not None:
+                verified += 1
+                s = float(fpos.get("score", feat_threshold)) if isinstance(fpos, dict) else feat_threshold
+                scores.append(s)
+                ctx.log(f"[FindImage·特征] 特征{i}验证通过 (期望=({exp_x},{exp_y}) score={s:.3f})", "DEBUG")
+            else:
+                ctx.log(f"[FindImage·特征] 特征{i}验证失败 (期望=({exp_x},{exp_y}) 区域={search_region})", "DEBUG")
+
+        if verified >= min_hits:
+            # 验证通过，返回模板中心（已知位置）
+            abs_cx = tpl_left + tpl_w // 2 + offset_x
+            abs_cy = tpl_top + tpl_h // 2 + offset_y
+            avg_score = sum(scores) / len(scores) if scores else 1.0
+            ctx.log(f"[FindImage·特征] 验证成功！{verified}/{total}个特征通过，模板中心=({abs_cx},{abs_cy})", "SUCCESS")
+            _cleanup()
+            return (abs_cx, abs_cy, avg_score)
+        else:
+            ctx.log(f"[FindImage·特征] 验证失败：{verified}/{total}个特征通过 < 最低{min_hits}", "DEBUG")
+            _cleanup()
+            return None
+
+    # ================================================================
+    # 兜底模式：模板未找到，全屏搜索特征 + 交叉验证
+    # ================================================================
     t0 = time.time()
     while (time.time() - t0) < timeout_s and ctx.is_running:
         wait_if_paused(ctx)
         if not ctx.is_running:
             break
 
-        # 1) 对每个特征独立匹配
+        # 1) 对每个特征在全屏（或指定 region）内独立匹配
         hits = []  # [(feat_idx, screen_cx, screen_cy, score)]
         for i, fpath in enumerate(feat_paths):
             if fpath is None:
                 continue
-            try:
-                rx, ry, fw, fh = feat_info[i]
-                if strategy == "feature":
-                    fpos = ctx.matcher.find_image(fpath, region=region, threshold=feat_threshold, fast_mode=False)
+            fpos = _match_one(fpath, region)
+            if fpos is not None:
+                if isinstance(fpos, dict):
+                    fl = int(fpos.get("left", 0)); ft = int(fpos.get("top", 0))
+                    fwi = int(fpos.get("width", fw)); fhi = int(fpos.get("height", fh))
+                    raw_s = fpos.get("score")
+                    fscore = float(raw_s) if isinstance(raw_s, (int, float)) else float(feat_threshold)
+                elif isinstance(fpos, (list, tuple)) and len(fpos) >= 4:
+                    fl, ft, fwi, fhi = int(fpos[0]), int(fpos[1]), int(fpos[2]), int(fpos[3])
+                    fscore = float(feat_threshold)
+                elif isinstance(fpos, (list, tuple)) and len(fpos) >= 2:
+                    fl, ft, fwi, fhi = int(fpos[0]), int(fpos[1]), fw, fh
+                    fscore = float(feat_threshold)
                 else:
-                    fpos = ctx.matcher.find_image_gray(fpath, region=region, threshold=feat_threshold, fast_mode=True)
-                    if fpos is None:
-                        fpos = ctx.matcher.find_image(fpath, region=region, threshold=feat_threshold, fast_mode=False)
-                if fpos is not None:
-                    # 提取特征中心（绝对屏幕坐标）
-                    if isinstance(fpos, dict):
-                        fl, ft = int(fpos.get("left", 0)), int(fpos.get("top", 0))
-                        fwi, fhi = int(fpos.get("width", fw)), int(fpos.get("height", fh))
-                    elif isinstance(fpos, (list, tuple)) and len(fpos) >= 4:
-                        fl, ft, fwi, fhi = int(fpos[0]), int(fpos[1]), int(fpos[2]), int(fpos[3])
-                    elif isinstance(fpos, (list, tuple)) and len(fpos) >= 2:
-                        fl, ft, fwi, fhi = int(fpos[0]), int(fpos[1]), fw, fh
-                    else:
-                        continue
-                    scx = fl + fwi // 2
-                    scy = ft + fhi // 2
-                    hits.append((i, scx, scy, 0.9))
-            except Exception:
-                pass
+                    continue
+                scx = fl + fwi // 2
+                scy = ft + fhi // 2
+                hits.append((i, scx, scy, fscore))
 
         if len(hits) < min(2, min_hits):
-            # 命中太少，重试
             if auto_scroll and ctx.is_running and (time.time() - t0) < timeout_s:
                 try:
                     import pyautogui
+                    if region is not None:
+                        pyautogui.moveTo(int(region[0]) + int(region[2]) // 2, int(region[1]) + int(region[3]) // 2)
                     if scroll_dy != 0:
                         pyautogui.scroll(scroll_dy)
-                    if scroll_dx != 0:
-                        try:
-                            pyautogui.hscroll(scroll_dx)
-                        except Exception:
-                            pass
                 except Exception:
                     pass
                 t_wait = time.time()
@@ -814,23 +900,25 @@ def _findimage_feature_match(ctx, params: Dict[str, Any], region, win_origin, se
                 rxb, ryb, _, _ = feat_info[idx_b]
                 dist_t = _math.sqrt((rxb - rxa) ** 2 + (ryb - rya) ** 2)
                 dist_s = _math.sqrt((sxb - sxa) ** 2 + (syb - sya) ** 2)
-                if dist_t > 5:  # 模板间距太小不靠谱
+                if dist_t > 5:
                     scales.append(dist_s / dist_t)
 
         if scales:
             scale = sum(scales) / len(scales)
         else:
-            # 回退：用 capture_width
             cap_w = int(params.get("feature_capture_width", 0) or 0)
-            cur_w = win_origin[0]  # 临时，下面修正
-            try:
-                target = ctx.get_var("target") if hasattr(ctx, "get_var") else None
-                if isinstance(target, dict):
-                    r = target.get("rect")
-                    if isinstance(r, (tuple, list)) and len(r) >= 3:
-                        cur_w = int(r[2])  # width
-            except Exception:
-                pass
+            cur_w = 0
+            if region is not None and len(region) >= 3:
+                cur_w = int(region[2])
+            if cur_w <= 0:
+                try:
+                    target = ctx.get_var("target") if hasattr(ctx, "get_var") else None
+                    if isinstance(target, dict):
+                        r = target.get("rect")
+                        if isinstance(r, (tuple, list)) and len(r) >= 3:
+                            cur_w = int(r[2])
+                except Exception:
+                    pass
             if cap_w > 0 and cur_w > 0:
                 scale = cur_w / cap_w
             else:
@@ -845,7 +933,6 @@ def _findimage_feature_match(ctx, params: Dict[str, Any], region, win_origin, se
         for hit in hits[1:]:
             idx, sx, sy, sc = hit
             rx, ry, _, _ = feat_info[idx]
-            # 期望位置 = 基准屏幕位置 + (模板相对偏移差) × scale
             exp_x = base_sx + (rx - base_rx) * scale
             exp_y = base_sy + (ry - base_ry) * scale
             err = _math.sqrt((sx - exp_x) ** 2 + (sy - exp_y) ** 2)
@@ -859,13 +946,10 @@ def _findimage_feature_match(ctx, params: Dict[str, Any], region, win_origin, se
             if auto_scroll and ctx.is_running and (time.time() - t0) < timeout_s:
                 try:
                     import pyautogui
+                    if region is not None:
+                        pyautogui.moveTo(int(region[0]) + int(region[2]) // 2, int(region[1]) + int(region[3]) // 2)
                     if scroll_dy != 0:
                         pyautogui.scroll(scroll_dy)
-                    if scroll_dx != 0:
-                        try:
-                            pyautogui.hscroll(scroll_dx)
-                        except Exception:
-                            pass
                 except Exception:
                     pass
                 time.sleep(0.3)
@@ -884,31 +968,19 @@ def _findimage_feature_match(ctx, params: Dict[str, Any], region, win_origin, se
         origin_x = sum(origins_x) / len(origins_x)
         origin_y = sum(origins_y) / len(origins_y)
 
-        # 模板中心
         if template_w > 0 and template_h > 0:
             abs_cx = int(origin_x + template_w / 2) + offset_x
             abs_cy = int(origin_y + template_h / 2) + offset_y
         else:
-            # 没有模板尺寸，用第一个特征中心
             abs_cx = valid_hits[0][1] + offset_x
             abs_cy = valid_hits[0][2] + offset_y
 
         avg_score = sum(h[3] for h in valid_hits) / len(valid_hits)
         ctx.log(f"[FindImage·特征] 匹配成功！{len(valid_hits)}/{len(feat_paths)}个特征通过，模板原点=({int(origin_x)},{int(origin_y)}) 中心=({abs_cx},{abs_cy}) score={avg_score:.2f}", "SUCCESS")
-        # 清理临时文件
-        for cp in cleanup_paths:
-            try:
-                os.unlink(cp)
-            except Exception:
-                pass
+        _cleanup()
         return (abs_cx, abs_cy, avg_score)
 
-    # 清理临时文件
-    for cp in cleanup_paths:
-        try:
-            os.unlink(cp)
-        except Exception:
-            pass
+    _cleanup()
     return None
 
 
@@ -918,9 +990,9 @@ def execute_FindImage(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any])
     找图节点：
       - 匹配策略 match_strategy: hybrid(智能混合) / template(模板匹配) / feature(特征匹配)
       - 超时 timeout_seconds：在此时间内循环重试
-      - 未找到时尝试滚动 auto_scroll：把鼠标移到搜索区/屏幕中心后，先垂直滚动 scroll_dy，再水平滚动 scroll_dx
-      - 找到后执行 after_action: none / click / double_click / right_click / move_to，带 offset (X,Y)
-      - 命中：out_pos(中心坐标) / out_found=True / out_score；未命中：out_found=False 但照常走 out_exec（不再有失败策略终止全局）
+      - 滚动重试 scroll_dy：非0时，找图失败后将鼠标移到搜索区域中心滚动一次再重试
+      - 找到后执行 after_action: none / click / double_click / right_click，带 offset (X,Y)
+      - 命中：out_pos(中心坐标) / out_found=True；未命中：out_found=False 但照常走 out_exec
     """
     wait_if_paused(ctx)
     # 1) 读参数
@@ -935,14 +1007,17 @@ def execute_FindImage(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any])
     search_mode = str(node.params.get("search_mode", "relative") or "relative")
     threshold = inputs.get("in_threshold")
     if threshold is None:
-        threshold = float(node.params.get("threshold", 0.75) or 0.75)
+        threshold = float(node.params.get("threshold", 0.9) or 0.9)
+    try:
+        threshold = float(threshold)
+    except (TypeError, ValueError):
+        threshold = 0.9
+    akaze_thr = max(0.01, min(1.0, float(threshold)))
     strategy = str(node.params.get("match_strategy", "hybrid") or "hybrid")
     timeout_s = max(0.1, float(node.params.get("timeout_seconds", 10.0) or 10.0))
-    auto_scroll = bool(node.params.get("auto_scroll", False))
-    scroll_dy = int(node.params.get("scroll_dy", -500) or -500)
-    scroll_dx = int(node.params.get("scroll_dx", 0) or 0)
+    auto_scroll = (int(node.params.get("scroll_dy", 0) or 0) != 0)
+    scroll_dy = int(node.params.get("scroll_dy", 0) or 0)
     after_action = str(node.params.get("after_action", "none") or "none")
-    use_feature_assist = bool(node.params.get("use_feature_assist", False))
     _tpl_off = node.params.get("offset", (0, 0))
     if isinstance(_tpl_off, (list, tuple)) and len(_tpl_off) >= 2:
         try:
@@ -953,30 +1028,7 @@ def execute_FindImage(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any])
     else:
         offset_x, offset_y = 0, 0
 
-    # 1.5) 计算搜索区域：relative 模式截取目标窗口，absolute 模式全屏
-    region = None  # None=全屏；(x,y,w,h)=窗口区域
-    win_origin = (0, 0)  # 窗口左上角偏移，用于坐标转换
-    if search_mode == "relative":
-        # 优先临时目标窗口
-        temp = _resolve_temp_target_rect(ctx, node.params)
-        if temp is not None:
-            rect = temp[1]  # (left, top, right, bottom)
-            region = (int(rect[0]), int(rect[1]), int(rect[2]) - int(rect[0]), int(rect[3]) - int(rect[1]))
-            win_origin = (int(rect[0]), int(rect[1]))
-            ctx.log(f"[FindImage] 相对目标窗口截图 region={region} (临时目标)", "DEBUG")
-        else:
-            # 回退到全局目标程序
-            try:
-                target = ctx.get_var("target") if hasattr(ctx, "get_var") else None
-                if isinstance(target, dict):
-                    r = target.get("rect")
-                    if isinstance(r, (tuple, list)) and len(r) >= 4:
-                        region = (int(r[0]), int(r[1]), int(r[2]), int(r[3]))
-                        win_origin = (int(r[0]), int(r[1]))
-                        ctx.log(f"[FindImage] 相对目标窗口截图 region={region} (全局目标)", "DEBUG")
-            except Exception:
-                pass
-    # absolute 模式：region=None，全屏截图
+    feature_assist_mode = str(node.params.get("use_feature_assist", "off") or "off")
 
     # 2) 模板有效性检查
     use_path: Optional[str] = None
@@ -992,183 +1044,230 @@ def execute_FindImage(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any])
             use_path = tmp_path
         except Exception:
             use_path = None
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
     if not use_path:
         ctx.log("[FindImage] 模板无效（路径不存在 & 无PIL缓存） -> out_found=False", "WARN")
         annotate_step(ctx, node, "find", note="ERROR: invalid template")
         return (
-            {"out_pos": None, "out_found": False, "out_score": 0.0},
+            {"out_pos": None, "out_found": False},
             ["out_exec"], "",
         )
 
     # 3) 超时空转 + 滚动重试 循环
     t0 = time.time()
     pos = None
-    score = 0.0
     last_err = ""
-    # fast_mode / use_gray 从 strategy 推导
-    if strategy == "template":
-        do_gray, do_fast = True, True
-    elif strategy == "feature":
-        do_gray, do_fast = False, False
-    else:  # hybrid
-        do_gray, do_fast = True, True
 
-    try:
-        while (time.time() - t0) < timeout_s and ctx.is_running:
-            wait_if_paused(ctx)
-            if not ctx.is_running:
-                break
-            # 尝试匹配
-            try:
-                if ctx.matcher is not None:
-                    if strategy == "template":
-                        pos = ctx.matcher.find_image_gray(
-                            str(use_path), region=region, threshold=threshold, fast_mode=True
-                        )
-                    elif strategy == "feature":
-                        pos = ctx.matcher.find_image(
-                            str(use_path), region=region, threshold=threshold, fast_mode=False
-                        )
-                    else:  # hybrid：灰度模板快筛，失败再试特征
-                        pos = ctx.matcher.find_image_gray(
-                            str(use_path), region=region, threshold=threshold, fast_mode=True
-                        )
-                        if pos is None:
-                            pos = ctx.matcher.find_image(
-                                str(use_path), region=region, threshold=threshold, fast_mode=False
-                            )
-                    if pos is not None:
-                        score = 1.0
-            except Exception as e:
-                last_err = str(e)
-                ctx.log(f"[FindImage] 匹配异常: {e}", "WARN")
+    with _temp_window_foreground(ctx, node.params):
+        try:
+            # region 在窗口前置之后计算，避免最小化窗口恢复后 rect 失效
+            region = None  # None=全屏；(x,y,w,h)=窗口区域
+            win_origin = (0, 0)
+            if search_mode == "relative":
+                temp = _resolve_temp_target_rect(ctx, node.params)
+                if temp is not None:
+                    rect = temp[1]  # (left, top, right, bottom)
+                    region = (int(rect[0]), int(rect[1]), int(rect[2]) - int(rect[0]), int(rect[3]) - int(rect[1]))
+                    win_origin = (int(rect[0]), int(rect[1]))
+                    ctx.log(f"[FindImage] 相对目标窗口截图 region={region} (临时目标)", "DEBUG")
+                else:
+                    try:
+                        target = ctx.get_var("target") if hasattr(ctx, "get_var") else None
+                        if isinstance(target, dict):
+                            r = target.get("rect")
+                            if isinstance(r, (tuple, list)) and len(r) >= 4:
+                                region = (int(r[0]), int(r[1]), int(r[2]), int(r[3]))
+                                win_origin = (int(r[0]), int(r[1]))
+                                ctx.log(f"[FindImage] 相对目标窗口截图 region={region} (全局目标)", "DEBUG")
+                    except Exception:
+                        pass
 
-            if pos is not None:
-                break
-
-            # 未命中：特征识别辅助（常规匹配失败时自动启用）
-            if use_feature_assist and ctx.is_running:
-                feat_result = _findimage_feature_match(
-                    ctx, node.params, region, win_origin, search_mode,
-                    timeout_s - (time.time() - t0),  # 剩余时间
-                    auto_scroll, scroll_dy, scroll_dx,
-                    strategy, threshold, offset_x, offset_y
-                )
-                if feat_result is not None:
-                    abs_cx_f, abs_cy_f, score_f = feat_result
-                    # 构造 pos 用于后续统一处理
-                    pos = {
-                        "left": abs_cx_f - offset_x,
-                        "top": abs_cy_f - offset_y,
-                        "width": 1,
-                        "height": 1,
-                        "_feature_assist": True,
-                    }
-                    score = score_f
+            while (time.time() - t0) < timeout_s and ctx.is_running:
+                wait_if_paused(ctx)
+                if not ctx.is_running:
                     break
-
-            # 未命中：是否需要滚动
-            if auto_scroll and ctx.is_running and (time.time() - t0) < timeout_s:
+                # 尝试匹配
                 try:
-                    import pyautogui
-                    # 在当前鼠标位置直接滚动，不移动鼠标
-                    if scroll_dy != 0:
-                        pyautogui.scroll(scroll_dy)
-                    if scroll_dx != 0:
-                        # pyautogui 在 Windows 支持 hscroll（水平滚动，右=正，左=负）
-                        try:
-                            pyautogui.hscroll(scroll_dx)
-                        except Exception:
-                            pass
-                except Exception as e2:
-                    ctx.log(f"[FindImage] 自动滚动失败: {e2}", "WARN")
-                # 滚动后稍等
-                t_wait = time.time()
-                while (time.time() - t_wait) < 0.5 and ctx.is_running:
-                    wait_if_paused(ctx)
-                    time.sleep(0.05)
-                continue
+                    if ctx.matcher is not None:
+                        if strategy == "template":
+                            pos = ctx.matcher.find_image(
+                                str(use_path), region=region, threshold=threshold, fast_mode=True
+                            )
+                        elif strategy == "gray":
+                            pos = ctx.matcher.find_image_gray(
+                                str(use_path), region=region, threshold=threshold, fast_mode=True
+                            )
+                        elif strategy == "feature":
+                            pos = ctx.matcher.find_image_akaze(
+                                str(use_path), region=region, threshold=akaze_thr
+                            )
+                        else:  # hybrid：彩色 → 灰度 → AKAZE 三层级联
+                            pos = ctx.matcher.find_image(
+                                str(use_path), region=region, threshold=threshold, fast_mode=True
+                            )
+                            if pos is None:
+                                pos = ctx.matcher.find_image_gray(
+                                    str(use_path), region=region, threshold=threshold, fast_mode=True
+                                )
+                            if pos is None:
+                                pos = ctx.matcher.find_image_akaze(
+                                    str(use_path), region=region, threshold=akaze_thr
+                                )
+                        if pos is not None:
+                            pass  # pos 已就绪，score 不再单独提取
+                except Exception as e:
+                    last_err = str(e)
+                    ctx.log(f"[FindImage] 匹配异常: {e}", "WARN")
 
-            # 普通短间隔避免CPU满载
-            time.sleep(0.15)
+                if pos is not None:
+                    # 验证模式：模板匹配成功后，用特征辅助额外验证
+                    if feature_assist_mode == "verify" and ctx.is_running:
+                        feat_result = _findimage_feature_match(
+                            ctx, node.params, region,
+                            timeout_s - (time.time() - t0),
+                            auto_scroll, scroll_dy,
+                            threshold, offset_x, offset_y,
+                            strategy,
+                            template_pos=pos
+                        )
+                        if feat_result is None:
+                            ctx.log("[FindImage] 模板匹配成功，但特征验证失败 -> 判定未命中", "WARN")
+                            pos = None
+                            # 验证失败继续重试（不break）
+                    if pos is not None:
+                        break
 
-        # 4) 找到后执行 动作
-        if pos is not None:
-            # 特征识别辅助的结果：坐标已经是模板中心+偏移，直接用
-            if isinstance(pos, dict) and pos.get("_feature_assist"):
-                abs_cx = int(pos.get("left", 0)) + offset_x
-                abs_cy = int(pos.get("top", 0)) + offset_y
+                # 未命中：兜底模式（模板匹配失败后用特征辅助尝试）
+                if pos is None and feature_assist_mode == "fallback" and ctx.is_running:
+                    feat_result = _findimage_feature_match(
+                        ctx, node.params, region,
+                        timeout_s - (time.time() - t0),
+                        auto_scroll, scroll_dy,
+                        threshold, offset_x, offset_y,
+                        strategy
+                    )
+                    if feat_result is not None:
+                        abs_cx_f, abs_cy_f, _ = feat_result
+                        pos = {
+                            "left": abs_cx_f - offset_x,
+                            "top": abs_cy_f - offset_y,
+                            "width": 1,
+                            "height": 1,
+                            "_feature_assist": True,
+                        }
+                        break
+
+                # 未命中：是否需要滚动
+                if auto_scroll and ctx.is_running and (time.time() - t0) < timeout_s:
+                    try:
+                        import pyautogui
+                        # 将鼠标移到搜索区域中心再滚动，确保滚动作用于目标窗口
+                        if region is not None:
+                            scroll_cx = int(region[0]) + int(region[2]) // 2
+                            scroll_cy = int(region[1]) + int(region[3]) // 2
+                        else:
+                            # 全屏模式：移到屏幕中心
+                            import ctypes
+                            scroll_cx = ctypes.windll.user32.GetSystemMetrics(0) // 2
+                            scroll_cy = ctypes.windll.user32.GetSystemMetrics(1) // 2
+                        pyautogui.moveTo(scroll_cx, scroll_cy)
+                        time.sleep(0.05)
+                        if scroll_dy != 0:
+                            pyautogui.scroll(scroll_dy)
+                    except Exception as e2:
+                        ctx.log(f"[FindImage] 自动滚动失败: {e2}", "WARN")
+                    # 滚动后稍等
+                    t_wait = time.time()
+                    while (time.time() - t_wait) < 0.5 and ctx.is_running:
+                        wait_if_paused(ctx)
+                        time.sleep(0.05)
+                    continue
+
+                # 普通短间隔避免CPU满载
+                time.sleep(0.15)
+
+            # 4) 找到后执行 动作
+            if pos is not None:
+                # 特征识别辅助的结果：坐标已经是模板中心+偏移，直接用
+                if isinstance(pos, dict) and pos.get("_feature_assist"):
+                    abs_cx = int(pos.get("left", 0)) + offset_x
+                    abs_cy = int(pos.get("top", 0)) + offset_y
+                    left, top, w, h = abs_cx, abs_cy, 0, 0
+                else:
+                    # 解析 pos：兼容 (left, top, w, h) / 字典 / tuple5
+                    # 注意：matcher 返回的是绝对屏幕坐标（region 模式下已加 region offset）
+                    left, top, w, h = 0, 0, 0, 0
+                    if isinstance(pos, dict):
+                        left = int(pos.get("left", 0)); top = int(pos.get("top", 0))
+                        w = int(pos.get("width", 0)); h = int(pos.get("height", 0))
+                    elif isinstance(pos, (list, tuple)):
+                        if len(pos) >= 4:
+                            left, top, w, h = int(pos[0]), int(pos[1]), int(pos[2]), int(pos[3])
+                        elif len(pos) >= 2:
+                            left, top, w, h = int(pos[0]), int(pos[1]), 0, 0
+                    # 模板中心 + 偏移 = 实际点击位置（绝对屏幕坐标）
+                    abs_cx = left + (w // 2) + offset_x
+                    abs_cy = top + (h // 2) + offset_y
+                # out_pos：relative 模式输出相对窗口坐标，absolute 模式输出绝对坐标
+                if search_mode == "relative" and win_origin != (0, 0):
+                    out_pos = (abs_cx - win_origin[0], abs_cy - win_origin[1])
+                else:
+                    out_pos = (abs_cx, abs_cy)
+                # 动作：始终用绝对坐标点击
+                if after_action != "none":
+                    try:
+                        import pyautogui
+                        pyautogui.moveTo(abs_cx, abs_cy)
+                        if after_action == "click":
+                            pyautogui.click()
+                        elif after_action == "double_click":
+                            pyautogui.doubleClick()
+                        elif after_action == "right_click":
+                            pyautogui.rightClick()
+                    except Exception as ea:
+                        ctx.log(f"[FindImage] 找到后执行动作失败: {ea}", "WARN")
+                # 日志
+                display = os.path.basename(str(use_path))
+                act_note = {
+                    "none": "", "click": "|动作=单击", "double_click": "|动作=双击",
+                    "right_click": "|动作=右键",
+                }.get(after_action, "")
+                mode_note = "相对窗口" if search_mode == "relative" else "全屏"
+                ctx.log(f"[FindImage] 命中 {display} 命中矩形=({left},{top},{w},{h}) 绝对中心=({abs_cx},{abs_cy}) out_pos={out_pos}({mode_note}) {act_note}", "SUCCESS")
+                annotate_step(
+                    ctx, node, "find",
+                    pos=(left, top, w, h), region=region,
+                    note=f"OK: {display} @({left},{top}) out={out_pos}({mode_note}) {act_note}",
+                )
+                return (
+                    {"out_pos": out_pos, "out_found": True},
+                    ["out_exec"], "",
+                )
             else:
-                # 解析 pos：兼容 (left, top, w, h) / 字典 / tuple5
-                # 注意：matcher 返回的是绝对屏幕坐标（region 模式下已加 region offset）
-                left, top, w, h = 0, 0, 0, 0
-                if isinstance(pos, dict):
-                    left = int(pos.get("left", 0)); top = int(pos.get("top", 0))
-                    w = int(pos.get("width", 0)); h = int(pos.get("height", 0))
-                elif isinstance(pos, (list, tuple)):
-                    if len(pos) >= 4:
-                        left, top, w, h = int(pos[0]), int(pos[1]), int(pos[2]), int(pos[3])
-                    elif len(pos) >= 2:
-                        left, top, w, h = int(pos[0]), int(pos[1]), 0, 0
-                # 模板中心 + 偏移 = 实际点击位置（绝对屏幕坐标）
-                abs_cx = left + (w // 2) + offset_x
-                abs_cy = top + (h // 2) + offset_y
-            # out_pos：relative 模式输出相对窗口坐标，absolute 模式输出绝对坐标
-            if search_mode == "relative" and win_origin != (0, 0):
-                out_pos = (abs_cx - win_origin[0], abs_cy - win_origin[1])
-            else:
-                out_pos = (abs_cx, abs_cy)
-            # 动作：始终用绝对坐标点击
-            if after_action != "none":
+                msg = f"未找到 {os.path.basename(str(use_path))} threshold={threshold} timeout={timeout_s}s"
+                if last_err:
+                    msg += f" err={last_err}"
+                scroll_note = f"（滚动量={scroll_dy}）" if scroll_dy != 0 else ""
+                ctx.log(f"[FindImage] {msg}{scroll_note} -> out_found=False", "WARN")
+                annotate_step(
+                    ctx, node, "find", region=region,
+                    note=f"FAIL: {msg}{scroll_note}",
+                )
+                return (
+                    {"out_pos": None, "out_found": False},
+                    ["out_exec"], "",
+                )
+        finally:
+            # 清理临时文件
+            if tmp_path and os.path.exists(tmp_path):
                 try:
-                    import pyautogui
-                    pyautogui.moveTo(abs_cx, abs_cy)
-                    if after_action == "click":
-                        pyautogui.click()
-                    elif after_action == "double_click":
-                        pyautogui.doubleClick()
-                    elif after_action == "right_click":
-                        pyautogui.rightClick()
-                except Exception as ea:
-                    ctx.log(f"[FindImage] 找到后执行动作失败: {ea}", "WARN")
-            # 日志
-            display = os.path.basename(str(use_path))
-            act_note = {
-                "none": "", "click": "|动作=单击", "double_click": "|动作=双击",
-                "right_click": "|动作=右键",
-            }.get(after_action, "")
-            mode_note = "相对窗口" if search_mode == "relative" else "全屏"
-            ctx.log(f"[FindImage] 命中 {display} 命中矩形=({left},{top},{w},{h}) 绝对中心=({abs_cx},{abs_cy}) out_pos={out_pos}({mode_note}) {act_note}", "SUCCESS")
-            annotate_step(
-                ctx, node, "find",
-                pos=(left, top, w, h), region=region,
-                note=f"OK: {display} @({left},{top}) score={score:.2f} out={out_pos}({mode_note}) {act_note}",
-            )
-            return (
-                {"out_pos": out_pos, "out_found": True, "out_score": float(score)},
-                ["out_exec"], "",
-            )
-        else:
-            msg = f"未找到 {os.path.basename(str(use_path))} threshold={threshold} timeout={timeout_s}s"
-            if last_err:
-                msg += f" err={last_err}"
-            scroll_note = "（已启用自动滚动）" if auto_scroll else ""
-            ctx.log(f"[FindImage] {msg}{scroll_note} -> out_found=False", "WARN")
-            annotate_step(
-                ctx, node, "find", region=region,
-                note=f"FAIL: {msg}{scroll_note}",
-            )
-            return (
-                {"out_pos": None, "out_found": False, "out_score": 0.0},
-                ["out_exec"], "",
-            )
-    finally:
-        # 清理临时文件
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.unlink(tmp_path)
-            except Exception:
-                pass
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
 
 
 def _find_fail(ctx, node, on_fail: str, reason: str, region=None):
@@ -1179,7 +1278,7 @@ def _find_fail(ctx, node, on_fail: str, reason: str, region=None):
         ctx, node, "find",
         region=region, note=f"FAIL: {reason} | on_fail={on_fail}",
     )
-    outputs = {"out_pos": None, "out_found": False, "out_score": 0.0}
+    outputs = {"out_pos": None, "out_found": False}
     if on_fail == "stop":
         ctx.log("[FindImage] 策略=stop: 终止执行。", "ERROR")
         ctx.is_running = False
@@ -1229,10 +1328,20 @@ def execute_PressKey(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
                 pyperclip.copy(text)
                 time.sleep(0.05)
                 if ctx.input_actions is not None:
-                    # 用 SendInput 模拟 Ctrl+V
-                    ctx.input_actions.hw_press("lctrl", hold_ms=30)
-                    ctx.input_actions.hw_press("v", hold_ms=30)
-                    ctx.input_actions.hw_press("lctrl", hold_ms=30)  # 抬起
+                    # 用 SendInput 模拟 Ctrl+V（正确的组合键：按下Ctrl→按下V→释放V→释放Ctrl）
+                    ia = ctx.input_actions
+                    try:
+                        ia.key_down("lctrl")
+                        time.sleep(0.02)
+                        ia.key_down("v")
+                        time.sleep(0.03)
+                        ia.key_up("v")
+                        time.sleep(0.01)
+                        ia.key_up("lctrl")
+                    except Exception:
+                        # 回退到 pyautogui
+                        import pyautogui
+                        pyautogui.hotkey("ctrl", "v")
                 else:
                     import pyautogui
                     pyautogui.hotkey("ctrl", "v")
@@ -1267,7 +1376,7 @@ def execute_PressKey(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
         hold_ms = max(1, int(p.get("hold_ms", 50) or 50))
         interval_ms = max(1, int(p.get("interval_ms", 100) or 100))
 
-        # 读取 key_combo JSON 数组，向后兼容旧版 key_name 字符串
+        # 读取 key_combo JSON 数组
         keys = []
         key_combo_raw = p.get("key_combo", "[]")
         if isinstance(key_combo_raw, str):
@@ -1277,11 +1386,6 @@ def execute_PressKey(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
                 keys = []
         elif isinstance(key_combo_raw, (list, tuple)):
             keys = list(key_combo_raw)
-        # 向后兼容：key_combo 为空时尝试从旧版 key_name 解析
-        if not keys:
-            key_name_old = str(p.get("key_name", "") or "").strip()
-            if key_name_old:
-                keys = [k.strip().lower() for k in key_name_old.split("+") if k.strip()]
 
         # 规范化 + 校验
         keys = [str(k).strip().lower() for k in keys if str(k).strip()]
@@ -1358,6 +1462,11 @@ def _resolve_temp_target_rect(ctx, params: Dict[str, Any]):
     try:
         engine = getattr(ctx, "var_engine", None) or VariableEngine(ctx.variables)
         title = str(engine.interpolate(title_raw)) if engine.has_any_marker(title_raw) else title_raw
+        # 对 exe_name 和 class_name 也做变量插值
+        if engine.has_any_marker(exe_name):
+            exe_name = str(engine.interpolate(exe_name))
+        if engine.has_any_marker(class_name):
+            class_name = str(engine.interpolate(class_name))
     except Exception:
         title = title_raw
     try:
@@ -1374,6 +1483,57 @@ def _resolve_temp_target_rect(ctx, params: Dict[str, Any]):
         return None
 
 
+def _bring_window_to_front_safe(ctx, hwnd):
+    """安全地把窗口前置到最前面，失败不抛异常。"""
+    if not hwnd:
+        return
+    try:
+        import win32gui as _wg
+        try:
+            from src.tools.window_utils import bring_window_to_front
+            bring_window_to_front(hwnd, log_fn=ctx.log)
+        except Exception:
+            _wg.SetForegroundWindow(hwnd)
+    except Exception:
+        pass
+
+
+@contextlib.contextmanager
+def _temp_window_foreground(ctx, params: Dict[str, Any]):
+    """临时目标窗口前置上下文管理器。
+
+    如果节点配置了临时目标窗口（temp_target_*），在操作前把临时窗口前置到最前面，
+    操作完成后（无论成功或异常）把全局目标窗口还原到最前面。
+
+    用法：
+        with _temp_window_foreground(ctx, node.params):
+            # 执行操作
+    """
+    temp = _resolve_temp_target_rect(ctx, params)
+    if temp is not None:
+        temp_hwnd = temp[0]
+        # 获取全局目标窗口句柄（用于操作后还原）
+        global_hwnd = None
+        try:
+            target = ctx.get_var("target") if hasattr(ctx, "get_var") else None
+            if isinstance(target, dict):
+                global_hwnd = target.get("hwnd")
+        except Exception:
+            pass
+        # 前置临时窗口
+        _bring_window_to_front_safe(ctx, temp_hwnd)
+        time.sleep(0.15)  # 等待窗口切换完成
+        try:
+            yield
+        finally:
+            # 还原全局目标窗口到最前面
+            if global_hwnd:
+                _bring_window_to_front_safe(ctx, global_hwnd)
+                time.sleep(0.1)
+    else:
+        yield
+
+
 def _mouse_final_pos(ctx, params: Dict[str, Any], inputs: Dict[str, Any]):
     """按 coord_mode 把 pos(tuple2) 或 in_pos 转换为屏幕绝对坐标。
     in_pos 的坐标系取决于 Mouse 节点的 coord_mode：
@@ -1383,36 +1543,34 @@ def _mouse_final_pos(ctx, params: Dict[str, Any], inputs: Dict[str, Any]):
     in_pos = inputs.get("in_pos")
     if in_pos is not None and isinstance(in_pos, (tuple, list)) and len(in_pos) == 2:
         x, y = int(in_pos[0]), int(in_pos[1])
-        ox, oy = _tuple2(params.get("offset", (0, 0)))
         mode = str(params.get("coord_mode", "relative") or "relative")
         if mode == "absolute":
-            return (x + ox, y + oy)
+            return (x, y)
         elif mode == "relative":
             # in_pos 是相对目标窗口的坐标，需要加上窗口偏移
             temp = _resolve_temp_target_rect(ctx, params)
             if temp is not None:
                 rect = temp[1]
-                return (int(rect[0]) + x + ox, int(rect[1]) + y + oy)
+                return (int(rect[0]) + x, int(rect[1]) + y)
             try:
                 target = ctx.get_var("target") if hasattr(ctx, "get_var") else None
                 if isinstance(target, dict):
                     rect = target.get("rect")
                     if isinstance(rect, (tuple, list)) and len(rect) >= 2:
-                        return (int(rect[0]) + x + ox, int(rect[1]) + y + oy)
+                        return (int(rect[0]) + x, int(rect[1]) + y)
             except Exception:
                 pass
-        return (x + ox, y + oy)
+        return (x, y)
     mode = str(params.get("coord_mode", "relative") or "relative")
     x, y = _tuple2(params.get("pos", (0, 0)))
-    ox, oy = _tuple2(params.get("offset", (0, 0)))
     if mode == "absolute":
-        return (x + ox, y + oy)
+        return (x, y)
     elif mode == "relative":
         # 优先使用临时目标窗口
         temp = _resolve_temp_target_rect(ctx, params)
         if temp is not None:
             rect = temp[1]
-            return (int(rect[0]) + x + ox, int(rect[1]) + y + oy)
+            return (int(rect[0]) + x, int(rect[1]) + y)
         try:
             target = ctx.get_var("target") if hasattr(ctx, "get_var") else None
             if isinstance(target, dict):
@@ -1420,10 +1578,10 @@ def _mouse_final_pos(ctx, params: Dict[str, Any], inputs: Dict[str, Any]):
                 if isinstance(rect, (tuple, list)) and len(rect) >= 2:
                     rx = int(rect[0])
                     ry = int(rect[1])
-                    return (rx + x + ox, ry + y + oy)
+                    return (rx + x, ry + y)
         except Exception:
             pass
-    return (x + ox, y + oy)
+    return (x, y)
 
 
 def _tuple2(val) -> Tuple[int, int]:
@@ -1464,135 +1622,111 @@ def _mouse_final_pos_for(ctx, params: Dict[str, Any], point_param_name: str) -> 
 
 
 def execute_Mouse(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
-    """统一 mouse 执行：根据 action 分派（click/press/release/move/drag/scroll）。"""
+    """统一 mouse 执行：根据 action 分派（click/move/drag/scroll）。"""
     import random
     p = dict(node.params or {})
     action = str(p.get("action", "click") or "click")
     btn = str(p.get("button", "left") or "left")
     ia = getattr(ctx, "input_actions", None)
 
-    # 临时目标窗口：如果设置了，临时切换 safe_region 让点击后鼠标归位到临时窗口而非全局目标
-    _temp_rect_saved = None
-    if ia is not None and str(p.get("coord_mode", "relative") or "relative") == "relative":
-        _temp_target = _resolve_temp_target_rect(ctx, p)
-        if _temp_target is not None:
-            _temp_rect_saved = getattr(ia, "safe_region", None)
-            rect = _temp_target[1]
-            ia.set_safe_region((int(rect[0]), int(rect[1]), int(rect[2]) - int(rect[0]), int(rect[3]) - int(rect[1])))
+    with _temp_window_foreground(ctx, p):
+        try:
+            pos = _mouse_final_pos(ctx, p, inputs)
+            wait_if_paused(ctx)
 
-    try:
-        pos = _mouse_final_pos(ctx, p, inputs)
-        wait_if_paused(ctx)
+            if action == "click":
+                clicks = max(1, int(p.get("click_count", 1) or 1))
+                hold_min = max(1, int(p.get("hold_ms_min", 30) or 30))
+                hold_max = max(1, int(p.get("hold_ms_max", 80) or 80))
+                hold_range = (min(hold_min, hold_max), max(hold_min, hold_max))
+                post_min = max(0, int(p.get("post_delay_min_ms", 30) or 30))
+                post_max = max(0, int(p.get("post_delay_max_ms", 80) or 80))
+                post_range = (min(post_min, post_max), max(post_min, post_max))
+                # clicks=1→单击1次; clicks=2→双击(1轮2击); clicks=3→三击(1轮3击,非翻倍)
+                double = (clicks == 2)
+                repeat = 1 if clicks <= 2 else clicks
+                if ia is not None:
+                    ia.game_click(pos, double=double, random_offset_radius=0,
+                                  hold_ms_range=hold_range, post_delay_range=post_range,
+                                  repeat=repeat, button=btn)
+                annotate_step(ctx, node, "click", pos=pos,
+                              note=f"click@{pos} btn={btn} count={clicks}")
+                ctx.log(f"[Mouse] click @{pos} btn={btn} x{clicks}", "SUCCESS")
 
-        if action == "click":
-            clicks = max(1, int(p.get("click_count", 1) or 1))
-            hold_min = max(1, int(p.get("hold_ms_min", 30) or 30))
-            hold_max = max(1, int(p.get("hold_ms_max", 80) or 80))
-            hold_range = (min(hold_min, hold_max), max(hold_min, hold_max))
-            post_min = max(0, int(p.get("post_delay_min_ms", 30) or 30))
-            post_max = max(0, int(p.get("post_delay_max_ms", 80) or 80))
-            post_range = (min(post_min, post_max), max(post_min, post_max))
-            double = clicks >= 2
-            if ia is not None:
-                ia.game_click(pos, double=double, random_offset_radius=0,
-                              hold_ms_range=hold_range, post_delay_range=post_range,
-                              repeat=clicks if clicks >= 3 else 1)
-            annotate_step(ctx, node, "click", pos=pos,
-                          note=f"click@{pos} btn={btn} count={clicks}")
-            ctx.log(f"[Mouse] click @{pos} btn={btn} x{clicks}", "SUCCESS")
-
-        elif action == "press":
-            hold_min = max(1, int(p.get("hold_ms_min", 30) or 30))
-            hold_max = max(1, int(p.get("hold_ms_max", 80) or 80))
-            hold_range = (min(hold_min, hold_max), max(hold_min, hold_max))
-            post_min = max(0, int(p.get("post_delay_min_ms", 30) or 30))
-            post_max = max(0, int(p.get("post_delay_max_ms", 80) or 80))
-            post_range = (min(post_min, post_max), max(post_min, post_max))
-            if ia is not None:
-                ia.game_click(pos, double=False, random_offset_radius=0,
-                              hold_ms_range=hold_range,
-                              post_delay_range=post_range)
-            annotate_step(ctx, node, "press", pos=pos,
-                          note=f"press@{pos} btn={btn} hold={hold_range}ms")
-            ctx.log(f"[Mouse] press @{pos} btn={btn} hold={hold_range}ms", "SUCCESS")
-
-        elif action == "release":
-            annotate_step(ctx, node, "release", pos=pos, note=f"release btn={btn}")
-            ctx.log(f"[Mouse] release btn={btn}", "SUCCESS")
-
-        elif action == "move":
-            speed = max(0, int(p.get("move_speed_ms", 0) or 0))
-            # 简化实现：直接移动，后续可加入分帧
-            if ia is not None:
-                try:
-                    ia._ensure_dc()
-                    if hasattr(ia, "_mouse_move"):
-                        ia._mouse_move(pos[0], pos[1])
-                    else:
-                        ia.game_click(pos, double=False, random_offset_radius=0,
-                                      hold_ms_range=(0, 0), post_delay_range=(0, 0))
-                except Exception:
-                    pass
-            annotate_step(ctx, node, "move", pos=pos, note=f"move→{pos} speed={speed}ms")
-            ctx.log(f"[Mouse] move→{pos} speed={speed}ms", "SUCCESS")
-
-        elif action == "drag":
-            from_pt = _mouse_final_pos_for(ctx, p, "from_pos")
-            to_pt = _mouse_final_pos_for(ctx, p, "to_pos")
-            dur = max(0, int(p.get("drag_duration_ms", 300) or 300))
-            from_x, from_y = from_pt
-            to_x, to_y = to_pt
-            if ia is not None:
-                try:
-                    steps = max(2, dur // 20)
-                    ia.game_click(from_pt, double=False, random_offset_radius=0,
-                                  hold_ms_range=(20, 20), post_delay_range=(0, 0))
-                    for i in range(1, steps + 1):
-                        ratio = i / steps
-                        px = int(from_x + (to_x - from_x) * ratio)
-                        py = int(from_y + (to_y - from_y) * ratio)
-                        time.sleep((dur / steps) / 1000.0)
-                        wait_if_paused(ctx)
-                    ia.game_click(to_pt, double=False, random_offset_radius=0,
-                                  hold_ms_range=(20, 20), post_delay_range=(0, 0))
-                except Exception:
-                    pass
-            annotate_step(ctx, node, "drag", pos=to_pt,
-                          note=f"drag {from_pt}→{to_pt} dur={dur}ms")
-            ctx.log(f"[Mouse] drag {from_pt}→{to_pt} dur={dur}ms", "SUCCESS")
-
-        elif action == "scroll":
-            dy = int(p.get("scroll_dy", 0) or 0)
-            dx = int(p.get("scroll_dx", 0) or 0)
-            steps = max(1, int(p.get("scroll_steps", 1) or 1))
-            if ia is not None:
-                for i in range(steps):
+            elif action == "move":
+                if ia is not None:
                     try:
-                        if hasattr(ia, "scroll"):
-                            ia.scroll(pos, dy=dy, dx=dx)
-                        else:
-                            ia._ensure_dc()
-                    except Exception:
-                        pass
-                    time.sleep(0.02)
-                    wait_if_paused(ctx)
-            annotate_step(ctx, node, "scroll", pos=pos,
-                          note=f"scroll@{pos} dy={dy} dx={dx} x{steps}")
-            ctx.log(f"[Mouse] scroll @{pos} dy={dy} dx={dx} repeat={steps}", "SUCCESS")
+                        ia._mouse_move(pos[0], pos[1])
+                    except Exception as e:
+                        ctx.log(f"[Mouse] move error: {e}", "WARN")
+                annotate_step(ctx, node, "move", pos=pos, note=f"move→{pos}")
+                ctx.log(f"[Mouse] move→{pos}", "SUCCESS")
 
-        else:
-            ctx.log(f"[Mouse] 未知 action={action}", "ERROR")
-            annotate_step(ctx, node, "mouse", note=f"ERROR: unknown action={action}")
+            elif action == "drag":
+                from_pt = _mouse_final_pos_for(ctx, p, "from_pos")
+                to_pt = _mouse_final_pos_for(ctx, p, "to_pos")
+                dur = max(0, int(p.get("drag_duration_ms", 300) or 300))
+                from_x, from_y = from_pt
+                to_x, to_y = to_pt
+                _drag_btn_held = False
+                if ia is not None:
+                    try:
+                        steps = max(2, dur // 20)
+                        # 1. 移动到起点
+                        ia._hw_mouse_move(from_x, from_y)
+                        time.sleep(0.05)
+                        # 2. 按下鼠标
+                        ia._hw_mouse_down(btn)
+                        _drag_btn_held = True
+                        time.sleep(0.05)
+                        # 3. 逐步移动到终点（真正移动鼠标）
+                        for i in range(1, steps + 1):
+                            if not getattr(ctx, "is_running", True):
+                                break
+                            ratio = i / steps
+                            px = int(from_x + (to_x - from_x) * ratio)
+                            py = int(from_y + (to_y - from_y) * ratio)
+                            ia._mouse_move(px, py)
+                            time.sleep((dur / steps) / 1000.0)
+                            wait_if_paused(ctx)
+                    except Exception as e:
+                        ctx.log(f"[Mouse] drag error: {e}", "ERROR")
+                    finally:
+                        # 4. 无论成功还是异常，都必须释放鼠标按键，避免卡死
+                        if _drag_btn_held:
+                            try:
+                                time.sleep(0.05)
+                                ia._hw_mouse_up(btn)
+                            except Exception:
+                                pass
+                annotate_step(ctx, node, "drag", pos=to_pt,
+                              note=f"drag {from_pt}→{to_pt} dur={dur}ms btn={btn}")
+                ctx.log(f"[Mouse] drag {from_pt}→{to_pt} dur={dur}ms btn={btn}", "SUCCESS")
+
+            elif action == "scroll":
+                dy = int(p.get("scroll_dy", 0) or 0)
+                steps = max(1, int(p.get("scroll_steps", 1) or 1))
+                if ia is not None:
+                    for i in range(steps):
+                        try:
+                            ia.scroll(pos, dy_px=dy)
+                        except Exception as e:
+                            ctx.log(f"[Mouse] scroll error: {e}", "WARN")
+                        time.sleep(0.02)
+                        wait_if_paused(ctx)
+                annotate_step(ctx, node, "scroll", pos=pos,
+                              note=f"scroll@{pos} {dy:+}px x{steps}")
+                ctx.log(f"[Mouse] scroll @{pos} Δy={dy}px repeat={steps}", "SUCCESS")
+
+            else:
+                ctx.log(f"[Mouse] 未知 action={action}", "ERROR")
+                annotate_step(ctx, node, "mouse", note=f"ERROR: unknown action={action}")
+                return {}, ["err"], ""
+
+        except Exception as e:
+            ctx.log(f"[Mouse] 执行失败: {type(e).__name__}: {e}", "ERROR")
+            annotate_step(ctx, node, "mouse", note=f"ERROR: {e}")
             return {}, ["err"], ""
-
-    except Exception as e:
-        ctx.log(f"[Mouse] 执行失败: {type(e).__name__}: {e}", "ERROR")
-        annotate_step(ctx, node, "mouse", note=f"ERROR: {e}")
-        return {}, ["err"], ""
-    finally:
-        # 恢复全局 safe_region
-        if _temp_rect_saved is not None and ia is not None:
-            ia.set_safe_region(_temp_rect_saved)
 
     return {}, ["out_done"], ""
 
@@ -2671,33 +2805,20 @@ def execute_IfImageDetect(ctx: ExecutionContext, node: Node, inputs: Dict[str, A
             imgs = json.loads(raw)
         except Exception:
             imgs = []
-    elif isinstance(raw, list):
-        imgs = raw
+    elif isinstance(raw, (list, tuple)):
+        imgs = list(raw)
     else:
         imgs = []
-    threshold = float(data.get("threshold", 0.9) or 0.9)
+    if not isinstance(imgs, list):
+        imgs = []
+    try:
+        threshold = float(data.get("threshold", 0.9) or 0.9)
+    except (TypeError, ValueError):
+        threshold = 0.9
+    akaze_thr = max(0.01, min(1.0, float(threshold)))
     strategy = str(data.get("match_strategy", "hybrid") or "hybrid")
     eval_mode = str(data.get("eval_mode", "complete") or "complete")
     search_mode = str(data.get("search_mode", "relative") or "relative")
-
-    # 计算检测区域：relative=目标窗口，absolute=全屏
-    region = None
-    if search_mode == "relative":
-        temp = _resolve_temp_target_rect(ctx, data)
-        if temp is not None:
-            rect = temp[1]
-            region = (int(rect[0]), int(rect[1]), int(rect[2]) - int(rect[0]), int(rect[3]) - int(rect[1]))
-            ctx.log(f"[IfImg] 相对目标窗口检测 region={region} (临时目标)", "DEBUG")
-        else:
-            try:
-                target = ctx.get_var("target") if hasattr(ctx, "get_var") else None
-                if isinstance(target, dict):
-                    r = target.get("rect")
-                    if isinstance(r, (tuple, list)) and len(r) >= 4:
-                        region = (int(r[0]), int(r[1]), int(r[2]), int(r[3]))
-                        ctx.log(f"[IfImg] 相对目标窗口检测 region={region} (全局目标)", "DEBUG")
-            except Exception:
-                pass
 
     if not imgs:
         ctx.log("[IfImg] 没有配置参考图 -> no", "WARN")
@@ -2719,134 +2840,163 @@ def execute_IfImageDetect(ctx: ExecutionContext, node: Node, inputs: Dict[str, A
         hit_all = True
     scores: List[str] = []
 
-    try:
-        for i, item in enumerate(imgs):
-            wait_if_paused(ctx)
-            if not ctx.is_running:
-                break
-            if not isinstance(item, dict):
-                miss_name = f"[{i}]无效项"
-                scores.append(f"[{i}] 无效=0.00")
-                if eval_mode == "or_true":
-                    # OR模式：无效算未命中，继续下一张
-                    continue
+    with _temp_window_foreground(ctx, data):
+        try:
+            # region 在窗口前置之后计算，避免最小化窗口恢复后 rect 失效
+            region = None
+            if search_mode == "relative":
+                temp = _resolve_temp_target_rect(ctx, data)
+                if temp is not None:
+                    rect = temp[1]
+                    region = (int(rect[0]), int(rect[1]), int(rect[2]) - int(rect[0]), int(rect[3]) - int(rect[1]))
+                    ctx.log(f"[IfImg] 相对目标窗口检测 region={region} (临时目标)", "DEBUG")
                 else:
-                    hit_all = False
-                    if eval_mode == "short_circuit":
-                        break
-                    else:
-                        continue
-            path = item.get("path", "") or ""
-            pil = cached_pils[i] if i < len(cached_pils) else None
+                    try:
+                        target = ctx.get_var("target") if hasattr(ctx, "get_var") else None
+                        if isinstance(target, dict):
+                            r = target.get("rect")
+                            if isinstance(r, (tuple, list)) and len(r) >= 4:
+                                region = (int(r[0]), int(r[1]), int(r[2]), int(r[3]))
+                                ctx.log(f"[IfImg] 相对目标窗口检测 region={region} (全局目标)", "DEBUG")
+                    except Exception:
+                        pass
 
-            use_path = ""
-            if isinstance(path, str) and path and os.path.exists(path):
-                use_path = path
-            elif pil is not None:
-                fd, tmp = tempfile.mkstemp(suffix=".png", prefix="ba_ifimg_")
-                os.close(fd)
+            for i, item in enumerate(imgs):
+                wait_if_paused(ctx)
+                if not ctx.is_running:
+                    break
+                if not isinstance(item, dict):
+                    miss_name = f"[{i}]无效项"
+                    scores.append(f"[{i}] 无效=0.00")
+                    if eval_mode == "or_true":
+                        # OR模式：无效算未命中，继续下一张
+                        continue
+                    else:
+                        hit_all = False
+                        if eval_mode == "short_circuit":
+                            break
+                        else:
+                            continue
+                path = item.get("path", "") or ""
+                pil = cached_pils[i] if i < len(cached_pils) else None
+
+                use_path = ""
+                if isinstance(path, str) and path and os.path.exists(path):
+                    use_path = path
+                elif pil is not None:
+                    fd, tmp = tempfile.mkstemp(suffix=".png", prefix="ba_ifimg_")
+                    os.close(fd)
+                    tmp_paths.append(tmp)  # 先登记，save 失败也能清理
+                    try:
+                        pil.save(tmp, format="PNG")
+                        use_path = tmp
+                    except Exception:
+                        use_path = None
+
+                if not use_path:
+                    miss_name = f"[{i}]无路径/无图"
+                    scores.append(f"[{i}] 无图=0.00")
+                    if eval_mode == "or_true":
+                        continue
+                    else:
+                        hit_all = False
+                        if eval_mode == "short_circuit":
+                            break
+                        else:
+                            continue
+
+                pos = None
+                score_val = 0.0
                 try:
-                    pil.save(tmp, format="PNG")
-                    tmp_paths.append(tmp)
-                    use_path = tmp
+                    if ctx.matcher is not None:
+                        if strategy == "template":
+                            pos = ctx.matcher.find_image(use_path, region=region, threshold=threshold, fast_mode=True)
+                        elif strategy == "gray":
+                            pos = ctx.matcher.find_image_gray(use_path, region=region, threshold=threshold, fast_mode=True)
+                        elif strategy == "feature":
+                            pos = ctx.matcher.find_image_akaze(use_path, region=region, threshold=akaze_thr)
+                        else:  # hybrid：彩色 → 灰度 → AKAZE
+                            pos = ctx.matcher.find_image(use_path, region=region, threshold=threshold, fast_mode=True)
+                            if pos is None:
+                                pos = ctx.matcher.find_image_gray(use_path, region=region, threshold=threshold, fast_mode=True)
+                            if pos is None:
+                                pos = ctx.matcher.find_image_akaze(use_path, region=region, threshold=akaze_thr)
+                except Exception as e:
+                    ctx.log(f"[IfImg] 匹配异常[{i}]: {e}", "WARN")
+                try:
+                    if pos is not None and isinstance(pos, (tuple, list)) and len(pos) >= 5:
+                        score_val = float(pos[4])
+                    elif pos is not None and isinstance(pos, dict):
+                        s = pos.get("score")
+                        if isinstance(s, (int, float)):
+                            score_val = float(s)
+                        else:
+                            s2 = pos.get("similarity")
+                            score_val = float(s2) if isinstance(s2, (int, float)) else 1.0
+                    else:
+                        score_val = 1.0 if pos is not None else 0.0
+                except Exception:
+                    score_val = 1.0 if pos is not None else 0.0
+
+                display = os.path.basename(str(path)) if path else f"image[{i}]"
+                scores.append(f"[{i}] {display} 分数={score_val:.2f} {'✓' if pos is not None else '✗'}")
+
+                if pos is None:
+                    miss_name = display
+                    ctx.log(f"[IfImg] 缺少: {display} (score={score_val:.2f})", "DEBUG")
+                    if eval_mode == "or_true":
+                        continue
+                    else:
+                        hit_all = False
+                        if eval_mode == "short_circuit":
+                            break
+                else:
+                    hit_name = display
+                    ctx.log(f"[IfImg] 命中: {display} score={score_val:.2f}", "DEBUG")
+                    if eval_mode == "or_true":
+                        any_hit = True
+                        ctx.log(f"[IfImg] 一真即真(OR)：{display} 命中 → 立即返回 yes", "DEBUG")
+                        break
+
+            if eval_mode == "complete" and scores:
+                ctx.log("[IfImg] 匹配结果汇总(完全求值):\n  " + "\n  ".join(scores), "DEBUG")
+            elif eval_mode == "or_true" and scores:
+                ctx.log("[IfImg] 匹配结果汇总(一真即真 OR):\n  " + "\n  ".join(scores), "DEBUG")
+
+            if eval_mode == "or_true":
+                if any_hit and ctx.is_running:
+                    ctx.log(f"[IfImg] 一真即真(OR)：命中 [{hit_name}] -> yes", "DEBUG")
+                    hit_cnt = sum(1 for s in scores if "✓" in s)
+                    annotate_step(ctx, node, "find", note=f"OR HIT: {hit_name} ({hit_cnt}/{len(imgs)})")
+                    return {}, ["yes"], ""
+                else:
+                    note_parts = [f"0/{len(imgs)}"]
+                    if miss_name:
+                        note_parts.append(f"ALL MISS, last: {miss_name}")
+                    note_parts.append(f"mode=or_true")
+                    annotate_step(ctx, node, "find", note=" | ".join(note_parts))
+                    return {}, ["no"], ""
+            else:
+                if hit_all and ctx.is_running:
+                    ctx.log(f"[IfImg] 全部{len(imgs)}张都存在 -> yes", "DEBUG")
+                    annotate_step(ctx, node, "find", note=f"ALL PRESENT x{len(imgs)} [{eval_mode}]")
+                    return {}, ["yes"], ""
+                else:
+                    note_parts = []
+                    if miss_name:
+                        note_parts.append(f"MISS: {miss_name}")
+                    note_parts.append(f"mode={eval_mode}")
+                    if eval_mode == "complete":
+                        hit_cnt = sum(1 for s in scores if "✓" in s)
+                        note_parts.insert(0, f"{hit_cnt}/{len(imgs)}")
+                    annotate_step(ctx, node, "find", note=" | ".join(note_parts))
+                    return {}, ["no"], ""
+        finally:
+            for p in tmp_paths:
+                try:
+                    os.unlink(p)
                 except Exception:
                     pass
-
-            if not use_path:
-                miss_name = f"[{i}]无路径/无图"
-                scores.append(f"[{i}] 无图=0.00")
-                if eval_mode == "or_true":
-                    continue
-                else:
-                    hit_all = False
-                    if eval_mode == "short_circuit":
-                        break
-                    else:
-                        continue
-
-            pos = None
-            score_val = 0.0
-            try:
-                if ctx.matcher is not None:
-                    if strategy == "template":
-                        pos = ctx.matcher.find_image(use_path, region=region, threshold=threshold, fast_mode=True)
-                    elif strategy == "feature":
-                        pos = ctx.matcher.find_image(use_path, region=region, threshold=threshold, fast_mode=False)
-                    else:  # hybrid
-                        pos = ctx.matcher.find_image_gray(use_path, region=region, threshold=threshold, fast_mode=True)
-                        if pos is None:
-                            pos = ctx.matcher.find_image(use_path, region=region, threshold=threshold, fast_mode=False)
-            except Exception as e:
-                ctx.log(f"[IfImg] 匹配异常[{i}]: {e}", "WARN")
-            try:
-                if pos is not None and isinstance(pos, (tuple, list)) and len(pos) >= 5:
-                    score_val = float(pos[4])
-                elif pos is not None and isinstance(pos, dict):
-                    score_val = float(pos.get("score") or pos.get("similarity") or threshold)
-                else:
-                    score_val = float(threshold) if pos is not None else 0.0
-            except Exception:
-                score_val = float(threshold) if pos is not None else 0.0
-
-            display = os.path.basename(str(path)) if path else f"image[{i}]"
-            scores.append(f"[{i}] {display} 分数={score_val:.2f} {'✓' if pos is not None else '✗'}")
-
-            if pos is None:
-                miss_name = display
-                ctx.log(f"[IfImg] 缺少: {display} (score={score_val:.2f})", "DEBUG")
-                if eval_mode == "or_true":
-                    continue
-                else:
-                    hit_all = False
-                    if eval_mode == "short_circuit":
-                        break
-            else:
-                hit_name = display
-                ctx.log(f"[IfImg] 命中: {display} score={score_val:.2f}", "DEBUG")
-                if eval_mode == "or_true":
-                    any_hit = True
-                    ctx.log(f"[IfImg] 一真即真(OR)：{display} 命中 → 立即返回 yes", "DEBUG")
-                    break
-
-        if eval_mode == "complete" and scores:
-            ctx.log("[IfImg] 匹配结果汇总(完全求值):\n  " + "\n  ".join(scores), "DEBUG")
-        elif eval_mode == "or_true" and scores:
-            ctx.log("[IfImg] 匹配结果汇总(一真即真 OR):\n  " + "\n  ".join(scores), "DEBUG")
-
-        if eval_mode == "or_true":
-            if any_hit and ctx.is_running:
-                ctx.log(f"[IfImg] 一真即真(OR)：命中 [{hit_name}] -> yes", "DEBUG")
-                hit_cnt = sum(1 for s in scores if "✓" in s)
-                annotate_step(ctx, node, "find", note=f"OR HIT: {hit_name} ({hit_cnt}/{len(imgs)})")
-                return {}, ["yes"], ""
-            else:
-                note_parts = [f"0/{len(imgs)}"]
-                if miss_name:
-                    note_parts.append(f"ALL MISS, last: {miss_name}")
-                note_parts.append(f"mode=or_true")
-                annotate_step(ctx, node, "find", note=" | ".join(note_parts))
-                return {}, ["no"], ""
-        else:
-            if hit_all and ctx.is_running:
-                ctx.log(f"[IfImg] 全部{len(imgs)}张都存在 -> yes", "DEBUG")
-                annotate_step(ctx, node, "find", note=f"ALL PRESENT x{len(imgs)} [{eval_mode}]")
-                return {}, ["yes"], ""
-            else:
-                note_parts = []
-                if miss_name:
-                    note_parts.append(f"MISS: {miss_name}")
-                note_parts.append(f"mode={eval_mode}")
-                if eval_mode == "complete":
-                    hit_cnt = sum(1 for s in scores if "✓" in s)
-                    note_parts.insert(0, f"{hit_cnt}/{len(imgs)}")
-                annotate_step(ctx, node, "find", note=" | ".join(note_parts))
-                return {}, ["no"], ""
-    finally:
-        for p in tmp_paths:
-            try:
-                os.unlink(p)
-            except Exception:
-                pass
 
 
 # ---------------- 检测：静止（if_static） ----------------
@@ -2884,14 +3034,16 @@ def execute_StillnessDetect(ctx: ExecutionContext, node: Node, inputs: Dict[str,
         annotate_step(ctx, node, "static", note="ERROR: ROI empty")
         return {}, ["no"], ""
 
-    # relative 模式：每帧获取窗口偏移，ROI 转为绝对坐标
+    # relative 模式：获取窗口偏移（缓存，不每帧枚举窗口）
+    _cached_win_offset = None
+    _cache_ts = 0.0
+    _CACHE_TTL = 2.0  # 缓存有效期2秒
+
     def _get_win_offset():
+        nonlocal _cached_win_offset, _cache_ts
         if search_mode != "relative":
             return (0, 0)
-        temp = _resolve_temp_target_rect(ctx, p)
-        if temp is not None:
-            rect = temp[1]
-            return (int(rect[0]), int(rect[1]))
+        # 快路径：优先从 ctx 缓存的全局目标读取（不枚举窗口）
         try:
             target = ctx.get_var("target") if hasattr(ctx, "get_var") else None
             if isinstance(target, dict):
@@ -2900,70 +3052,84 @@ def execute_StillnessDetect(ctx: ExecutionContext, node: Node, inputs: Dict[str,
                     return (int(r[0]), int(r[1]))
         except Exception:
             pass
+        # 慢路径：临时目标窗口，使用缓存避免每帧枚举
+        now = time.monotonic()
+        if _cached_win_offset is not None and (now - _cache_ts) < _CACHE_TTL:
+            return _cached_win_offset
+        temp = _resolve_temp_target_rect(ctx, p)
+        if temp is not None:
+            rect = temp[1]
+            _cached_win_offset = (int(rect[0]), int(rect[1]))
+            _cache_ts = now
+            return _cached_win_offset
         return (0, 0)
 
     prev_roi: Optional[np.ndarray] = None
     stable_since_ts: Optional[float] = None
-    t0 = time.time()
+    t0 = time.monotonic()
     timeout_s = timeout_seconds
     interval_s = sample_interval_seconds
-    last_diff = 0.0
+    last_diff = None  # None=未采样过，float=最近一次帧差
 
-    while (time.time() - t0) < timeout_s and ctx.is_running:
-        wait_if_paused(ctx)
-        if not ctx.is_running:
-            break
-        shot_bgr = None
-        try:
-            if ctx.screen is not None:
-                ox, oy = _get_win_offset()
-                shot_bgr = ctx.screen.capture_region_bgr((x + ox, y + oy, w, h))
-        except Exception:
+    with _temp_window_foreground(ctx, p):
+        while (time.monotonic() - t0) < timeout_s and getattr(ctx, "is_running", True):
+            wait_if_paused(ctx)
+            if not getattr(ctx, "is_running", True):
+                break
             shot_bgr = None
-        if shot_bgr is None:
-            break
+            try:
+                if ctx.screen is not None:
+                    ox, oy = _get_win_offset()
+                    shot_bgr = ctx.screen.capture_region_bgr((x + ox, y + oy, w, h))
+            except Exception:
+                shot_bgr = None
+            if shot_bgr is None:
+                # 截图失败不立即终止，等待下一帧重试
+                time.sleep(min(0.5, interval_s))
+                continue
 
-        if prev_roi is not None:
-            diff = float(
-                np.mean(np.abs(shot_bgr.astype(np.int16) - prev_roi.astype(np.int16)) / 255.0)
-            )
-            last_diff = diff
-            if diff < dt:
-                if stable_since_ts is None:
-                    stable_since_ts = time.time()
-                elapsed_s = time.time() - stable_since_ts
-                if elapsed_s >= stillness_seconds:
-                    ctx.log(
-                        f"[if_static] 达到静止 持续={elapsed_s:.1f}s (要求>={stillness_seconds:.1f}s), diff={diff:.4f} < {dt:.4f} -> yes",
-                        "DEBUG",
-                    )
+            if prev_roi is not None:
+                diff = float(
+                    np.mean(np.abs(shot_bgr.astype(np.int16) - prev_roi.astype(np.int16)) / 255.0)
+                )
+                last_diff = diff
+                if diff < dt:
+                    if stable_since_ts is None:
+                        stable_since_ts = time.monotonic()
+                    elapsed_s = time.monotonic() - stable_since_ts
+                    if elapsed_s >= stillness_seconds:
+                        ctx.log(
+                            f"[if_static] 达到静止 持续={elapsed_s:.1f}s (要求>={stillness_seconds:.1f}s), diff={diff:.4f} < {dt:.4f} -> yes",
+                            "DEBUG",
+                        )
+                        annotate_step(
+                            ctx, node, "static",
+                            note=f"OK stable={elapsed_s:.1f}s diff={diff:.3f}",
+                            region=(x, y, w, h),
+                        )
+                        return {}, ["yes"], ""
+                else:
+                    stable_since_ts = None
                     annotate_step(
-                        ctx, node, "static",
-                        note=f"OK stable={elapsed_s:.1f}s diff={diff:.3f}",
+                        ctx, node, "moving",
+                        note=f"diff={diff:.4f} >= {dt:.4f}",
                         region=(x, y, w, h),
                     )
-                    return {}, ["yes"], ""
-            else:
-                stable_since_ts = None
-                annotate_step(
-                    ctx, node, "moving",
-                    note=f"diff={diff:.4f} >= {dt:.4f}",
-                    region=(x, y, w, h),
-                )
-        prev_roi = shot_bgr
+            prev_roi = shot_bgr
 
-        t_sleep = time.time()
-        while (time.time() - t_sleep) < interval_s and ctx.is_running:
-            wait_if_paused(ctx)
-            time.sleep(min(0.05, max(0.005, interval_s - (time.time() - t_sleep))))
+            t_sleep = time.monotonic()
+            while (time.monotonic() - t_sleep) < interval_s and getattr(ctx, "is_running", True):
+                wait_if_paused(ctx)
+                time.sleep(min(0.05, max(0.005, interval_s - (time.monotonic() - t_sleep))))
 
+    _diff_str = f"{last_diff:.4f}" if last_diff is not None else "未采样"
     ctx.log(
-        f"[if_static] 超时 {timeout_seconds:.1f}s 仍未静止 (last_diff={last_diff:.4f}, stable_since={stable_since_ts}) -> no",
+        f"[if_static] 超时 {timeout_seconds:.1f}s 仍未静止 (last_diff={_diff_str}, stable_since={stable_since_ts}) -> no",
         "DEBUG",
     )
     annotate_step(
         ctx, node, "static",
-        note=f"TIMEOUT last_diff={last_diff:.3f}",
+        note=f"TIMEOUT last_diff={_diff_str}",
         region=(x, y, w, h),
     )
     return {}, ["no"], ""
@@ -3288,12 +3454,13 @@ class BlueprintRunner(QThread):
         super().__init__(parent)
         self._graph = graph
         self._ctx: Optional[ExecutionContext] = None
-        self._hotkeys: Optional[HotkeyManager] = None
         self._initial_hwnd = initial_hwnd
 
     def request_stop(self):
         if self._ctx is not None:
             self._ctx.is_running = False
+            # 清除暂停状态，确保 wait_if_paused 循环能立即退出
+            self._ctx.is_paused = False
 
     def request_pause(self, pause: bool):
         if self._ctx is not None:
@@ -3313,6 +3480,9 @@ class BlueprintRunner(QThread):
         （即 paused=True → False），把 step_mode=False 清掉，退出 Step 模式，
         后续不再「进入每节点自动停」，只认用户手动设置的 breakpoint=True 节点才会停。"""
         if self._ctx is None:
+            return False
+        # 停止中或已停止时不允许切换暂停状态
+        if not bool(getattr(self._ctx, "is_running", True)):
             return False
         cur = not bool(self._ctx.is_paused)
         # 暂停 → 继续：退出 Step 模式（后续不再每节点自动停）
@@ -3451,13 +3621,6 @@ class BlueprintRunner(QThread):
         except Exception as _ie:
             _write_log(f"[Runtime] 应用初始目标程序失败（不影响后续）: {_ie}", "WARN")
 
-        # 热键注册（硬约束 §3）
-        self._hotkeys = HotkeyManager(
-            on_stop=self.request_stop,
-            log_fn=lambda m, l="INFO": _write_log(m, l),
-        )
-        self._hotkeys.start()
-
         try:
             self._run_graph(ctx)
             _write_log(
@@ -3479,11 +3642,6 @@ class BlueprintRunner(QThread):
                     pythoncom.CoUninitialize()
                 except Exception:
                     pass
-            try:
-                if self._hotkeys is not None:
-                    self._hotkeys.stop()
-            except Exception:
-                pass
             try:
                 if log_fp is not None:
                     log_fp.close()

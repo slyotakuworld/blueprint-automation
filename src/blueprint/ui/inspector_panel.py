@@ -5,7 +5,7 @@ import os
 import re
 from typing import Any, Callable, Dict, List, Optional
 
-from PySide6.QtCore import QSize, Qt, Signal
+from PySide6.QtCore import QEvent, QObject, QSize, Qt, Signal
 from PySide6.QtGui import QFont, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPlainTextEdit,
+    QProgressDialog,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -31,7 +32,9 @@ from PySide6.QtWidgets import (
     QToolButton,
     QVBoxLayout,
     QWidget,
+    QLayout,
 )
+from PySide6.QtCore import QRect, QPoint
 
 try:
     from PIL import Image
@@ -53,6 +56,138 @@ from ..core.node_library import (
     EDITOR_TEMPLATE_PICKER,
     EDITOR_MULTILINE,
 )
+
+
+class _FlowLayout(QLayout):
+    """自动换行的流式布局，用于按键 chips 显示。"""
+    def __init__(self, parent=None, spacing=6):
+        super().__init__(parent)
+        self._spacing = spacing
+        self._items = []
+
+    def addItem(self, item):
+        self._items.append(item)
+
+    def count(self):
+        return len(self._items)
+
+    def itemAt(self, index):
+        if 0 <= index < len(self._items):
+            return self._items[index]
+        return None
+
+    def takeAt(self, index):
+        if 0 <= index < len(self._items):
+            return self._items.pop(index)
+        return None
+
+    def expandingDirections(self):
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, width):
+        return self._do_layout(QRect(0, 0, width, 0), test_only=True)
+
+    def setGeometry(self, rect):
+        super().setGeometry(rect)
+        self._do_layout(rect, test_only=False)
+
+    def sizeHint(self):
+        return self.minimumSize()
+
+    def minimumSize(self):
+        size = QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        return size
+
+    def _do_layout(self, rect, test_only):
+        x = rect.x()
+        y = rect.y()
+        line_height = 0
+        for item in self._items:
+            wid = item.widget()
+            if wid is None:
+                continue
+            hint = wid.sizeHint()
+            next_x = x + hint.width() + self._spacing
+            if next_x - self._spacing > rect.right() and line_height > 0:
+                x = rect.x()
+                y = y + line_height + self._spacing
+                next_x = x + hint.width() + self._spacing
+                line_height = 0
+            if not test_only:
+                item.setGeometry(QRect(QPoint(x, y), hint))
+            x = next_x
+            line_height = max(line_height, hint.height())
+        return y + line_height - rect.y()
+
+
+class _ClickableImageLabel(QLabel):
+    """可点击的图片标签，用于从模板预览图上拾取偏移量。
+    点击时发出 clicked(normalized_x, normalized_y) 信号，值域 [0,1]。"""
+    clicked = Signal(float, float)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._pick_mode = False
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+
+    def set_pick_mode(self, on: bool):
+        self._pick_mode = on
+        self.setCursor(Qt.CursorShape.CrossCursor if on else Qt.CursorShape.ArrowCursor)
+        if on:
+            self.setStyleSheet(
+                "QLabel { background:#000; border:2px solid #F78166; border-radius:4px; padding:2px; }"
+            )
+        else:
+            self.setStyleSheet(
+                "QLabel { background:#000; border:2px solid #0969DA; border-radius:4px; padding:2px; }"
+            )
+
+    def mousePressEvent(self, event):
+        if not self._pick_mode:
+            return super().mousePressEvent(event)
+        if self.pixmap() is None:
+            return
+        pix = self.pixmap()
+        pw, ph = pix.width(), pix.height()
+        if pw <= 0 or ph <= 0:
+            return
+        # pixmap 居中显示，需要计算 pixmap 在控件中的实际偏移
+        cw, ch = self.width(), self.height()
+        # 减去 padding/border（样式里写了 padding:2px, border:2px）
+        pad = 4  # 2px padding + 2px border
+        cw -= pad * 2
+        ch -= pad * 2
+        offset_x = (cw - pw) / 2.0 + pad
+        offset_y = (ch - ph) / 2.0 + pad
+        # 点击坐标减去 pixmap 偏移，再除以 pixmap 尺寸
+        click_x = event.position().x() - offset_x
+        click_y = event.position().y() - offset_y
+        x = max(0.0, min(1.0, click_x / pw))
+        y = max(0.0, min(1.0, click_y / ph))
+        self.clicked.emit(x, y)
+
+
+class _NoWheelFilter(QObject):
+    """事件过滤器：吞掉滚轮事件，防止在属性面板滚动时误改 QSpinBox/QComboBox 值。"""
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.Wheel:
+            return True
+        return False
+
+
+# 全局单例，所有 QSpinBox/QComboBox 共用
+_NO_WHEEL_FILTER = _NoWheelFilter()
+
+
+def _disable_wheel(widget):
+    """给控件装上滚轮过滤器"""
+    widget.installEventFilter(_NO_WHEEL_FILTER)
+    return widget
 
 
 class InspectorPanel(QWidget):
@@ -96,11 +231,14 @@ class InspectorPanel(QWidget):
         )
         outer.addWidget(self._header)
 
-        # ---- 节点动作条（根据节点类型动态填充） ----
+        # ---- 节点动作条（根据节点类型动态填充，自动换行） ----
         self._action_host = QWidget()
-        self._action_layout = QHBoxLayout(self._action_host)
+        self._action_layout = QGridLayout(self._action_host)
         self._action_layout.setContentsMargins(0, 0, 0, 0)
         self._action_layout.setSpacing(6)
+        self._action_col = 0
+        self._action_row = 0
+        self._action_max_cols = 4
         self._action_host.hide()
         outer.addWidget(self._action_host)
 
@@ -185,6 +323,16 @@ class InspectorPanel(QWidget):
             w = it.widget()
             if w:
                 w.deleteLater()
+        self._action_col = 0
+        self._action_row = 0
+
+    def _add_action_btn(self, btn):
+        """添加按钮到动作条，自动换行（每行最多4个）"""
+        self._action_layout.addWidget(btn, self._action_row, self._action_col)
+        self._action_col += 1
+        if self._action_col >= self._action_max_cols:
+            self._action_col = 0
+            self._action_row += 1
 
     def _populate_action_bar(self, node: Node):
         self._clear_action_bar()
@@ -195,8 +343,8 @@ class InspectorPanel(QWidget):
             btn = QPushButton("🔍 预览通知内容")
             btn.setStyleSheet(self._btn_style("#0B3A5C", "#0F4A77"))
             btn.clicked.connect(lambda _=False: self._show_notify_preview())
-            self._action_layout.addWidget(btn)
-            self._action_layout.addStretch(1)
+            self._add_action_btn(btn)
+
             self._action_host.show()
             return
         if node.type == "BindWindow":
@@ -204,13 +352,13 @@ class InspectorPanel(QWidget):
             btn_pick.setStyleSheet(self._btn_style("#8957E5", "#BC8CFF"))
             btn_pick.setToolTip("点击后用鼠标点击目标窗口，自动回填标题/程序名/类名")
             btn_pick.clicked.connect(lambda _=False: self._pick_window_for_bind())
-            self._action_layout.addWidget(btn_pick)
+            self._add_action_btn(btn_pick)
             btn_list = QPushButton("📋 从列表选择")
             btn_list.setStyleSheet(self._btn_style("#238636", "#2EA043"))
             btn_list.setToolTip("列出当前所有可见窗口供选择")
             btn_list.clicked.connect(lambda _=False: self._list_windows_for_bind())
-            self._action_layout.addWidget(btn_list)
-            self._action_layout.addStretch(1)
+            self._add_action_btn(btn_list)
+
             self._action_host.show()
             return
         if node.type == "IfImageDetect":
@@ -219,17 +367,17 @@ class InspectorPanel(QWidget):
             btn_add.setToolTip("全屏框选一张参考图，追加到下方列表")
             nid = node.id
             btn_add.clicked.connect(lambda _=False, n=nid: self.request_snip_for_node.emit(n, "if_img_add"))
-            self._action_layout.addWidget(btn_add)
+            self._add_action_btn(btn_add)
             btn_import = QPushButton("📂 导入图片")
             btn_import.setStyleSheet(self._btn_style("#238636", "#2EA043"))
             btn_import.setToolTip("从本地文件选择一张或多张图片导入")
             btn_import.clicked.connect(lambda _=False: self._ifimg_import_files())
-            self._action_layout.addWidget(btn_import)
-            btn_test = QPushButton("🔍 测试当前屏幕匹配度")
+            self._add_action_btn(btn_import)
+            btn_test = QPushButton("🔍 测试匹配")
             btn_test.setStyleSheet(self._btn_style("#0B3A5C", "#0F4A77"))
             btn_test.setToolTip("用当前屏幕画面和全部参考图做一次匹配，查看每张图的分数")
             btn_test.clicked.connect(lambda _=False: self._ifimg_test_screen_match())
-            self._action_layout.addWidget(btn_test)
+            self._add_action_btn(btn_test)
             # 仅 search_mode=relative 时显示临时目标窗口拾取按钮
             search_mode_val = str(node.params.get("search_mode", "relative") or "relative")
             if search_mode_val == "relative":
@@ -237,18 +385,13 @@ class InspectorPanel(QWidget):
                 btn_pick.setStyleSheet(self._btn_style("#8957E5", "#BC8CFF"))
                 btn_pick.setToolTip("点击后用鼠标点击目标窗口，自动回填临时目标标题/程序名/类名\n（留空=用全局目标程序）")
                 btn_pick.clicked.connect(lambda _=False: self._pick_window_for_ifimg_temp())
-                self._action_layout.addWidget(btn_pick)
+                self._add_action_btn(btn_pick)
                 btn_list = QPushButton("📋 从列表选择")
                 btn_list.setStyleSheet(self._btn_style("#238636", "#2EA043"))
                 btn_list.setToolTip("列出当前所有可见窗口供选择作为临时目标")
                 btn_list.clicked.connect(lambda _=False: self._list_windows_for_ifimg_temp())
-                self._action_layout.addWidget(btn_list)
-                btn_clear = QPushButton("🗑 清空临时目标")
-                btn_clear.setStyleSheet(self._btn_style("#6E7681", "#8B949E"))
-                btn_clear.setToolTip("清空临时目标，恢复使用全局目标程序")
-                btn_clear.clicked.connect(lambda _=False: self._clear_ifimg_temp_target())
-                self._action_layout.addWidget(btn_clear)
-            self._action_layout.addStretch(1)
+                self._add_action_btn(btn_list)
+
             self._action_host.show()
             return
         if node.type == "FindImage":
@@ -257,17 +400,17 @@ class InspectorPanel(QWidget):
             btn_snip.setToolTip("全屏框选一个目标区域，自动保存为PNG到templates文件夹并回填模板路径+预览图")
             nid = node.id
             btn_snip.clicked.connect(lambda _=False, n=nid: self.request_snip_for_node.emit(n, "findimg_target"))
-            self._action_layout.addWidget(btn_snip)
+            self._add_action_btn(btn_snip)
             btn_import = QPushButton("📂 导入图片")
             btn_import.setStyleSheet(self._btn_style("#238636", "#2EA043"))
             btn_import.setToolTip("从本地文件选择一张图片作为模板，默认打开工程目录templates文件夹")
             btn_import.clicked.connect(lambda _=False: self._findimg_import_image())
-            self._action_layout.addWidget(btn_import)
+            self._add_action_btn(btn_import)
             btn_test = QPushButton("🔍 测试匹配")
             btn_test.setStyleSheet(self._btn_style("#0B3A5C", "#0F4A77"))
-            btn_test.setToolTip("用当前屏幕与模板做一次匹配，查看结果/分数（不运行蓝图）")
+            btn_test.setToolTip("用当前屏幕画面与模板做一次匹配，查看结果/分数（不运行蓝图）")
             btn_test.clicked.connect(lambda _=False: self._findimg_test_match())
-            self._action_layout.addWidget(btn_test)
+            self._add_action_btn(btn_test)
             # 仅 search_mode=relative 时显示临时目标窗口拾取按钮
             search_mode_val = str(node.params.get("search_mode", "relative") or "relative")
             if search_mode_val == "relative":
@@ -275,31 +418,26 @@ class InspectorPanel(QWidget):
                 btn_pick.setStyleSheet(self._btn_style("#8957E5", "#BC8CFF"))
                 btn_pick.setToolTip("点击后用鼠标点击目标窗口，自动回填临时目标标题/程序名/类名\n（留空=用全局目标程序）")
                 btn_pick.clicked.connect(lambda _=False: self._pick_window_for_findimg_temp())
-                self._action_layout.addWidget(btn_pick)
+                self._add_action_btn(btn_pick)
                 btn_list = QPushButton("📋 从列表选择")
                 btn_list.setStyleSheet(self._btn_style("#238636", "#2EA043"))
                 btn_list.setToolTip("列出当前所有可见窗口供选择作为临时目标")
                 btn_list.clicked.connect(lambda _=False: self._list_windows_for_findimg_temp())
-                self._action_layout.addWidget(btn_list)
-                btn_clear = QPushButton("🗑 清空临时目标")
-                btn_clear.setStyleSheet(self._btn_style("#6E7681", "#8B949E"))
-                btn_clear.setToolTip("清空临时目标，恢复使用全局目标程序")
-                btn_clear.clicked.connect(lambda _=False: self._clear_findimg_temp_target())
-                self._action_layout.addWidget(btn_clear)
-            # 特征识别辅助：勾选时显示截取特征按钮
-            use_feat = bool(node.params.get("use_feature_assist", False))
+                self._add_action_btn(btn_list)
+            # 特征识别辅助：非 off 时显示截取特征按钮
+            use_feat = str(node.params.get("use_feature_assist", "off") or "off") != "off"
             if use_feat:
                 btn_feat = QPushButton("✂ 从模板截取特征")
                 btn_feat.setStyleSheet(self._btn_style("#BF8700", "#FFD700"))
                 btn_feat.setToolTip("在模板图片上框选区域作为特征，自动裁剪并记录相对坐标\n（需要先截取/导入模板图片）")
                 btn_feat.clicked.connect(lambda _=False: self._findimg_snip_features())
-                self._action_layout.addWidget(btn_feat)
+                self._add_action_btn(btn_feat)
                 btn_feat_list = QPushButton("📋 查看特征列表")
                 btn_feat_list.setStyleSheet(self._btn_style("#0969DA", "#58A6FF"))
                 btn_feat_list.setToolTip("查看/删除已截取的特征")
                 btn_feat_list.clicked.connect(lambda _=False: self._findimg_show_feature_list())
-                self._action_layout.addWidget(btn_feat_list)
-            self._action_layout.addStretch(1)
+                self._add_action_btn(btn_feat_list)
+
             self._action_host.show()
             return
         if node.type == "StillnessDetect":
@@ -310,18 +448,13 @@ class InspectorPanel(QWidget):
                 btn_pick.setStyleSheet(self._btn_style("#8957E5", "#BC8CFF"))
                 btn_pick.setToolTip("点击后用鼠标点击目标窗口，自动回填临时目标标题/程序名/类名\n（留空=用全局目标程序）")
                 btn_pick.clicked.connect(lambda _=False: self._pick_window_for_ifstatic_temp())
-                self._action_layout.addWidget(btn_pick)
+                self._add_action_btn(btn_pick)
                 btn_list = QPushButton("📋 从列表选择")
                 btn_list.setStyleSheet(self._btn_style("#238636", "#2EA043"))
                 btn_list.setToolTip("列出当前所有可见窗口供选择作为临时目标")
                 btn_list.clicked.connect(lambda _=False: self._list_windows_for_ifstatic_temp())
-                self._action_layout.addWidget(btn_list)
-                btn_clear = QPushButton("🗑 清空临时目标")
-                btn_clear.setStyleSheet(self._btn_style("#6E7681", "#8B949E"))
-                btn_clear.setToolTip("清空临时目标，恢复使用全局目标程序")
-                btn_clear.clicked.connect(lambda _=False: self._clear_ifstatic_temp_target())
-                self._action_layout.addWidget(btn_clear)
-                self._action_layout.addStretch(1)
+                self._add_action_btn(btn_list)
+
                 self._action_host.show()
                 return
             self._action_host.hide()
@@ -334,18 +467,13 @@ class InspectorPanel(QWidget):
                 btn_pick.setStyleSheet(self._btn_style("#8957E5", "#BC8CFF"))
                 btn_pick.setToolTip("点击后用鼠标点击目标窗口，自动回填临时目标标题/程序名/类名\n（留空=用全局目标程序）")
                 btn_pick.clicked.connect(lambda _=False: self._pick_window_for_mouse_temp())
-                self._action_layout.addWidget(btn_pick)
+                self._add_action_btn(btn_pick)
                 btn_list = QPushButton("📋 从列表选择")
                 btn_list.setStyleSheet(self._btn_style("#238636", "#2EA043"))
                 btn_list.setToolTip("列出当前所有可见窗口供选择作为临时目标")
                 btn_list.clicked.connect(lambda _=False: self._list_windows_for_mouse_temp())
-                self._action_layout.addWidget(btn_list)
-                btn_clear = QPushButton("🗑 清空临时目标")
-                btn_clear.setStyleSheet(self._btn_style("#6E7681", "#8B949E"))
-                btn_clear.setToolTip("清空临时目标，恢复使用全局目标程序")
-                btn_clear.clicked.connect(lambda _=False: self._clear_mouse_temp_target())
-                self._action_layout.addWidget(btn_clear)
-                self._action_layout.addStretch(1)
+                self._add_action_btn(btn_list)
+
                 self._action_host.show()
                 return
             self._action_host.hide()
@@ -914,7 +1042,7 @@ class InspectorPanel(QWidget):
         )
 
     def _findimg_show_feature_list(self):
-        """查看/删除已截取的特征列表。"""
+        """查看/删除已截取的特征列表（图片画廊式展示）。"""
         node = self._current_node
         if node is None or node.type != "FindImage":
             return
@@ -932,74 +1060,96 @@ class InspectorPanel(QWidget):
 
         from PySide6.QtWidgets import (
             QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-            QTableWidget, QTableWidgetItem, QAbstractItemView,
-            QHeaderView,
+            QScrollArea, QGridLayout, QFrame,
         )
         from PySide6.QtGui import QImage
 
         dlg = QDialog(self)
         dlg.setWindowTitle(f"特征列表（共 {len(features)} 个）")
-        dlg.resize(700, 450)
+        dlg.resize(600, 450)
         lay = QVBoxLayout(dlg)
 
-        table = QTableWidget(len(features), 5)
-        table.setHorizontalHeaderLabels(["#", "相对位置", "特征尺寸", "预览", ""])
-        table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        table.horizontalHeader().setStretchLastSection(False)
-        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Fixed)
-        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
-        table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Fixed)
-        table.setColumnWidth(0, 40)
-        table.setColumnWidth(4, 60)
-        table.setStyleSheet(
-            "QTableWidget { background-color: #1C2128; color: #C9D1D9;"
-            "  border: 1px solid #2D333B; border-radius: 4px; gridline-color: #2D333B; }"
-            "QHeaderView::section { background-color: #22272E; color: #C9D1D9;"
-            "  padding: 4px; border: none; border-bottom: 1px solid #2D333B; }"
+        # 顶部说明
+        info = QLabel(f"共 {len(features)} 个特征（偏移信息已自动记录，无需手动管理）")
+        info.setStyleSheet("color: #8B949E; font-size: 10px;")
+        lay.addWidget(info)
+
+        # 滚动区域 + 网格图片画廊
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet(
+            "QScrollArea { border: 1px solid #2D333B; border-radius: 4px; background: #1C2128; }"
         )
+        gallery_host = QWidget()
+        gallery_host.setStyleSheet("background: transparent;")
+        grid = QGridLayout(gallery_host)
+        grid.setSpacing(8)
+        grid.setContentsMargins(8, 8, 8, 8)
+
+        deleted = set()
 
         for i, feat in enumerate(features):
-            table.setItem(i, 0, QTableWidgetItem(str(i + 1)))
-            rx = feat.get("rel_x", 0)
-            ry = feat.get("rel_y", 0)
-            table.setItem(i, 1, QTableWidgetItem(f"({rx}, {ry})"))
-            fw = feat.get("w", 0)
-            fh = feat.get("h", 0)
-            table.setItem(i, 2, QTableWidgetItem(f"{fw}×{fh}"))
-            # 预览缩略图
+            card = QFrame()
+            card.setStyleSheet(
+                "QFrame { background: #21262D; border: 1px solid #2D333B; border-radius: 6px; }"
+            )
+            card_lay = QVBoxLayout(card)
+            card_lay.setContentsMargins(4, 4, 4, 4)
+            card_lay.setSpacing(4)
+
+            # 图片
             b64 = feat.get("b64", "")
             if b64:
                 try:
                     img_data = base64.b64decode(b64)
                     qimg = QImage.fromData(img_data)
                     if not qimg.isNull():
-                        pm = QPixmap.fromImage(qimg).scaled(60, 60, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                        pm = QPixmap.fromImage(qimg).scaled(120, 120, Qt.KeepAspectRatio, Qt.SmoothTransformation)
                         lbl = QLabel()
                         lbl.setPixmap(pm)
-                        table.setCellWidget(i, 3, lbl)
+                        lbl.setAlignment(Qt.AlignCenter)
+                        lbl.setMinimumSize(120, 120)
+                        lbl.setStyleSheet("background: #000; border-radius: 4px;")
+                        card_lay.addWidget(lbl)
                     else:
-                        table.setItem(i, 3, QTableWidgetItem("(解码失败)"))
+                        card_lay.addWidget(QLabel("(解码失败)"))
                 except Exception:
-                    table.setItem(i, 3, QTableWidgetItem("(加载失败)"))
+                    card_lay.addWidget(QLabel("(加载失败)"))
             else:
-                table.setItem(i, 3, QTableWidgetItem("(空)"))
-            # 删除按钮
-            btn_del = QPushButton("删除")
+                empty = QLabel("（无图）")
+                empty.setAlignment(Qt.AlignCenter)
+                empty.setMinimumSize(120, 120)
+                empty.setStyleSheet("background: #1C2128; border-radius: 4px; color: #8B949E;")
+                card_lay.addWidget(empty)
+
+            # 序号 + 删除按钮
+            bottom = QHBoxLayout()
+            bottom.setContentsMargins(0, 0, 0, 0)
+            num_lbl = QLabel(f"#{i + 1}")
+            num_lbl.setStyleSheet("color: #58A6FF; font-size: 10px; font-weight: bold;")
+            bottom.addWidget(num_lbl)
+            bottom.addStretch(1)
+            btn_del = QPushButton("🗑")
+            btn_del.setFixedSize(28, 24)
             btn_del.setStyleSheet(self._btn_style("#B62324", "#FF7B72"))
-            row_i = i
-            def _del_row(checked=False, r=row_i):
-                table.removeRow(r)
-            btn_del.clicked.connect(_del_row)
-            table.setCellWidget(i, 4, btn_del)
+            feat_idx = i
+            def _del(checked=False, idx=feat_idx, c=card):
+                c.hide()
+                deleted.add(idx)
+            btn_del.clicked.connect(_del)
+            bottom.addWidget(btn_del)
+            card_lay.addLayout(bottom)
 
-        lay.addWidget(table, 1)
+            row, col = i // 4, i % 4
+            grid.addWidget(card, row, col)
 
+        scroll.setWidget(gallery_host)
+        lay.addWidget(scroll, 1)
+
+        # 底部按钮
         btn_box = QHBoxLayout()
         btn_box.addStretch(1)
-        btn_save = QPushButton("保存修改")
+        btn_save = QPushButton("保存")
         btn_save.setStyleSheet(self._btn_style("#238636", "#2EA043"))
         btn_box.addWidget(btn_save)
         btn_cancel = QPushButton("取消")
@@ -1008,15 +1158,7 @@ class InspectorPanel(QWidget):
         lay.addLayout(btn_box)
 
         def _save():
-            # 从表格重建特征列表（排除被删除的行）
-            remaining = []
-            for r in range(table.rowCount()):
-                idx_item = table.item(r, 0)
-                if idx_item is None:
-                    continue
-                orig_idx = int(idx_item.text()) - 1
-                if 0 <= orig_idx < len(features):
-                    remaining.append(features[orig_idx])
+            remaining = [feat for i, feat in enumerate(features) if i not in deleted]
             self.apply_params_merge({"features_json": json.dumps(remaining, ensure_ascii=False)})
             dlg.accept()
 
@@ -1220,14 +1362,15 @@ class InspectorPanel(QWidget):
             try:
                 self._hide_param_row("template_b64")
                 self._hide_param_row("template")
+                self._hide_param_row("features_json")
+                self._hide_param_row("feature_capture_width")
+                self._hide_param_row("feature_template_w")
+                self._hide_param_row("feature_template_h")
                 self._append_findimage_panel()
                 # 注意：每次 set_node 创建的是全新控件（_clear_form 已销毁旧控件），
                 # 不存在重复连接问题，所以不需要 disconnect()。
                 # 如果 disconnect()，会断掉 _build_editor 中连接的 param_changed.emit 信号，
-                # 导致用户切换 after_action / auto_scroll 时新值无法写入 node.params！
-                w_auto = self._widgets.get("auto_scroll")
-                if isinstance(w_auto, QCheckBox):
-                    w_auto.stateChanged.connect(lambda _s: self._findimg_apply_param_visibility())
+                # 导致用户切换 after_action 时新值无法写入 node.params！
                 w_act = self._widgets.get("after_action")
                 if isinstance(w_act, QComboBox):
                     w_act.currentIndexChanged.connect(lambda _i: self._findimg_apply_param_visibility())
@@ -1235,10 +1378,10 @@ class InspectorPanel(QWidget):
                 w_sm = self._widgets.get("search_mode")
                 if isinstance(w_sm, QComboBox):
                     w_sm.currentIndexChanged.connect(lambda *_: self._on_findimg_search_mode_changed())
-                # 绑定 use_feature_assist 勾选，切换特征参数显隐 + 工具栏按钮
+                # 绑定 use_feature_assist 下拉框，切换特征参数显隐 + 工具栏按钮
                 w_ufa = self._widgets.get("use_feature_assist")
-                if isinstance(w_ufa, QCheckBox):
-                    w_ufa.stateChanged.connect(lambda _s: self._on_findimg_feature_assist_changed())
+                if isinstance(w_ufa, QComboBox):
+                    w_ufa.currentIndexChanged.connect(lambda _i: self._on_findimg_feature_assist_changed())
                 self._findimg_apply_param_visibility(initial=True)
             except Exception as e:
                 print(f"[Inspector] FindImage UI 出错: {e}")
@@ -1483,7 +1626,7 @@ class InspectorPanel(QWidget):
         th = QHBoxLayout(title_row)
         th.setContentsMargins(0, 0, 0, 0)
         th.setSpacing(6)
-        stat = QLabel(f"🖼️ 参考图列表（共 {n} 张）：全部存在才走 yes；缺任何一张走 no ｜ 单张卡片右下角 ✖ 可删除（不支持一次性全删）")
+        stat = QLabel(f"🖼️ 参考图列表（共 {n} 张）：结合上方「求值模式」判定 —— AND(完全/短路)：全中才走 yes、缺任一张走 no；OR(一真即真)：任意一张命中就走 yes、全缺才走 no ｜ 单张卡片右下角 ✖ 可删除")
         stat.setStyleSheet("color: #ff9800; font-weight: bold; font-size: 10px;")
         stat.setWordWrap(True)
         th.addWidget(stat, 1)
@@ -1894,21 +2037,28 @@ class InspectorPanel(QWidget):
         })
 
     def _ifimg_test_screen_match(self):
-        """「测试当前屏幕匹配度」按钮：当场截全屏与每张参考图做模板匹配并弹窗显示分数"""
+        """「测试当前屏幕匹配度」按钮：直接调用运行时 TemplateMatcher，保证测试=运行时预览。"""
+        if getattr(self, "_ifimg_test_running", False):
+            return
+        self._ifimg_test_running = True
         arr = self._parse_ifimg_list()
         if not arr:
+            self._ifimg_test_running = False
             QMessageBox.information(self, "提示", "还没有添加参考图，先截图新增或导入图片～")
             return
-        # 拿当前参数
         node = self._current_node
         if node is None:
+            self._ifimg_test_running = False
             return
         p = node.params or {}
         threshold = float(p.get("threshold", 0.9) or 0.9)
         strategy = str(p.get("match_strategy", "hybrid") or "hybrid")
-        algo_txt = {"hybrid": "混合匹配", "template": "模板匹配", "feature": "特征匹配"}.get(strategy, strategy)
+        algo_txt = {"hybrid": "智能混合", "template": "模板匹配", "gray": "灰度匹配", "feature": "特征匹配"}.get(strategy, strategy)
+        akaze_thr = max(0.01, min(1.0, float(threshold)))
 
-        # 先最小化主窗口，避免蓝图工具遮挡要识别的画面
+        from PySide6.QtCore import QCoreApplication
+
+        # 隐藏主窗口，避免遮挡目标
         main_win = self.window()
         win_visible = True
         try:
@@ -1916,139 +2066,140 @@ class InspectorPanel(QWidget):
                 win_visible = bool(main_win.isVisible())
                 if win_visible:
                     main_win.hide()
-            # 等窗口完全隐藏后再截图
-            from PySide6.QtCore import QCoreApplication
             for _ in range(5):
                 QCoreApplication.processEvents()
             import time as _t
             _t.sleep(0.3)
         except Exception:
             pass
+
+        progress = QProgressDialog("正在匹配图像，请稍候...", None, 0, len(arr), self)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setCancelButton(None)
+        progress.setWindowTitle("匹配中")
+        progress.setValue(0)
+        progress.show()
+        QCoreApplication.processEvents()
+
+        results: List[str] = []
+        tmp_paths: List[str] = []
         try:
-            # 1) 先截一张当前屏幕
-            import tempfile
-            shot_png = ""
-            screen_pil = None
-            # 优先用全局截图工具（尝试多种方法）
-            try:
-                from src.blueprint.runtime.screen_capture import DefaultScreenCapture
-                cap = DefaultScreenCapture()
-                screen_pil = cap.capture_pil()
-            except Exception:
-                screen_pil = None
-            # 兜底：用 PIL.ImageGrab（仅Windows/macOS可用）
-            if screen_pil is None:
+            from src.blueprint.runtime.template_matcher import TemplateMatcher
+            import pyautogui
+
+            # 创建运行时 TemplateMatcher 实例（与 F5 运行时使用同一个类）
+            matcher = TemplateMatcher(log_fn=lambda *a, **k: None, is_running_fn=lambda: True)
+            screen_w, screen_h = pyautogui.size()
+            matcher.set_fullscreen_region((0, 0, screen_w, screen_h))
+
+            for idx, item in enumerate(arr):
+                progress.setLabelText(f"正在匹配第 {idx + 1}/{len(arr)} 张参考图...")
+                progress.setValue(idx)
+                QCoreApplication.processEvents()
+
+                name = f"[{idx}]"
+                if not isinstance(item, dict):
+                    results.append(f"{name} （无效项）  score=0.00  ✗")
+                    continue
+
+                # 获取模板路径：优先全分辨率路径，b64只是缩略图
+                path = str(item.get("path", "") or "")
+                b64 = str(item.get("b64", "") or "")
+                use_path = None
+                if isinstance(path, str) and path and os.path.exists(path):
+                    use_path = path
+                elif isinstance(b64, str) and b64:
+                    try:
+                        tpl_pil = self._b64_to_pil(b64)
+                        if tpl_pil is not None:
+                            import tempfile
+                            fd, tmp = tempfile.mkstemp(suffix=".png", prefix="ba_ifimg_test_")
+                            os.close(fd)
+                            tpl_pil.save(tmp, format="PNG")
+                            tmp_paths.append(tmp)
+                            use_path = tmp
+                    except Exception:
+                        use_path = None
+                if not use_path:
+                    results.append(f"{name} （无参考图数据）  score=0.00  ✗")
+                    continue
+
+                # 直接调用运行时匹配方法（与 executor.py 完全一致的策略分支）
+                pos = None
+                used_chain = []
                 try:
-                    from PIL import ImageGrab
-                    screen_pil = ImageGrab.grab(all_screens=True)
-                except Exception as e2:
-                    QMessageBox.critical(self, "截图失败", f"无法抓取当前屏幕：\n{e2}")
-                    return
-            fd, shot_png = tempfile.mkstemp(suffix=".png", prefix="ba_testshot_")
-            os.close(fd)
-            screen_pil.save(shot_png, format="PNG")
+                    if strategy == "template":
+                        pos = matcher.find_image(use_path, region=None, threshold=threshold, fast_mode=True)
+                        used_chain.append("color")
+                    elif strategy == "gray":
+                        pos = matcher.find_image_gray(use_path, region=None, threshold=threshold, fast_mode=True)
+                        used_chain.append("gray")
+                    elif strategy == "feature":
+                        pos = matcher.find_image_akaze(use_path, region=None, threshold=akaze_thr)
+                        used_chain.append("AKAZE")
+                    else:  # hybrid: color → gray → AKAZE
+                        pos = matcher.find_image(use_path, region=None, threshold=threshold, fast_mode=True)
+                        used_chain.append("color")
+                        if pos is None:
+                            pos = matcher.find_image_gray(use_path, region=None, threshold=threshold, fast_mode=True)
+                            used_chain.append("gray")
+                        if pos is None:
+                            pos = matcher.find_image_akaze(use_path, region=None, threshold=akaze_thr)
+                            used_chain.append("AKAZE")
+                except Exception as e:
+                    results.append(f"{name} 匹配出错={e}")
+                    continue
+
+                # 格式化结果
+                score_val = 0.0
+                if pos is not None and isinstance(pos, dict):
+                    s = pos.get("score")
+                    if isinstance(s, (int, float)):
+                        score_val = float(s)
+                    else:
+                        score_val = 1.0
+                display = os.path.basename(path) if path else f"image[{idx}]"
+                tag = "✓ PASS" if pos is not None else "✗ FAIL"
+                loc_txt = ""
+                if pos is not None:
+                    left = int(pos.get("left", 0))
+                    top = int(pos.get("top", 0))
+                    w = int(pos.get("width", 0))
+                    h = int(pos.get("height", 0))
+                    loc_txt = f" 位置=({left},{top},{w},{h})"
+                chain_txt = f" 级联=[{'→'.join(used_chain)}]"
+                results.append(f"{name} {display}  score={score_val:.3f}{chain_txt} (阈值≥{threshold:.2f}) {tag}{loc_txt}")
+                QCoreApplication.processEvents()
+
+            progress.setValue(len(arr))
+            progress.close()
         except Exception as e:
-            QMessageBox.critical(self, "截图失败", f"无法抓取当前屏幕：\n{e}")
-            return
+            progress.close()
+            results.append(f"匹配出错: {e}")
         finally:
-            # 恢复主窗口显示
+            # 恢复主窗口
             try:
                 if main_win and win_visible and hasattr(main_win, "show"):
                     main_win.show()
-                    from PySide6.QtCore import QCoreApplication
                     for _ in range(3):
                         QCoreApplication.processEvents()
             except Exception:
                 pass
-
-        # 2) 逐张匹配，做模板匹配拿最大相关系数
-        results: List[str] = []
-        import numpy as np
-        try:
-            import cv2  # opencv做模板匹配，快速
-            screen_cv2 = None
-            try:
-                arr_np = np.fromfile(shot_png, dtype=np.uint8)
-                screen_cv2 = cv2.imdecode(arr_np, cv2.IMREAD_COLOR)
-            except Exception:
-                screen_cv2 = None
-            if screen_cv2 is None:
-                QMessageBox.critical(self, "读取失败", "无法读取当前截图为OpenCV图像")
-                return
-            screen_gray = cv2.cvtColor(screen_cv2, cv2.COLOR_BGR2GRAY)
-
-            for idx, item in enumerate(arr):
-                name = f"[{idx}]"
-                # 读取参考图
-                ref_pil = None
-                b64 = item.get("b64") if isinstance(item, dict) else None
-                if isinstance(b64, str) and b64:
-                    try:
-                        ref_pil = self._b64_to_pil(b64)
-                    except Exception:
-                        ref_pil = None
-                if ref_pil is None and isinstance(item, dict):
-                    path = item.get("path", "") or ""
-                    if isinstance(path, str) and path and os.path.exists(path) and Image is not None:
-                        try:
-                            ref_pil = Image.open(path)
-                        except Exception:
-                            ref_pil = None
-                if ref_pil is None:
-                    results.append(f"{name} （无参考图数据）  score=0.00  ✗")
-                    continue
-                # 转 OpenCV
-                if ref_pil.mode not in ("RGB", "L"):
-                    ref_pil = ref_pil.convert("RGB")
-                ref_cv2 = cv2.cvtColor(np.array(ref_pil), cv2.COLOR_RGB2BGR)
-                h, w = ref_cv2.shape[:2]
-                sh, sw = screen_cv2.shape[:2]
-                if h > sh or w > sw:
-                    results.append(f"{name} 参考图({w}x{h})>屏幕({sw}x{sh})  score=0.00  ✗")
-                    continue
+            # 清理临时文件
+            for tp in tmp_paths:
                 try:
-                    if strategy == "feature":
-                        # 特征匹配：简化版直接模板兜底（不做复杂特征）
-                        ref_g = cv2.cvtColor(ref_cv2, cv2.COLOR_BGR2GRAY)
-                        res = cv2.matchTemplate(screen_gray, ref_g, cv2.TM_CCOEFF_NORMED)
-                    else:
-                        # template / hybrid：灰度模板匹配
-                        ref_g = cv2.cvtColor(ref_cv2, cv2.COLOR_BGR2GRAY)
-                        res = cv2.matchTemplate(screen_gray, ref_g, cv2.TM_CCOEFF_NORMED)
-                    _, max_val, _, max_loc = cv2.minMaxLoc(res)
-                    score = float(max_val)
-                    hit = score >= threshold
-                    tag = "✓ PASS" if hit else "✗ FAIL"
-                    loc_txt = f"位置:{max_loc}" if hit else ""
-                    results.append(f"{name} {w}x{h}  score={score:.3f} (阈值≥{threshold:.2f}) {tag} {loc_txt}")
-                except Exception as e:
-                    results.append(f"{name} 匹配出错={e}")
-        except ImportError:
-            # 没有OpenCV，做PIL+NCC简化版
-            results.append("⚠ 未安装opencv-python，改用简化判断：仅检测图片是否完整读取成功")
-            for idx, item in enumerate(arr):
-                ref_pil = None
-                b64 = item.get("b64") if isinstance(item, dict) else None
-                if isinstance(b64, str) and b64:
-                    try:
-                        ref_pil = self._b64_to_pil(b64)
-                    except Exception:
-                        ref_pil = None
-                ok = ref_pil is not None
-                results.append(f"[{idx}] 参考图{'可用' if ok else'缺失'}")
-        finally:
-            try:
-                if shot_png and os.path.exists(shot_png):
-                    os.unlink(shot_png)
-            except Exception:
-                pass
+                    if tp and os.path.exists(tp):
+                        os.unlink(tp)
+                except Exception:
+                    pass
+            self._ifimg_test_running = False
 
-        # 弹窗显示结果
         dlg = QDialog(self)
         dlg.setWindowTitle("🔍 当前屏幕匹配结果")
-        dlg.resize(560, 420)
+        dlg.resize(620, 460)
         lay = QVBoxLayout(dlg)
-        info = QLabel(f"算法：{algo_txt}  |  阈值：≥{threshold:.2f}  |  共 {len(arr)} 张")
+        info = QLabel(f"算法：{algo_txt}  |  阈值：≥{threshold:.2f}  |  共 {len(arr)} 张  |  级联 fallback 已启用")
         info.setStyleSheet("color:#C9D1D9; font-weight:bold;")
         lay.addWidget(info)
         edit = QPlainTextEdit()
@@ -2063,7 +2214,6 @@ class InspectorPanel(QWidget):
         btn_ok.clicked.connect(dlg.accept)
         lay.addWidget(btn_ok)
         dlg.exec()
-
     # ================================================================
     # FindImage：模板预览 + 滚动/动作显隐 + 测试匹配
     # ================================================================
@@ -2114,6 +2264,8 @@ class InspectorPanel(QWidget):
                     pil = Image.open(tpl_path)
             except Exception:
                 pil = None
+        # 记录模板原始尺寸（用于偏移拾取计算）
+        self._findimg_tpl_size = (pil.width, pil.height) if pil is not None else None
         if pil is None:
             empty = QLabel("（无预览）")
             empty.setAlignment(Qt.AlignCenter)
@@ -2143,18 +2295,12 @@ class InspectorPanel(QWidget):
             self._form.addRow(lbl)
 
     def _findimg_apply_param_visibility(self, initial: bool = False):
-        """根据 auto_scroll / after_action，通过 self._widgets 精准定位行并显隐。
+        """根据 after_action / use_feature_assist，通过 self._widgets 精准定位行并显隐。
         直接从控件读当前值，避免信号触发时 node.params 还没更新的时序问题。
         """
         node = self._current_node
         if node is None:
             return
-
-        # 直接从控件读取当前值（解决 currentIndexChanged 信号触发时 node.params 未更新的时序问题）
-        auto_scroll = bool(node.params.get("auto_scroll", False))
-        w_auto = self._widgets.get("auto_scroll")
-        if isinstance(w_auto, QCheckBox):
-            auto_scroll = w_auto.isChecked()
 
         after_action = str(node.params.get("after_action", "none") or "none")
         w_act = self._widgets.get("after_action")
@@ -2167,11 +2313,13 @@ class InspectorPanel(QWidget):
 
         show_offsets = after_action != "none"
 
-        # 特征识别辅助参数：仅 use_feature_assist 勾选时显示
-        use_feat = bool(node.params.get("use_feature_assist", False))
+        # 特征识别辅助参数：仅 use_feature_assist 非 off 时显示
+        use_feat = str(node.params.get("use_feature_assist", "off") or "off") != "off"
         w_ufa = self._widgets.get("use_feature_assist")
-        if isinstance(w_ufa, QCheckBox):
-            use_feat = w_ufa.isChecked()
+        if isinstance(w_ufa, QComboBox):
+            d = w_ufa.currentData()
+            ufa_val = str(d) if d is not None else str(w_ufa.currentText() or "off")
+            use_feat = ufa_val != "off"
 
         form = self._form
         if form is None:
@@ -2185,16 +2333,10 @@ class InspectorPanel(QWidget):
 
         # 参数名 -> 是否可见 的映射表
         vis_map = {
-            "scroll_dy": auto_scroll,
-            "scroll_dx": auto_scroll,
             "offset": show_offsets,
-            # 特征识别辅助参数
-            "features_json": use_feat,
+            # 特征识别辅助参数（features_json / feature_capture_width / feature_template_w/h 已隐藏，不在此管理）
             "feature_tolerance": use_feat,
             "feature_min_hits": use_feat,
-            "feature_capture_width": use_feat,
-            "feature_template_w": use_feat,
-            "feature_template_h": use_feat,
         }
 
         # 临时目标参数：仅 search_mode=relative 时显示
@@ -2235,35 +2377,46 @@ class InspectorPanel(QWidget):
         self._populate_action_bar(self._current_node)
 
     def _findimg_test_match(self):
-        """「🔍 测试匹配」按钮：不运行蓝图，现场截全屏做一次匹配。"""
+        """「🔍 测试匹配」按钮：直接调用运行时 TemplateMatcher，保证测试=运行时预览。"""
+        if getattr(self, "_findimg_test_running", False):
+            return
+        self._findimg_test_running = True
         node = self._current_node
         if node is None:
+            self._findimg_test_running = False
             return
         p = node.params or {}
         tpl_path = str(p.get("template", "") or "")
         tpl_b64 = str(p.get("template_b64", "") or "")
-        threshold = float(p.get("threshold", 0.75) or 0.75)
+        threshold = float(p.get("threshold", 0.9) or 0.9)
         strategy = str(p.get("match_strategy", "hybrid") or "hybrid")
-        algo_txt = {"hybrid": "智能混合", "template": "模板匹配", "feature": "特征匹配"}.get(strategy, strategy)
+        algo_txt = {"hybrid": "智能混合", "template": "模板匹配", "gray": "灰度匹配", "feature": "特征匹配"}.get(strategy, strategy)
+        akaze_thr = max(0.01, min(1.0, float(threshold)))
 
-        # 找到模板pil
-        tpl_pil = None
-        if isinstance(tpl_b64, str) and tpl_b64:
+        from PySide6.QtCore import QCoreApplication
+
+        # 获取模板路径：优先全分辨率路径，b64只是220px缩略图仅供UI预览
+        use_path = None
+        tmp_tpl = ""
+        if isinstance(tpl_path, str) and tpl_path and os.path.exists(tpl_path):
+            use_path = tpl_path
+        elif isinstance(tpl_b64, str) and tpl_b64:
             try:
                 tpl_pil = self._b64_to_pil(tpl_b64)
+                if tpl_pil is not None:
+                    import tempfile
+                    fd, tmp_tpl = tempfile.mkstemp(suffix=".png", prefix="ba_findtest_tpl_")
+                    os.close(fd)
+                    tpl_pil.save(tmp_tpl, format="PNG")
+                    use_path = tmp_tpl
             except Exception:
-                tpl_pil = None
-        if tpl_pil is None and isinstance(tpl_path, str) and tpl_path:
-            try:
-                if os.path.exists(tpl_path) and Image is not None:
-                    tpl_pil = Image.open(tpl_path)
-            except Exception:
-                tpl_pil = None
-        if tpl_pil is None:
+                use_path = None
+        if not use_path:
+            self._findimg_test_running = False
             QMessageBox.information(self, "提示", "还没有模板，请先点 [📸 截取目标] 或填写模板路径")
             return
 
-        # 先最小化主窗口，避免蓝图工具遮挡要识别的画面
+        # 隐藏主窗口，避免遮挡目标
         main_win = self.window()
         win_visible = True
         try:
@@ -2271,7 +2424,6 @@ class InspectorPanel(QWidget):
                 win_visible = bool(main_win.isVisible())
                 if win_visible:
                     main_win.hide()
-            from PySide6.QtCore import QCoreApplication
             for _ in range(5):
                 QCoreApplication.processEvents()
             import time as _t
@@ -2279,108 +2431,111 @@ class InspectorPanel(QWidget):
         except Exception:
             pass
 
-        # 截全屏
-        import tempfile
-        shot_png = ""
+        progress = QProgressDialog("正在匹配图像，请稍候...", None, 0, 100, self)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setCancelButton(None)
+        progress.setWindowTitle("匹配中")
+        progress.setValue(5)
+        progress.show()
+        QCoreApplication.processEvents()
+
+        result_txt = ""
+        used_chain = []
+        pos = None
         try:
-            from PIL import ImageGrab
-            screen_pil = ImageGrab.grab(all_screens=True)
-            fd, shot_png = tempfile.mkstemp(suffix=".png", prefix="ba_findtest_")
-            os.close(fd)
-            screen_pil.save(shot_png, format="PNG")
+            from src.blueprint.runtime.template_matcher import TemplateMatcher
+            import pyautogui
+
+            # 创建运行时 TemplateMatcher 实例（与 F5 运行时使用同一个类）
+            matcher = TemplateMatcher(log_fn=lambda *a, **k: None, is_running_fn=lambda: True)
+            screen_w, screen_h = pyautogui.size()
+            matcher.set_fullscreen_region((0, 0, screen_w, screen_h))
+
+            progress.setValue(15)
+            QCoreApplication.processEvents()
+
+            # 直接调用运行时匹配方法（与 executor.py 完全一致的策略分支）
+            if strategy == "template":
+                pos = matcher.find_image(str(use_path), region=None, threshold=threshold, fast_mode=True)
+                used_chain.append("color")
+                progress.setValue(60)
+            elif strategy == "gray":
+                pos = matcher.find_image_gray(str(use_path), region=None, threshold=threshold, fast_mode=True)
+                used_chain.append("gray")
+                progress.setValue(60)
+            elif strategy == "feature":
+                pos = matcher.find_image_akaze(str(use_path), region=None, threshold=akaze_thr)
+                used_chain.append("AKAZE")
+                progress.setValue(60)
+            else:  # hybrid: color → gray → AKAZE
+                pos = matcher.find_image(str(use_path), region=None, threshold=threshold, fast_mode=True)
+                used_chain.append("color")
+                progress.setValue(35)
+                QCoreApplication.processEvents()
+                if pos is None:
+                    pos = matcher.find_image_gray(str(use_path), region=None, threshold=threshold, fast_mode=True)
+                    used_chain.append("gray")
+                    progress.setValue(60)
+                    QCoreApplication.processEvents()
+                if pos is None:
+                    pos = matcher.find_image_akaze(str(use_path), region=None, threshold=akaze_thr)
+                    used_chain.append("AKAZE")
+                    progress.setValue(85)
+                    QCoreApplication.processEvents()
+
+            progress.setValue(95)
+            QCoreApplication.processEvents()
+
+            # 格式化结果
+            if pos is not None:
+                left = int(pos.get("left", 0))
+                top = int(pos.get("top", 0))
+                w = int(pos.get("width", 0))
+                h = int(pos.get("height", 0))
+                score = float(pos.get("score", 0.0))
+                cx = int(pos.get("cx", left + w // 2))
+                cy = int(pos.get("cy", top + h // 2))
+                result_txt = (
+                    f"算法: {algo_txt}  |  级联: [{'→'.join(used_chain)}]\n"
+                    f"设定阈值: ≥{threshold:.2f}\n"
+                    f"匹配分数: {score:.3f}\n"
+                    f"命中矩形: ({left}, {top}, {w}, {h})\n"
+                    f"中心坐标: ({cx}, {cy})\n"
+                    f"结果: ✅ 找到"
+                )
+            else:
+                result_txt = (
+                    f"算法: {algo_txt}  |  级联: [{'→'.join(used_chain)}]\n"
+                    f"设定阈值: ≥{threshold:.2f}\n"
+                    f"结果: ❌ 未找到\n"
+                    f"（测试使用全屏截图，运行时如设为相对窗口则使用窗口区域）"
+                )
         except Exception as e:
-            try:
-                if main_win and win_visible and hasattr(main_win, "show"):
-                    main_win.show()
-            except Exception:
-                pass
-            QMessageBox.critical(self, "截图失败", f"无法抓取当前屏幕：\n{e}")
-            try:
-                if shot_png and os.path.exists(shot_png):
-                    os.unlink(shot_png)
-            except Exception:
-                pass
-            return
+            result_txt = f"匹配出错: {e}"
         finally:
-            # 恢复主窗口显示（截图完就立刻恢复，不用等匹配完成）
+            # 恢复主窗口
             try:
                 if main_win and win_visible and hasattr(main_win, "show"):
                     main_win.show()
-                    from PySide6.QtCore import QCoreApplication
                     for _ in range(3):
                         QCoreApplication.processEvents()
             except Exception:
                 pass
+            # 清理临时文件
+            if tmp_tpl and os.path.exists(tmp_tpl):
+                try:
+                    os.unlink(tmp_tpl)
+                except Exception:
+                    pass
+            progress.setValue(100)
+            progress.close()
+            self._findimg_test_running = False
 
-        # 把模板也存临时
-        tpl_png = ""
-        try:
-            fd, tpl_png = tempfile.mkstemp(suffix=".png", prefix="ba_tpltest_")
-            os.close(fd)
-            tpl_pil.save(tpl_png, format="PNG")
-        except Exception as e:
-            QMessageBox.critical(self, "临时文件失败", f"{e}")
-            try:
-                for _p in (shot_png, tpl_png):
-                    if _p and os.path.exists(_p):
-                        os.unlink(_p)
-            except Exception:
-                pass
-            return
-
-        # OpenCV 模板匹配（简化版，和 IfImageDetect 测试一致）
-        result_txt = ""
-        import numpy as np
-        try:
-            import cv2
-            screen_arr = np.fromfile(shot_png, dtype=np.uint8)
-            screen_cv2 = cv2.imdecode(screen_arr, cv2.IMREAD_COLOR)
-            tpl_arr = np.fromfile(tpl_png, dtype=np.uint8)
-            tpl_cv2 = cv2.imdecode(tpl_arr, cv2.IMREAD_COLOR)
-            if screen_cv2 is None or tpl_cv2 is None:
-                result_txt = "ERROR: 读取图像解码失败"
-            else:
-                th, tw = tpl_cv2.shape[:2]
-                sh, sw = screen_cv2.shape[:2]
-                if th > sh or tw > sw:
-                    result_txt = (
-                        f"模板({tw}x{th}) 大于 屏幕({sw}x{sh})，不可能匹配\n"
-                        f"建议重新截小一点的目标"
-                    )
-                else:
-                    screen_g = cv2.cvtColor(screen_cv2, cv2.COLOR_BGR2GRAY)
-                    tpl_g = cv2.cvtColor(tpl_cv2, cv2.COLOR_BGR2GRAY)
-                    res = cv2.matchTemplate(screen_g, tpl_g, cv2.TM_CCOEFF_NORMED)
-                    _, max_val, _, max_loc = cv2.minMaxLoc(res)
-                    score = float(max_val)
-                    ok = score >= threshold
-                    status = "✅ 找到" if ok else "❌ 未找到"
-                    cx = int(max_loc[0]) + tw // 2
-                    cy = int(max_loc[1]) + th // 2
-                    result_txt = (
-                        f"算法: {algo_txt}\n"
-                        f"阈值: ≥{threshold:.2f}\n"
-                        f"模板尺寸: {tw}x{th}\n"
-                        f"屏幕尺寸: {sw}x{sh}\n"
-                        f"最高分数: {score:.3f}\n"
-                        f"结果: {status}\n"
-                        f"命中位置: 左上角={max_loc}  (中心=({cx}, {cy}))"
-                    )
-        except ImportError:
-            result_txt = "⚠ 未安装 opencv-python，无法测试匹配。\n请先 pip install opencv-python。"
-        except Exception as e:
-            result_txt = f"匹配出错: {e}"
-        finally:
-            for _p in (shot_png, tpl_png):
-                if _p and os.path.exists(_p):
-                    try:
-                        os.unlink(_p)
-                    except Exception:
-                        pass
-
+        # 显示结果对话框
         dlg = QDialog(self)
         dlg.setWindowTitle("🔍 找图-测试匹配结果")
-        dlg.resize(480, 320)
+        dlg.resize(540, 380)
         lay = QVBoxLayout(dlg)
         edit = QPlainTextEdit()
         edit.setReadOnly(True)
@@ -2395,7 +2550,6 @@ class InspectorPanel(QWidget):
         btn_ok.clicked.connect(dlg.accept)
         lay.addWidget(btn_ok)
         dlg.exec()
-
     # ---- FindImage 专属：导入图片 ----
     def _findimg_import_image(self):
         """导入一张本地图片作为模板，默认打开工程目录的 templates 文件夹"""
@@ -2462,33 +2616,106 @@ class InspectorPanel(QWidget):
         # 刷新面板显示
         self.set_node(node)
 
-    # ---- FindImage 专属：偏移量加「📍 定位偏移位置」按钮 ----
-    def _findimg_add_offset_pick_button(self):
-        """在 offset 区域下，单独加一行「📍 定位偏移位置」按钮，点后在屏幕取点，算出相对目标模板左上角的偏移。"""
+    # ---- FindImage 专属：模板图偏移拾取弹窗 ----
+    def _findimg_popup_template_pick_offset(self):
+        """弹出模板图片窗口，用户在图上点击位置作为点击偏移量"""
         node = self._current_node
         if node is None or node.type != "FindImage":
             return
-        sep = QFrame()
-        sep.setFrameShape(QFrame.HLine)
-        sep.setStyleSheet("color: #2D333B;")
-        self._form.addRow(sep)
 
-        btn_row = QWidget()
-        bl = QHBoxLayout(btn_row)
-        bl.setContentsMargins(0, 0, 0, 0)
-        bl.setSpacing(6)
-        btn = QPushButton("📍 定位偏移位置（取点）")
-        btn.setStyleSheet(self._btn_style("#8957E5", "#A371F7"))
-        btn.setToolTip(
-            "点击后在屏幕上点一个位置，程序会把这个位置与模板左上角的差值写入偏移 X/Y。\n"
-            "前提：先确定当前屏幕中模板所在的位置（或用找图的 out_pos 作为参考基准），再点目标点，两点的差值就是偏移。\n"
-            "（简化版：点一下屏幕上的真实坐标 → X/Y 直接写入该点相对屏幕左上角的绝对值，方便调试）"
-        )
-        nid = node.id
-        btn.clicked.connect(lambda _=False, n=nid: self.request_pick_coord.emit(n, "findimg_offset"))
-        bl.addWidget(btn)
-        bl.addStretch(1)
-        self._form.addRow(btn_row)
+        import base64, io as _io
+        from PySide6.QtWidgets import QDialog, QVBoxLayout, QLabel, QPushButton, QHBoxLayout
+
+        # 获取模板图片
+        tpl_path = str(node.params.get("template", "") or "")
+        b64 = str(node.params.get("template_b64", "") or "")
+        pil = None
+        if isinstance(b64, str) and b64:
+            try:
+                pil = self._b64_to_pil(b64)
+            except Exception:
+                pil = None
+        if pil is None and isinstance(tpl_path, str) and tpl_path:
+            try:
+                if os.path.exists(tpl_path) and Image is not None:
+                    pil = Image.open(tpl_path)
+            except Exception:
+                pil = None
+        if pil is None:
+            QMessageBox.warning(self, "无法拾取", "未找到模板图片，请先设置模板。")
+            return
+
+        tpl_w, tpl_h = pil.width, pil.height
+        cx, cy = tpl_w / 2.0, tpl_h / 2.0
+
+        # 弹窗
+        dlg = QDialog(self)
+        dlg.setWindowTitle("在模板上点击拾取偏移")
+        dlg.setMinimumSize(600, 500)
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(8, 8, 8, 8)
+
+        hint = QLabel("在下方模板图上点击想要偏移到的位置\n偏移 = 点击位置 - 模板中心（Y正值=向下，负值=向上）")
+        hint.setStyleSheet("color: #8B949E; font-size: 10px;")
+        hint.setAlignment(Qt.AlignCenter)
+        lay.addWidget(hint)
+
+        # 可点击的图片标签
+        img_lbl = _ClickableImageLabel()
+        img_lbl.set_pick_mode(True)
+        img_lbl.setAlignment(Qt.AlignCenter)
+        # 缩放显示，但保留原始尺寸用于计算
+        display_pil = pil.copy()
+        display_pil.thumbnail((500, 500), Image.LANCZOS if Image else None)
+        disp_w, disp_h = display_pil.width, display_pil.height
+        pix = self._pil_to_qpixmap(display_pil, size=500)
+        if pix is None:
+            QMessageBox.warning(self, "无法拾取", "模板图片转换失败。")
+            return
+        img_lbl.setPixmap(pix)
+
+        info_lbl = QLabel(f"模板尺寸: {tpl_w} × {tpl_h} 像素 | 中心: ({int(cx)}, {int(cy)})")
+        info_lbl.setStyleSheet("color: #58A6FF; font-size: 10px;")
+        info_lbl.setAlignment(Qt.AlignCenter)
+        lay.addWidget(info_lbl)
+        lay.addWidget(img_lbl)
+
+        result_lbl = QLabel("（请在图上点击）")
+        result_lbl.setStyleSheet("color: #C9D1D9; font-size: 11px;")
+        result_lbl.setAlignment(Qt.AlignCenter)
+        lay.addWidget(result_lbl)
+
+        picked = {"offset": None}
+
+        def _on_pick(nx, ny):
+            # nx, ny 是 0~1 归一化坐标
+            click_x = nx * tpl_w
+            click_y = ny * tpl_h
+            offset_x = int(round(click_x - cx))
+            offset_y = int(round(click_y - cy))
+            picked["offset"] = (offset_x, offset_y)
+            result_lbl.setText(f"✅ 偏移: X={offset_x}, Y={offset_y}  (点击「确定」保存)")
+            result_lbl.setStyleSheet("color: #2EA043; font-size: 11px; font-weight: bold;")
+
+        img_lbl.clicked.connect(_on_pick)
+
+        # 底部按钮
+        btn_box = QHBoxLayout()
+        btn_box.addStretch(1)
+        btn_ok = QPushButton("确定")
+        btn_ok.setStyleSheet(self._btn_style("#238636", "#2EA043"))
+        btn_cancel = QPushButton("取消")
+        btn_cancel.setStyleSheet(self._btn_style("#6E7681", "#8B949E"))
+        btn_box.addWidget(btn_ok)
+        btn_box.addWidget(btn_cancel)
+        lay.addLayout(btn_box)
+
+        btn_ok.clicked.connect(dlg.accept)
+        btn_cancel.clicked.connect(dlg.reject)
+
+        if dlg.exec() == QDialog.Accepted and picked["offset"] is not None:
+            self.apply_params_merge({"offset": picked["offset"]})
+            self.set_node(node)  # 刷新显示
 
     # ================================================================
     # StillnessDetect：ROI 预览 + 数值显示
@@ -2613,7 +2840,7 @@ class InspectorPanel(QWidget):
         hlay = QHBoxLayout(container)
         hlay.setContentsMargins(0, 0, 0, 0)
         hlay.setSpacing(4)
-        combo = QComboBox()
+        combo = _disable_wheel(QComboBox())
         combo.setStyleSheet(self._edit_style() + " QComboBox QAbstractItemView { min-width: 480px; }")
         combo.setEditable(False)
         combo.setMinimumWidth(260)
@@ -2996,25 +3223,21 @@ class InspectorPanel(QWidget):
             # --- 通用(空list = 永远显示) ---
             "coord_mode": [],
             "action": [],
-            # --- 目标点（click/press/move/scroll 用）---
-            "pos": ["click", "press", "move", "scroll"],
-            # --- 偏移量（click/press/move/scroll/drag 用）---
-            "offset": ["click", "press", "move", "scroll", "drag"],
+            # --- 目标点（click/move/scroll 用）---
+            "pos": ["click", "move", "scroll"],
             # --- drag 独有 ---
             "from_pos": ["drag"],
             "to_pos": ["drag"],
             "drag_duration_ms": ["drag"],
             # --- 按钮/时长相关 ---
-            "button": ["click", "press", "release", "drag"],
+            "button": ["click", "drag"],
             "click_count": ["click"],
-            "hold_ms_min": ["click", "press"],
-            "hold_ms_max": ["click", "press"],
-            "post_delay_min_ms": ["click", "press"],
-            "post_delay_max_ms": ["click", "press"],
-            "move_speed_ms": ["move", "drag"],
+            "hold_ms_min": ["click"],
+            "hold_ms_max": ["click"],
+            "post_delay_min_ms": ["click"],
+            "post_delay_max_ms": ["click"],
             # --- scroll 独有 ---
             "scroll_dy": ["scroll"],
-            "scroll_dx": ["scroll"],
             "scroll_steps": ["scroll"],
         }
         # 初始调用时：在 form 顶部加一个 action 分组提示标题（用QGroupBox更清晰，这里用一个Label简化）
@@ -3022,8 +3245,6 @@ class InspectorPanel(QWidget):
             # 遍历找到第几个参数，在 action 下面插入提示
             tip_text_map = {
                 "click": "🖱 【点击模式】：在目标位置单击/双击/三击指定按键",
-                "press": "⏳ 【按住模式】：在目标位置按住指定按键（可配N毫秒自动抬）",
-                "release": "🆓 【释放模式】：松开前一次按住的按键（不需要坐标）",
                 "move": "✈️ 【移动模式】：把光标移到目标位置（不点）",
                 "drag": "🔗 【拖拽模式】：从起点按住→移动→释放到终点（原子组合）",
                 "scroll": "🎡 【滚动模式】：在目标位置滚滚轮（垂直/水平）",
@@ -3215,11 +3436,6 @@ class InspectorPanel(QWidget):
             current_keys = json.loads(raw) if isinstance(raw, str) and raw.strip() else []
         except Exception:
             current_keys = []
-        # 向后兼容 key_name
-        if not current_keys:
-            old_kn = str(node.params.get("key_name", "") or "").strip()
-            if old_kn:
-                current_keys = [k.strip().lower() for k in old_kn.split("+") if k.strip()]
 
         # 创建容器
         container = QFrame()
@@ -3237,8 +3453,7 @@ class InspectorPanel(QWidget):
         combo_label.setStyleSheet("font-size: 11px; color: #8B949E;")
         main_lay.addWidget(combo_label)
 
-        chips_lay = QHBoxLayout()
-        chips_lay.setSpacing(4)
+        chips_lay = _FlowLayout(spacing=4)
         chips_widget = QWidget()
         chips_widget.setLayout(chips_lay)
         chips_widget.setObjectName("_keycombo_chips")
@@ -3250,15 +3465,15 @@ class InspectorPanel(QWidget):
         main_lay.addWidget(cat_label)
 
         cats = self._get_key_categories()
-        dropdowns_lay = QHBoxLayout()
-        dropdowns_lay.setSpacing(6)
-        dropdowns_lay.setContentsMargins(0, 0, 0, 0)
+        dropdowns_grid = QGridLayout()
+        dropdowns_grid.setSpacing(6)
+        dropdowns_grid.setContentsMargins(0, 0, 0, 0)
         dropdowns_widget = QWidget()
-        dropdowns_widget.setLayout(dropdowns_lay)
+        dropdowns_widget.setLayout(dropdowns_grid)
         dropdowns_widget.setObjectName("_keycombo_dropdowns")
 
-        for cat_name, items in cats:
-            combo = QComboBox()
+        for i, (cat_name, items) in enumerate(cats):
+            combo = _disable_wheel(QComboBox())
             combo.setToolTip(f"{cat_name}：选择后添加到组合")
             combo.addItem(f"+ {cat_name}", "")  # 占位项
             for display, value in items:
@@ -3278,10 +3493,13 @@ class InspectorPanel(QWidget):
                 val = c.currentData()
                 if val:
                     self._keycombo_add_key(val)
-                    c.setCurrentIndex(0)  # 重置为占位项
+                    try:
+                        c.setCurrentIndex(0)  # 重置为占位项
+                    except RuntimeError:
+                        pass  # 控件可能已被重建销毁
             combo.currentIndexChanged.connect(_on_select)
-            dropdowns_lay.addWidget(combo)
-        dropdowns_lay.addStretch(1)
+            row, col = i // 4, i % 4
+            dropdowns_grid.addWidget(combo, row, col)
         main_lay.addWidget(dropdowns_widget)
 
         # --- 清空按钮 ---
@@ -3298,6 +3516,7 @@ class InspectorPanel(QWidget):
 
         # 渲染当前已选按键的 chips
         self._keycombo_render_chips(current_keys)
+        self._keycombo_update_dropdowns(current_keys)
 
     def _remove_keycombo_picker(self):
         """移除按键组合选择器"""
@@ -3323,9 +3542,17 @@ class InspectorPanel(QWidget):
         return [str(k).strip().lower() for k in keys if str(k).strip()]
 
     def _keycombo_save(self, keys):
-        """保存 key_combo 到 node.params"""
+        """保存 key_combo 到 node.params（不重建表单，避免销毁触发回调的下拉框控件）"""
         import json
-        self.apply_params_merge({"key_combo": json.dumps(keys, ensure_ascii=False)})
+        node = self._current_node
+        if node is None:
+            return
+        val = json.dumps(keys, ensure_ascii=False)
+        node.params["key_combo"] = val
+        try:
+            self.param_changed.emit(node.id, "key_combo", val)
+        except Exception:
+            pass
 
     def _keycombo_add_key(self, key):
         """添加一个键到组合"""
@@ -3335,6 +3562,7 @@ class InspectorPanel(QWidget):
             keys.append(key)
         self._keycombo_save(keys)
         self._keycombo_render_chips(keys)
+        self._keycombo_update_dropdowns(keys)
 
     def _keycombo_remove_key(self, key):
         """从组合中移除一个键"""
@@ -3343,11 +3571,37 @@ class InspectorPanel(QWidget):
         keys = [k for k in keys if k != key]
         self._keycombo_save(keys)
         self._keycombo_render_chips(keys)
+        self._keycombo_update_dropdowns(keys)
 
     def _keycombo_clear(self):
         """清空组合"""
         self._keycombo_save([])
         self._keycombo_render_chips([])
+        self._keycombo_update_dropdowns([])
+
+    def _keycombo_update_dropdowns(self, selected_keys):
+        """更新下拉列表：隐藏已选按键项"""
+        picker = None
+        for row_i in range(self._form.rowCount()):
+            fld_item = self._form.itemAt(row_i, QFormLayout.FieldRole)
+            fld_w = fld_item.widget() if fld_item else None
+            if fld_w is not None and fld_w.objectName() == "_keycombo_picker":
+                picker = fld_w
+                break
+        if picker is None:
+            return
+        dropdowns = picker.findChild(QWidget, "_keycombo_dropdowns")
+        if dropdowns is None:
+            return
+        selected_set = set(selected_keys)
+        for combo in dropdowns.findChildren(QComboBox):
+            view = combo.view()
+            for i in range(combo.count()):
+                val = combo.itemData(i)
+                if not val:
+                    view.setRowHidden(i, False)
+                    continue
+                view.setRowHidden(i, val.lower() in selected_set)
 
     def _keycombo_render_chips(self, keys):
         """渲染当前组合的按键标签"""
@@ -3375,7 +3629,6 @@ class InspectorPanel(QWidget):
             empty = QLabel("（空）— 请从下方选择按键")
             empty.setStyleSheet("color: #6E7681; font-size: 10px; font-style: italic;")
             lay.addWidget(empty)
-            lay.addStretch(1)
             return
         # 显示按键标签
         for k in keys:
@@ -3391,7 +3644,6 @@ class InspectorPanel(QWidget):
             key_val = k
             chip.clicked.connect(lambda _=False, kv=key_val: self._keycombo_remove_key(kv))
             lay.addWidget(chip)
-        lay.addStretch(1)
 
     def _apply_wait_mode_visibility(self):
         """Wait：fixed 模式显示 seconds；random 模式显示 min_seconds/max_seconds"""
@@ -3766,7 +4018,7 @@ class InspectorPanel(QWidget):
         editor = pd.editor
 
         if editor == EDITOR_INT:
-            sp = QSpinBox()
+            sp = _disable_wheel(QSpinBox())
             if pd.min is not None:
                 sp.setMinimum(int(pd.min))
             else:
@@ -3785,7 +4037,7 @@ class InspectorPanel(QWidget):
             return sp
 
         if editor == EDITOR_FLOAT:
-            sp = QDoubleSpinBox()
+            sp = _disable_wheel(QDoubleSpinBox())
             if pd.min is not None:
                 sp.setMinimum(float(pd.min))
             else:
@@ -3825,7 +4077,7 @@ class InspectorPanel(QWidget):
             return cb
 
         if editor == EDITOR_ENUM:
-            cb = QComboBox()
+            cb = _disable_wheel(QComboBox())
             if pd.options:
                 for op in pd.options:
                     label = op
@@ -3894,7 +4146,7 @@ class InspectorPanel(QWidget):
             spins = []
             labels = ["X", "Y"] if size == 2 else ["X", "Y", "W", "H"]
             for i in range(size):
-                s = QSpinBox()
+                s = _disable_wheel(QSpinBox())
                 s.setRange(-100000, 100000)
                 s.setValue(values[i])
                 s.setPrefix(f"{labels[i]} ")
@@ -3925,6 +4177,23 @@ class InspectorPanel(QWidget):
                     lambda _=False, nid=nid, pn=pd.name: self.request_pick_coord.emit(nid, pn)
                 )
                 row.addWidget(btn_pick)
+
+            # FindImage 的 offset 参数：附加 📍 从模板拾取偏移按钮
+            if editor == EDITOR_TUPLE2 and node is not None and node.type == "FindImage" and pd.name == "offset":
+                btn_tpl = QPushButton("📍")
+                btn_tpl.setFixedWidth(32)
+                btn_tpl.setToolTip(
+                    "点击弹出模板图片窗口，在图上点选位置作为点击偏移量。\n"
+                    "程序自动计算该点相对模板中心的偏移量 (X, Y) 并写入。"
+                )
+                btn_tpl.setStyleSheet(
+                    "QPushButton { background: #238636; color: white; border: none;"
+                    " border-radius: 4px; font-size: 14px; }"
+                    "QPushButton:hover { background: #2EA043; }"
+                )
+                btn_tpl.clicked.connect(lambda _=False: self._findimg_popup_template_pick_offset())
+                row.addWidget(btn_tpl)
+
             row.addStretch(1)  # 剩余空间推到右侧，让控件靠左对齐
             return host
 

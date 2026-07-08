@@ -85,7 +85,7 @@ def _project_root() -> str:
 
 _IMG_DIR = os.path.join(_project_root(), "images")
 _ANIM_AVATAR_WEBP = os.path.join(_IMG_DIR, "沉思女仆赫萝.webp")
-_ANIM_THINKING_WEBP = os.path.join(_IMG_DIR, "工作女仆赫萝.webp")
+_ANIM_THINKING_WEBP = os.path.join(_IMG_DIR, "搬砖女仆赫萝.webp")
 # 动画人物在 56x56 球里的绘制尺寸（留 6px 的渐变球边缘，不要顶满）
 _AVATAR_DRAW_SIZE = QSize(44, 44)
 
@@ -166,7 +166,7 @@ class FloatingBall(QWidget):
         self._did_drag: bool = False
         self._hovered = False
         self._opacity_val = 0.0
-        # ---- 赫萝 5 状态：idle / thinking / happy / sleep / sad
+        # ---- 赫萝 2 状态：idle / thinking
         self._state: str = "idle"
         self._bounce_offset: float = 0.0
         self._rot_tick: int = 0
@@ -185,6 +185,10 @@ class FloatingBall(QWidget):
 
         # ---- 动画 ----
         self._anim: Optional[QPropertyAnimation] = None
+        # ★ Win32 句柄必须在 setVisible(True) 之前初始化，因为 setVisible 会触发 showEvent，
+        #   showEvent 里调度了 _apply_win32_styles_once 的 QTimer，如果此时 _win32 还不存在就会崩溃
+        self._win32 = _win32()
+        self._hwnd: Optional[int] = None
         self.setVisible(True)
         QTimer.singleShot(60, self._fade_in)
         QToolTip.setFont(QFont("Microsoft YaHei", 9))
@@ -193,17 +197,26 @@ class FloatingBall(QWidget):
         # ============================================================
         # 【核心】Win32 层的 TOPMOST 双保险
         # ============================================================
-        self._win32 = _win32()
-        self._hwnd: Optional[int] = None
-        # QTimer：每 500ms 刷新一次 HWND_TOPMOST（防游戏抢置顶）
+        # _win32 / _hwnd 已在 setVisible(True) 之前初始化
+        # QTimer：每 220ms 刷新一次 HWND_TOPMOST（防游戏/新打开程序抢置顶）
         self._topmost_timer = QTimer(self)
-        self._topmost_timer.setInterval(500)
+        self._topmost_timer.setInterval(220)
         self._topmost_timer.timeout.connect(self._ensure_topmost_win32)
         self._topmost_timer.start()
 
         # 窗口真正显示到屏幕上后（show 之后会 polish 产生真实 HWND），再调一次 Win32 API
         QTimer.singleShot(100, self._apply_win32_styles_once)
         QTimer.singleShot(220, self._ensure_topmost_win32)
+
+        # 【焦点变化补钉】用户切换/新开窗口时，系统会重排 TOPMOST Z-order，趁刚切换完立刻补一次
+        #   这是解决「后开的程序能盖在悬浮球上面」最直接的一击——用户一切过去就顶回来
+        try:
+            from PySide6.QtWidgets import QApplication
+            app = QApplication.instance()
+            if app is not None and hasattr(app, "focusWindowChanged"):
+                app.focusWindowChanged.connect(lambda *_: self._ensure_topmost_win32())
+        except Exception:
+            pass
 
     # =================================================================
     # Win32 样式 / TopMost 双保险核心函数
@@ -224,7 +237,7 @@ class FloatingBall(QWidget):
         """第一次显示后，SetWindowLong 追加扩展样式：
         WS_EX_TOOLWINDOW（不出现在 Alt+Tab）+ WS_EX_NOACTIVATE（点我不抢焦点）。
         """
-        u32 = self._win32
+        u32 = getattr(self, "_win32", None)
         hwnd = self._win_hwnd()
         if u32 is None or hwnd is None:
             return
@@ -239,6 +252,7 @@ class FloatingBall(QWidget):
             )
             new_style = (
                 old_style
+                | _WS_EX_TOPMOST        # ⭐ Win32 层硬标记「我是 TOPMOST 类窗口」—— 缺失这一位会导致新弹出的 TOPMOST 窗口能压到我上面
                 | _WS_EX_TOOLWINDOW     # 不在 Alt+Tab / 任务栏出现
                 | _WS_EX_NOACTIVATE     # 点击/拖动悬浮球时不抢焦点/激活
                 | _WS_EX_LAYERED        # 配合 WA_TranslucentBackground 让透明像素不挡点击（可选）
@@ -254,19 +268,32 @@ class FloatingBall(QWidget):
     def _ensure_topmost_win32(self):
         """核心：SetWindowPos(HWND_TOPMOST) 把悬浮球钉在所有窗口（包括游戏全屏）之上。
 
-        - 游戏运行时，Unity/UE4 等引擎会频繁把自己的主窗口设为 HWND_TOPMOST，
-          我们必须以相同频率（每 500ms 就再钉一次）才能"压得住"。
+        - 游戏运行时，Unity/UE4 等引擎、以及用户新开的任意程序，都可能把自己的主窗口设为 HWND_TOPMOST，
+          我们必须以较高频率（每 220ms 就再钉一次）+ 焦点变化回调 才能"压得住"。
         - SWP_NOMOVE | SWP_NOSIZE：保持当前位置/大小不变，只改 Z-order。
         - SWP_NOACTIVATE：关键——不要让游戏失去焦点！
         - SWP_SHOWWINDOW：如果被系统藏了就再放出来。
+        - Qt 层兜底：同步调 raise_()，并重新确认 WindowStaysOnTopHint flag（某些游戏的反作弊驱动会偷偷抹掉 Qt flag）。
         """
-        u32 = self._win32
+        u32 = getattr(self, "_win32", None)
         hwnd = self._win_hwnd()
         if u32 is None or hwnd is None:
             return
         if not self.isVisible():
             return
         try:
+            # ① Qt 层：先确认 Flag 没被反作弊/其他程序抹掉（罕见，但遇到过）
+            cur_flags = self.windowFlags()
+            if not (cur_flags & Qt.WindowStaysOnTopHint):
+                self.setWindowFlags(cur_flags | Qt.WindowStaysOnTopHint)
+                # 改 flag 后必须重新 show（hide→show 会重造 HWND，这里只在缺失时调，频率极低）
+                try: self.show(); self.raise_()
+                except Exception: pass
+            else:
+                # ② Qt 层：普通 raise（不激活，只调 Z-order）
+                try: self.raise_()
+                except Exception: pass
+            # ③ Win32 层：硬钉 TOPMOST（核心）
             u32.SetWindowPos(
                 hwnd,
                 _HWND_TOPMOST,
@@ -278,7 +305,7 @@ class FloatingBall(QWidget):
 
     def _unset_topmost_win32(self):
         """显式撤销 TOPMOST（销毁时调用，避免句柄泄漏残留的置顶状态）。"""
-        u32 = self._win32
+        u32 = getattr(self, "_win32", None)
         hwnd = self._win_hwnd()
         if u32 is None or hwnd is None:
             return
@@ -325,33 +352,19 @@ class FloatingBall(QWidget):
         return None
 
     # =================================================================
-    # 赫萝 5 状态伪动画 + ToolTip
+    # 赫萝 2 状态伪动画 + ToolTip
     # =================================================================
     STATE_TIPS = {
         "idle":     "🐺 赫萝待命：唔姆，苹果商人~ 点左键聊天，右键弹快速气泡 ✨",
-        "thinking": "🤔 赫萝思考：唔…让咱捋捋…（稍等哦，马上给你答复 🍎）",
-        "happy":    "🍎 赫萝开心：收到苹果啦~ 你说啥咱都听！♡",
-        "sleep":    "💤 赫萝睡觉：zZ…（点一下唤醒，苹果放旁边哦）",
-        "sad":      "😢 赫萝委屈：唔…又出错了吗？给咱一颗苹果咱就加油！",
+        "thinking": "🤔 赫萝搬砖：唔…让咱捋捋…（稍等哦，马上给你答复 🍎）",
     }
     STATE_PRIMARY = {  # 对应不同状态下圆球的发色
         "idle":     ("#FFD89A", "#C97F35"),   # 正常发色渐变（赫萝金棕）
-        "thinking": ("#B9A8D4", "#6B5B73"),   # 狼尾灰紫（严肃思考）
-        "happy":    ("#FFE9B0", "#E8A95C"),   # 发亮的发色（开心）
-        "sleep":    ("#D9D4EA", "#8A7460"),   # 灰暖紫（打盹）
-        "sad":      ("#FFB0B0", "#E55D5D"),   # 苹果红粉（委屈）
+        "thinking": ("#B9A8D4", "#6B5B73"),   # 狼尾灰紫（严肃思考/搬砖）
     }
     STATE_HOVER = {    # hover 时的渐变色（稍亮）
         "idle":     ("#FFE1C2", "#E8A95C"),
         "thinking": ("#D4C5EE", "#B9A8D4"),
-        "happy":    ("#FFF2C8", "#F5C976"),
-        "sleep":    ("#EAE5F5", "#A99BC4"),
-        "sad":      ("#FFC8C8", "#F56D6D"),
-    }
-    STATE_AVATARS = {  # 非 idle 状态对应的 llm_icons 静态头像（idle/thinking 用 WebP 动画）
-        "happy":    "avatar_holo_joyful.png",
-        "sleep":    "avatar_holo_sleepy.png",
-        "sad":      "avatar_holo_tearful.png",
     }
 
     def _setup_state_anim(self):
@@ -366,7 +379,7 @@ class FloatingBall(QWidget):
         self.update()
 
     def set_avatar_state(self, state: str):
-        """外部调用：切赫萝 5 状态（idle / thinking / happy / sleep / sad）。
+        """外部调用：切赫萝 2 状态（idle / thinking）。
         未知名 → idle；切 ToolTip；立刻刷新。
         """
         if state not in self.STATE_TIPS:
@@ -441,7 +454,7 @@ class FloatingBall(QWidget):
         a.start()
 
     # =================================================================
-    # 绘制（赫萝发色渐变圆球 + 动画人物头像 / 🐺 兜底 + 5 状态浮动）
+    # 绘制（赫萝发色渐变圆球 + 动画人物头像 / 🐺 兜底 + 2 状态浮动）
     # =================================================================
     def paintEvent(self, _evt):
         p = QPainter(self)
@@ -483,7 +496,7 @@ class FloatingBall(QWidget):
             avatar_x = rect.x() + (rect.width() - _AVATAR_DRAW_SIZE.width()) // 2
             avatar_y = rect.y() + (rect.height() - _AVATAR_DRAW_SIZE.height()) // 2 + 1 + y_shift
 
-            # thinking 状态：用工作女仆赫萝 WebP 动画
+            # thinking 状态：用搬砖女仆赫萝 WebP 动画
             if self._state == "thinking" and self._movie_thinking is not None:
                 pm = self._movie_thinking.currentPixmap()
                 if not pm.isNull():
@@ -491,15 +504,6 @@ class FloatingBall(QWidget):
                     scaled = pm.scaled(_AVATAR_DRAW_SIZE, Qt.KeepAspectRatio, Qt.SmoothTransformation)
                     # 用固定坐标居中，不随 scaled 尺寸变化
                     p.drawPixmap(avatar_x, avatar_y, scaled); p.restore(); drawn_avatar = True
-
-            # happy/sleep/sad 状态：用 llm_icons 静态头像
-            if not drawn_avatar:
-                state_avatar = self.STATE_AVATARS.get(self._state)
-                if state_avatar:
-                    spm = _icon_pixmap(state_avatar, _AVATAR_DRAW_SIZE.width())
-                    if not spm.isNull():
-                        p.save(); p.setClipPath(path)
-                        p.drawPixmap(avatar_x, avatar_y, spm); p.restore(); drawn_avatar = True
 
             # idle 状态：用沉思女仆赫萝 WebP 动画
             if not drawn_avatar and self._movie is not None:
@@ -515,21 +519,6 @@ class FloatingBall(QWidget):
                 font = QFont("Microsoft YaHei"); font.setBold(True); font.setPixelSize(22)
                 p.setFont(font); p.setPen(QColor("#FFFFFF"))
                 p.drawText(rect.adjusted(0, y_shift, 0, y_shift), Qt.AlignCenter, "\U0001F43A")
-
-            # 5) sleep：右上 💤 zZ…
-            if self._state == "sleep":
-                from PySide6.QtCore import QRect as _QR
-                p.setBrush(Qt.NoBrush)
-                f = QFont("Microsoft YaHei"); f.setBold(True); f.setPixelSize(12); p.setFont(f)
-                p.setPen(QColor(255, 255, 255, 220))
-                r = _QR(rect.right() - 20, rect.top() + 2, 20, 14)
-                p.drawText(r, Qt.AlignRight | Qt.AlignTop, "z" if self._rot_tick % 2 == 0 else "Z")
-            # happy：右上 🍎 小标记
-            if self._state == "happy":
-                from PySide6.QtCore import QRect as _QR
-                f = QFont("Segoe UI Emoji"); f.setPixelSize(14); p.setFont(f)
-                p.setBrush(Qt.NoBrush); p.setPen(QPen(QColor(255, 255, 255, 220), 0))
-                p.drawText(_QR(rect.right() - 20, rect.top() + 2, 20, 14), Qt.AlignRight | Qt.AlignTop, "🍎")
         finally:
             # ⚠ 无论 paintEvent 中间抛不抛异常，必须 end()，否则下次进入会报：
             #   QBackingStore::endPaint() called with active painter
@@ -555,9 +544,6 @@ class FloatingBall(QWidget):
             pass
 
     def mousePressEvent(self, e):
-        # 睡觉 / 委屈状态下，任何按键先唤醒赫萝 → idle
-        if self._state in ("sleep", "sad"):
-            self.set_avatar_state("idle")
         if e.button() == Qt.LeftButton:
             # 记录按下时的全局坐标，用作「是否拖过」的基准
             self._press_global_pos = e.globalPosition().toPoint()
@@ -696,6 +682,19 @@ class FloatingBall(QWidget):
             QTimer.singleShot(2000, QToolTip.hideText)
         except Exception:
             pass
+
+    # =================================================================
+    # 生命周期：每次 show 立刻补打扩展样式 + 补钉 TOPMOST
+    # =================================================================
+    def showEvent(self, e):
+        """每次显示（首次创建 / 最小化恢复 / 关闭后重开）立刻重钉一次。
+        setWindowFlags() 会重建 HWND，扩展样式（WS_EX_TOPMOST/TOOLWINDOW）会丢失，
+        所以这里用 60ms / 120ms 双 QTimer 补两道保险。"""
+        try: super().showEvent(e)
+        except Exception: pass
+        QTimer.singleShot(60, self._apply_win32_styles_once)
+        self._ensure_topmost_win32()
+        QTimer.singleShot(120, self._ensure_topmost_win32)
 
     # =================================================================
     # 销毁前撤销 TOPMOST（避免句柄泄漏，且防止"关了程序桌面仍留一个置顶幽灵"）

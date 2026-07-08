@@ -408,17 +408,7 @@ class BlueprintMainWindow(QMainWindow):
 
         # 1) 执行器：上一工程可能残留的 BlueprintRunner / matcher 模板缓存 / 运行态变量
         try:
-            old_runner = getattr(self, "_runner", None)
-            if old_runner is not None:
-                try:
-                    old_runner.request_stop()
-                except Exception:
-                    pass
-                try:
-                    old_runner.wait(200)
-                except Exception:
-                    pass
-                self._runner = None
+            self._stop_and_detach_runner()
         except Exception as e:
             _warn(f"清理旧 runner 失败（不影响后续）: {type(e).__name__}: {e}")
 
@@ -477,13 +467,7 @@ class BlueprintMainWindow(QMainWindow):
                 clear_cls()
         except Exception:
             pass
-        try:
-            from src.config import app_paths as _ap
-            c = getattr(_ap, "clear_cache", None)
-            if callable(c):
-                c()
-        except Exception:
-            pass
+        # 全局图片路径缓存在 _finalize_project_switch 中由 clear_all_project_caches 清理
 
     def _load_or_new_graph_for_current_project(self):
         """当前已经有开工程：按三级优先级加载蓝图，绝不自动创建落盘的 .bp.json 文件（首次create_project除外）
@@ -1182,6 +1166,8 @@ class BlueprintMainWindow(QMainWindow):
         """把新蓝图 graph 绑定到画布和所有关联面板，统一清理残留状态。
         作用：避免切换蓝图后 Inspector 仍显示旧节点参数、画布选中高亮残留等。
         """
+        # 0) 停止正在运行的 runner（防止旧 runner 继续执行旧图、高亮串到新图节点）
+        self._stop_and_detach_runner()
         # 1) 先清理旧选中状态：画布取消所有高亮 + Inspector面板清空
         try:
             self._scene.clearSelection()
@@ -1896,6 +1882,30 @@ class BlueprintMainWindow(QMainWindow):
                     self._log.append_log(f"[if_img] 追加第 {len(arr)} 张参考图: {w}×{h}", "SUCCESS")
                 s = json.dumps(arr, ensure_ascii=False, sort_keys=True)
                 self._on_param_changed(nid, "images_json", s)
+                # 刷新 _pil_images 缓存，使运行时编辑后立即生效
+                try:
+                    from PIL import Image as _PILImage
+                    import io as _io
+                    new_cache = []
+                    for item in arr:
+                        b64_str = item.get("b64", "") if isinstance(item, dict) else ""
+                        path = item.get("path", "") if isinstance(item, dict) else ""
+                        pil_img = None
+                        if b64_str:
+                            try:
+                                pil_img = _PILImage.open(_io.BytesIO(base64.b64decode(b64_str))).convert("RGBA")
+                            except Exception:
+                                pil_img = None
+                        elif path and os.path.exists(path):
+                            try:
+                                pil_img = _PILImage.open(path).convert("RGBA")
+                            except Exception:
+                                pil_img = None
+                        new_cache.append(pil_img)
+                    node.runtime_attrs["_pil_images"] = new_cache
+                    self._log.append_log(f"[if_img] 已刷新图片缓存({len(new_cache)}张)", "DEBUG")
+                except Exception as e3:
+                    self._log.append_log(f"[if_img] 缓存刷新失败: {e3}", "WARN")
                 self._inspector.set_node(node)
             except Exception as e2:
                 self._log.append_log(f"[Snip] 结果处理失败: {e2}", "ERROR")
@@ -2140,6 +2150,40 @@ class BlueprintMainWindow(QMainWindow):
             self._inspector.set_node(self._graph.nodes[node_id])
 
     # ==================== 运行/停止 ====================
+    def _stop_and_detach_runner(self):
+        """停止正在运行的 runner 并断开所有信号连接。
+        统一清理逻辑，确保切换蓝图/工程时不会因旧 runner 信号触发已销毁的对象而崩溃。
+        """
+        runner = self._runner
+        if runner is None:
+            return
+        self._runner = None  # 先置 None，防止信号回调中再次访问
+        # 1) 断开所有信号连接，防止 runner 线程在结束过程中发射信号到已失效的 UI
+        try:
+            runner.log_message.disconnect()
+            runner.highlight_node.disconnect()
+            runner.highlight_clear.disconnect()
+            runner.progress_step.disconnect()
+            runner.finished_ok.disconnect()
+            runner.finished_err.disconnect()
+            runner.finished.disconnect()
+            runner.pause_changed.disconnect()
+            runner.notify_toast.disconnect()
+            runner.current_node_changed.disconnect()
+        except Exception:
+            pass
+        # 2) 请求停止
+        try:
+            runner.request_stop()
+        except Exception:
+            pass
+        # 3) 等待线程结束（最多 3 秒，防止 UI 卡死）
+        if hasattr(runner, "isRunning") and runner.isRunning():
+            try:
+                runner.wait(3000)
+            except Exception:
+                pass
+
     def _on_run_clicked(self):
         if self._graph is None:
             QMessageBox.warning(self, "无法运行", "当前没有蓝图。")
@@ -2299,8 +2343,7 @@ class BlueprintMainWindow(QMainWindow):
             cur_y = base_y
             for t in list(toasts):
                 try:
-                    if not t.isVisible():
-                        continue
+                    # 布局所有 toast（含尚未 show 的，避免遗漏）
                     # 先调大小，让 layout 把高度算出来
                     t.adjustSize()
                     if t.width() < 320:
@@ -2327,8 +2370,10 @@ class BlueprintMainWindow(QMainWindow):
                 on_destroyed_cb=self._on_toast_destroyed,
             )
             self._toasts.append(card)
+            # 先计算位置再 show，避免先在默认位置闪现再跳到右上角
+            self._relayout_toasts()
             card.show()
-            # 下一帧重新布局（等 show 完窗口大小才稳定）
+            # show 后再修正一次（adjustSize 可能改变高度）
             QTimer.singleShot(0, self._relayout_toasts)
             # 也在日志面板打一行，让最小化窗口时仍可在日志里看到
             try:
@@ -2359,8 +2404,19 @@ class BlueprintMainWindow(QMainWindow):
             stop_qt = pynput_to_qkeysequence(get_shortcut("stop_blueprint", self._user_settings))
             self._log.append_log(f"■ 请求优雅停止 ({stop_qt})，等待已入队节点完成...", "WARN")
             self._runner.request_stop()
+            # 立即禁用停止/暂停/下一步按钮，防止用户在 runner 线程结束前重复点击
+            self._act_stop.setEnabled(False)
+            self._act_pause.setEnabled(False)
+            if hasattr(self, "_act_step"):
+                self._act_step.setEnabled(False)
+            self._status_run.setText("状态: 正在停止...")
+            self._status_run.setStyleSheet("color: #F85149; font-size: 10px; padding: 0 8px;")
         else:
             self._log.append_log("当前没有运行中的蓝图。", "INFO")
+            # 兜底：确保按钮状态恢复
+            self._act_run.setEnabled(True)
+            self._act_pause.setEnabled(False)
+            self._act_stop.setEnabled(False)
 
     def _on_runner_finished(self):
         self._log.append_log("✔ 蓝图执行完成。", "SUCCESS")
@@ -2892,11 +2948,7 @@ class BlueprintMainWindow(QMainWindow):
                 if ret != QMessageBox.Yes:
                     event.ignore()
                     return
-                try:
-                    self._runner.request_stop()
-                    self._runner.wait(500)
-                except Exception:
-                    pass
+                self._stop_and_detach_runner()
         except Exception:
             pass
         try:
@@ -3135,47 +3187,6 @@ class BlueprintMainWindow(QMainWindow):
         else:
             self._log.append_log("[设置] 已保存（快捷键与之前一致，无需重新绑定）。", "INFO")
         self._refresh_hotkey_status_hint()
-
-    def _on_emergency_kill(self):
-        """紧急杀：不管当前蓝图有没有在优雅停止，直接强制结束（F6）。"""
-        r = self._runner
-        if r is None:
-            self._log.append_log("当前没有运行中的蓝图，无需紧急终止。", "INFO")
-            return
-        # 先尝试 request_stop + wait 极短时间
-        try:
-            r.request_stop()
-        except Exception:
-            pass
-        killed = False
-        if hasattr(r, "isRunning") and callable(r.isRunning) and r.isRunning():
-            try:
-                r.quit()
-            except Exception:
-                pass
-            if not r.wait(500):
-                # 退出事件循环还在跑：强制 terminate（最后手段）
-                try:
-                    r.terminate()
-                    r.wait(1000)
-                    killed = True
-                except Exception as e:
-                    self._log.append_log(f"[紧急杀] terminate 失败：{e}", "ERROR")
-        self._log.append_log(
-            f"⚠ 紧急停止已执行（F6）。{'（已强制终止执行线程）' if killed else '（执行线程已退出）'}。"
-            f"节点侧若有外部进程/子线程可能仍在运行，请自行确认。",
-            "WARN",
-        )
-        # 重置UI状态
-        self._act_run.setEnabled(True)
-        self._act_stop.setEnabled(False)
-        self._status_run.setText("状态: 已紧急停止 (F6)")
-        self._status_run.setStyleSheet("color: #F85149; font-size: 10px; padding: 0 8px;")
-        try:
-            self._scene.clear_running()
-        except Exception:
-            pass
-        self._runner = None
 
     def _hotkey_capture_target(self):
         if not self._ensure_project_open("截图保存到工程 screenshots/"):

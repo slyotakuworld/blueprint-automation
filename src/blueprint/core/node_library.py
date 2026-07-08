@@ -366,24 +366,25 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
             _exec_out("out_exec", label="执行"),
             _data_out("out_pos", "tuple2", label="位置"),
             _data_out("out_found", "bool", label="找到"),
-            _data_out("out_score", "float", label="最高得分"),
         ],
         params=[
             ParamDef(
                 name="match_strategy",
                 editor=EDITOR_ENUM,
                 default="hybrid",
-                options=["hybrid", "template", "feature"],
+                options=["hybrid", "template", "gray", "feature"],
                 option_labels={
                     "hybrid": "智能混合",
                     "template": "模板匹配",
+                    "gray": "灰度匹配",
                     "feature": "特征匹配",
                 },
                 label="匹配算法",
                 help='各算法优缺点：\n'
-                     '● 智能混合(hybrid)【推荐】：先用灰度模板匹配快速初筛，不通过再试特征点。速度较快，兼顾准确性和抗形变能力，大多数场景首选。\n'
-                     '● 模板匹配(template)：直接做像素归一化相关。速度最快，像素级精度最高；但参考图和屏幕只要有缩放、旋转、轻微形变或压缩失真就会匹配失败。适合尺寸固定、画面清晰的UI按钮/图标。\n'
-                     '● 特征匹配(feature)：提取SIFT/ORB局部特征点做匹配。抗缩放、旋转、部分遮挡和光照变化；但对于大面积纯色、缺少纹理的图片（如纯色方块）会找不到特征点而失败，速度也稍慢。',
+                     '● 智能混合(hybrid)【推荐】：彩色模板→灰度模板→AKAZE特征点，三层级联兜底。兼顾准确性、颜色容忍和抗形变，大多数场景首选。\n'
+                     '● 模板匹配(template)：彩色像素归一化相关。速度最快，精度最高；但对缩放、旋转、颜色变化敏感。适合尺寸固定、画面清晰的UI按钮/图标。\n'
+                     '● 灰度匹配(gray)：灰度像素归一化相关。容忍颜色变化（如选中态/高亮态），适合颜色可能变化但形状不变的场景。\n'
+                     '● 特征匹配(feature)：提取AKAZE局部特征点做匹配，经RANSAC几何验证。抗颜色变化、光照变化、局部遮挡、轻微旋转/缩放；但对纯色/少纹理图片会失败，速度稍慢。',
             ),
             # 找图范围模式
             ParamDef(name="search_mode", editor=EDITOR_ENUM, default="relative",
@@ -401,7 +402,7 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
             ParamDef(name="temp_target_class", editor=EDITOR_STRING, default="",
                      label="临时目标·类名",
                      help="仅「相对目标程序」模式生效。窗口类名精确匹配。\n留空=不按类名匹配。"),
-            ParamDef(name="threshold", editor=EDITOR_FLOAT, default=0.75, label="匹配阈值", min=0.3, max=1.0, step=0.01,
+            ParamDef(name="threshold", editor=EDITOR_FLOAT, default=0.9, label="匹配阈值", min=0.3, max=1.0, step=0.01,
                      help="相似度阈值，越高越严格。模板匹配/混合模式=相关系数；特征匹配=内点比例。"),
             ParamDef(name="timeout_seconds", editor=EDITOR_FLOAT, default=10.0, label="超时(秒)", min=0.5, max=600.0, step=0.5,
                      help="在超时时间内会根据自动滚动设置反复重试，直到找到或超时。"),
@@ -409,14 +410,9 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
                      help="要查找的图片文件路径（PNG/JPG/BMP等），也可点上面工具栏「📸 截取目标」或「📂 导入图片」直接选择，自动写入路径+预览。"),
             ParamDef(name="template_b64", editor=EDITOR_STRING, default="", label="模板预览图(只读)",
                      help="通过「📸 截取目标」/「📂 导入图片」时会写入b64缩略图，便于画布节点直接预览。"),
-            # 未找到时尝试滚动
-            ParamDef(name="auto_scroll", editor=EDITOR_BOOL, default=False,
-                     label="未找到时尝试滚动",
-                     help="勾选=找图失败后在当前鼠标位置滚动一次，然后继续重试，直到超时。"),
-            ParamDef(name="scroll_dy", editor=EDITOR_INT, default=-500, label="垂直滚动量(负=向下)", min=-5000, max=5000, step=10,
-                     help="pyautogui.scroll 的垂直 clicks 值，典型值：向下翻页=-500；向上翻页=500。仅勾选「未找到时尝试滚动」才生效。"),
-            ParamDef(name="scroll_dx", editor=EDITOR_INT, default=0, label="水平滚动量(正=向右)", min=-5000, max=5000, step=10,
-                     help="pyautogui.hscroll 的水平 clicks 值（Windows下部分程序有效）：向右=正数，向左=负数。0=不做水平滚动。仅勾选「未找到时尝试滚动」才生效。"),
+            # 未找到时滚动重试
+            ParamDef(name="scroll_dy", editor=EDITOR_INT, default=0, label="滚动量(0=不滚动)", min=-5000, max=5000, step=10,
+                     help="鼠标滚轮滚动量。0=不滚动；负值=向前滚(向下翻页)；正值=向后滚(向上翻页)。\n非0时，找图失败后会将鼠标移到搜索区域中心滚动一次再重试，直到超时。"),
             # 找到后执行
             ParamDef(
                 name="after_action",
@@ -435,9 +431,19 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
             ParamDef(name="offset", editor=EDITOR_TUPLE2, default=(0, 0), label="点击偏移",
                      help="找到目标后，相对模板中心的像素偏移 (X, Y)。X 正值向右，负值向左；Y 正值向下，负值向上。\n例如找到的图片中心在窗口(100,200)，偏移设(10,-5)，则实际点击位置为(110,195)。\nout_pos 输出的是「模板中心+偏移」后的最终坐标。"),
             # ===== 特征识别辅助 =====
-            ParamDef(name="use_feature_assist", editor=EDITOR_BOOL, default=False,
+            ParamDef(name="use_feature_assist", editor=EDITOR_ENUM, default="off",
+                     options=["off", "verify", "fallback"],
+                     option_labels={
+                         "off": "关闭",
+                         "verify": "验证模式",
+                         "fallback": "兜底模式",
+                     },
                      label="特征识别辅助",
-                     help="勾选后，当直接模板匹配失败时，自动改用「特征列表」方式匹配：\n将模板拆成多个小特征图独立匹配，再根据每个特征在模板中的相对位置交叉验证，\n确保特征出现在正确位置才算命中。适用于整张模板因缩放/遮挡/复杂背景无法直接匹配的场景。"),
+                     help="特征辅助用预存的小特征图做交叉验证：\n"
+                          "● 关闭：不使用特征辅助。\n"
+                          "● 验证模式：模板匹配成功后，再用特征辅助额外验证。特征也通过才算成功，否则判定失败（更严格）。\n"
+                          "● 兜底模式：模板匹配失败后，用特征辅助尝试找。找到了算成功（更宽松）。\n"
+                          "特征辅助内部固定使用彩色模板匹配，不受匹配算法选项影响。"),
             ParamDef(name="features_json", editor=EDITOR_MULTILINE, default="[]",
                      label="特征列表(JSON)",
                      help="特征数据JSON数组，每项包含: b64(特征图base64), rel_x/rel_y(相对模板左上角), w/h(特征宽高)。\n通常通过面板上方「✂ 从模板截取特征」按钮自动生成，无需手填。"),
@@ -530,9 +536,9 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
                      help="仅「相对绑定窗口」模式生效。窗口类名精确匹配。\n留空=不按类名匹配。"),
             # 2) 动作类型（第二位）
             ParamDef(name="action", editor=EDITOR_ENUM, default="click",
-                     options=["click", "press", "release", "move", "drag", "scroll"],
+                     options=["click", "move", "drag", "scroll"],
                      option_labels={
-                         "click": "点击", "press": "按住", "release": "释放",
+                         "click": "点击",
                          "move": "移动", "drag": "拖拽", "scroll": "滚动",
                      },
                      label="动作类型",
@@ -550,18 +556,14 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
             ParamDef(name="to_pos", editor=EDITOR_TUPLE2, default=(0, 0), label="终点",
                      pick_coord=True,
                      help="拖拽终点坐标 (X, Y)。点 📍 按钮可在屏幕上拾取坐标。"),
-            # --- 偏移量（click/press/move/scroll/drag 用）---
-            ParamDef(name="offset", editor=EDITOR_TUPLE2, default=(0, 0), label="偏移量",
-                     help="对目标点的像素偏移 (X, Y)。X 负数=向左，Y 负数=向下。"),
             ParamDef(name="drag_duration_ms", editor=EDITOR_INT, default=300, min=0, max=10000,
                      label="拖拽时长(ms)", help='0=瞬间；越大越平滑'),
 
             # --- 按钮/时长相关 ---
             ParamDef(name="button", editor=EDITOR_ENUM, default="left",
-                     options=["left", "middle", "right", "x1", "x2"],
+                     options=["left", "right"],
                      option_labels={
-                         "left": "左键", "middle": "中键", "right": "右键",
-                         "x1": "侧键1", "x2": "侧键2",
+                         "left": "左键", "right": "右键",
                      },
                      label="鼠标按键"),
             ParamDef(name="click_count", editor=EDITOR_INT, default=1, min=1, max=3,
@@ -574,14 +576,10 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
                      label="操作后最小延迟(ms)", help="鼠标操作完成后的额外等待时间下限。上下限一致=固定等待；否则在两者间随机。"),
             ParamDef(name="post_delay_max_ms", editor=EDITOR_INT, default=80, min=0, max=5000,
                      label="操作后最大延迟(ms)", help="鼠标操作完成后的额外等待时间上限"),
-            ParamDef(name="move_speed_ms", editor=EDITOR_INT, default=0, min=0, max=20000,
-                     label="移动时长(ms)", help='0=瞬移'),
 
             # --- scroll 独有 ---
-            ParamDef(name="scroll_dy", editor=EDITOR_INT, default=3, min=-100, max=100,
-                     label="垂直滚动(格)", help='正=上 负=下'),
-            ParamDef(name="scroll_dx", editor=EDITOR_INT, default=0, min=-100, max=100,
-                     label="水平滚动(格)", help='正=右 负=左'),
+            ParamDef(name="scroll_dy", editor=EDITOR_INT, default=400, min=-5000, max=5000,
+                     label="滚动距离(像素)", help='像素估算值，正=滚轮向前(页面/视角向上滚) 负=滚轮向后(页面/视角向下滚)。按常见浏览器1格≈40像素做经验换算：400≈1页、100≈小半页、1000≈2~3页；实际多少取决于目标程序和系统"每次滚动行数"设置。'),
             ParamDef(name="scroll_steps", editor=EDITOR_INT, default=1, min=1, max=100,
                      label="重复次数"),
         ],
@@ -789,7 +787,7 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         type="IfImageDetect",
         category=CATEGORY_VISION,
         title="检测",
-        description="当下就检查好几张图是不是都在屏幕上~完全求值全中才走是，短路缺一张就立马否决，一真即真（逻辑或）只要撞见任意一张中就喊是；只瞅当下这一眼，不会等太久哟。",
+        description="当下就检查好几张图是不是都在屏幕上~完全求值全中才走是，短路缺一张就立马否决，一真即真（逻辑或）只要撞见任意一张中就喊是；只瞅当下这一眼，不会等太久哟。\n注意：完全模式下如果未添加任何检测图片，将直接走「否」分支（空集视为未匹配）。",
         color="#ef6c00",
         accent="#ff9800",
         inputs=[_exec_in()],
@@ -802,17 +800,19 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
                 name="match_strategy",
                 editor=EDITOR_ENUM,
                 default="hybrid",
-                options=["hybrid", "template", "feature"],
+                options=["hybrid", "template", "gray", "feature"],
                 option_labels={
-                    "hybrid": "混合匹配",
+                    "hybrid": "智能混合",
                     "template": "模板匹配",
-                    "feature": "特征点匹配",
+                    "gray": "灰度匹配",
+                    "feature": "特征匹配",
                 },
                 label="匹配算法",
                 help='各算法优缺点：\n'
-                     '● 混合匹配(hybrid)【推荐】：先用模板匹配快速初筛，不通过再试特征点。速度较快，兼顾准确性和抗形变能力，适合大多数场景。\n'
-                     '● 模板匹配(template)：直接做像素归一化相关。速度最快，像素级精度最高；但参考图和屏幕只要有缩放、旋转、轻微形变或压缩失真就会匹配失败。适合尺寸固定、画面清晰的UI按钮/图标。\n'
-                     '● 特征点匹配(feature)：提取SIFT/ORB局部特征点做匹配。抗缩放、旋转、部分遮挡和光照变化；但对于大面积纯色、缺少纹理的图片（如纯色方块）会找不到特征点而失败，速度也稍慢。',
+                     '● 智能混合(hybrid)【推荐】：彩色模板→灰度模板→AKAZE特征点，三层级联兜底。兼顾准确性、颜色容忍和抗形变，大多数场景首选。\n'
+                     '● 模板匹配(template)：彩色像素归一化相关。速度最快，精度最高；但对缩放、旋转、颜色变化敏感。适合尺寸固定、画面清晰的UI按钮/图标。\n'
+                     '● 灰度匹配(gray)：灰度像素归一化相关。容忍颜色变化（如选中态/高亮态），适合颜色可能变化但形状不变的场景。\n'
+                     '● 特征匹配(feature)：提取AKAZE局部特征点做匹配，经RANSAC几何验证。抗颜色变化、光照变化、局部遮挡、轻微旋转/缩放；但对纯色/少纹理图片会失败，速度稍慢。',
             ),
             # 检测范围模式
             ParamDef(name="search_mode", editor=EDITOR_ENUM, default="relative",
@@ -834,11 +834,11 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
                 name="threshold",
                 editor=EDITOR_FLOAT,
                 default=0.9,
-                label="相似度阈值",
+                label="匹配阈值",
                 min=0.3,
                 max=1.0,
                 step=0.01,
-                help="模板匹配/混合下的相关系数阈值；特征匹配下为内点比例阈值。越大越严格，越小越宽松。",
+                help="相似度阈值，越高越严格。模板匹配/混合模式=相关系数；特征匹配=内点比例。",
             ),
             ParamDef(
                 name="eval_mode",
