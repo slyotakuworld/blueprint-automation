@@ -338,6 +338,7 @@ class LLMSettingsDialog(QDialog):
             "OpenAI", "Ollama"
         ])
         row1.addWidget(self.cmb_provider, 1)
+        self.cmb_provider.currentIndexChanged.connect(self._on_provider_changed)
         v.addLayout(row1)
 
         # Base URL（单独一行更宽敞）
@@ -361,8 +362,7 @@ class LLMSettingsDialog(QDialog):
         row4 = _row()
         row4.addWidget(_label("对话模型"))
         self.cmb_model = _apply_control_h(NoWheelComboBox())
-        self.cmb_model.setEditable(True)  # 允许手动输入（模型名没在返回列表里时手填）
-        self.cmb_model.addItems(["gpt-4o-mini", "qwen2.5:7b"])
+        self.cmb_model.addItems(["gpt-4o-mini", "gpt-4o", "gpt-3.5-turbo", "qwen2.5:7b", "qwen2.5:14b", "llama3.1:8b"])
         self.cmb_model.setCurrentText("gpt-4o-mini")
         row4.addWidget(self.cmb_model, 1)
         row4.addSpacing(8)
@@ -1032,24 +1032,93 @@ class LLMSettingsDialog(QDialog):
     # =================================================================
     # 默认值 / 事件 / 导入导出
     # =================================================================
+    def _on_provider_changed(self, idx: int):
+        """切换 OpenAI/Ollama 时自动填充对应 provider 的 base_url / model。"""
+        from src.config.user_settings import get_llm_config
+
+        provider_name = "ollama" if idx == 1 else "openai"
+        try:
+            cfg = get_llm_config()
+            providers = cfg.get("providers", {})
+            prov = providers.get(provider_name, {})
+            self.ed_baseurl.setText(prov.get("base_url", ""))
+            model_name = prov.get("model", "")
+            if model_name:
+                i = self.cmb_model.findText(model_name)
+                if i < 0:
+                    self.cmb_model.addItem(model_name)
+                self.cmb_model.setCurrentText(model_name)
+        except Exception:
+            pass
+
     def load_defaults(self):
-        self.chk_enable.setChecked(True)
-        self.cmb_provider.setCurrentIndex(0)
-        self.ed_baseurl.setText("https://api.openai.com/v1")
-        self.ed_apikey.setText("")
-        self.cmb_model.setCurrentText("gpt-4o-mini")
-        self.spn_ctx.setValue(16384)
-        self.spn_out.setValue(2048)
-        # ⚠ 已删除 chk_stream / chk_ssl 勾选框，统一在 config/llm_defaults.json 里配置：
-        #   ui.stream_output=true 启用流式输出；ui.skip_ssl_verify=true 默认跳过 SSL 校验
-        # 人设默认预设
-        self.cmb_preset.setCurrentIndex(0)
-        self._apply_persona_preset(0)
-        # ⚠ 已删除蓝图输出设置的 chk_validate/chk_autosave/spn_attempts 控件，
-        #   统一从 config/llm_defaults.json 的 blueprint 域读取（默认校验开/自动草稿开/最大尝试3次）
-        # theme / topmost：不再暴露 UI，直接写死默认值
-        #  · 主题默认奶茶白日（day）
-        #  · 悬浮球固定置顶（Win32 全屏也可见）
+        """从 user_settings 加载已保存的 LLM 配置，无配置时用默认值。"""
+        from src.config.user_settings import get_llm_config
+
+        try:
+            cfg = get_llm_config()
+        except Exception:
+            cfg = {}
+
+        self.chk_enable.setChecked(bool(cfg.get("enabled", True)))
+
+        active = cfg.get("active_provider", "openai")
+        if active == "ollama":
+            self.cmb_provider.setCurrentIndex(1)
+        else:
+            self.cmb_provider.setCurrentIndex(0)
+
+        providers = cfg.get("providers", {})
+        prov = providers.get(active, {})
+        self.ed_baseurl.setText(prov.get("base_url", "https://api.openai.com/v1"))
+        self.ed_apikey.setText(cfg.get("api_key", ""))
+        # 模型：如果不在下拉列表中，先添加再选中
+        model_name = prov.get("model", "gpt-4o-mini")
+        idx = self.cmb_model.findText(model_name)
+        if idx < 0:
+            self.cmb_model.addItem(model_name)
+        self.cmb_model.setCurrentText(model_name)
+
+        # 通用参数：从配置读取（不再硬编码）
+        from src.config.user_settings import get_llm_params
+        params = get_llm_params()
+        self.spn_ctx.setValue(params.get("max_ctx", 16384))
+        self.spn_out.setValue(params.get("max_out", 2048))
+        self.sl_temp.setValue(int(round((params.get("temperature", 0.7) - 0.0) / 0.05)))
+        self.sl_top.setValue(int(round((params.get("top_p", 0.9) - 0.0) / 0.01)))
+        self.sl_freq.setValue(int(round((params.get("freq_pen", 0.0) - (-2.0)) / 0.05)))
+        self.sl_pres.setValue(int(round((params.get("pres_pen", 0.0) - (-2.0)) / 0.05)))
+        preset_idx = int(cfg.get("active_preset", 0))
+        self.cmb_preset.setCurrentIndex(preset_idx)
+        self._apply_persona_preset(preset_idx)
+
+        # 加载用户档案
+        profile = cfg.get("profile", {})
+        if isinstance(profile, dict):
+            if hasattr(self, "ed_profile_name"):
+                self.ed_profile_name.setText(profile.get("name", ""))
+            if hasattr(self, "ed_profile_job"):
+                self.ed_profile_job.setText(profile.get("job", ""))
+            if hasattr(self, "ed_profile_skill"):
+                self.ed_profile_skill.setText(profile.get("skill", ""))
+            if hasattr(self, "ed_profile_games"):
+                self.ed_profile_games.setPlainText(profile.get("games", ""))
+            if hasattr(self, "ed_profile_extra"):
+                self.ed_profile_extra.setPlainText(profile.get("extra", ""))
+
+        # 加载用户档案
+        profile = cfg.get("profile", {})
+        if isinstance(profile, dict):
+            if hasattr(self, "ed_profile_name"):
+                self.ed_profile_name.setText(profile.get("name", ""))
+            if hasattr(self, "ed_profile_job"):
+                self.ed_profile_job.setText(profile.get("job", ""))
+            if hasattr(self, "ed_profile_skill"):
+                self.ed_profile_skill.setText(profile.get("skill", ""))
+            if hasattr(self, "ed_profile_games"):
+                self.ed_profile_games.setPlainText(profile.get("games", ""))
+            if hasattr(self, "ed_profile_extra"):
+                self.ed_profile_extra.setPlainText(profile.get("extra", ""))
 
     def _collect(self) -> Dict[str, Any]:
         # slider 辅助
@@ -1100,16 +1169,69 @@ class LLMSettingsDialog(QDialog):
 
     def _on_save(self):
         data = self._collect()
-        self.settings_saved.emit(dict(data))
-        # ⚠ 保存时也同步一次 enable 状态（避免用户在设置里开关后忘记保存时悬浮球状态不同步）
+
+        # ① 立即持久化到 user_settings（最先执行，防止后续步骤异常导致丢失）
+        from src.config.user_settings import set_llm_config, get_llm_config
+
         try:
+            old_cfg = get_llm_config()
+            old_providers = old_cfg.get("providers", {})
+        except Exception:
+            old_providers = {}
+
+        provider_name = "ollama" if data.get("provider") == "Ollama" else "openai"
+        new_providers = {}
+        for pk in ("openai", "ollama"):
+            if pk == provider_name:
+                new_providers[pk] = {
+                    "base_url": data.get("base_url", ""),
+                    "model": data.get("model", ""),
+                    "nickname": "Ollama 本地" if pk == "ollama" else "OpenAI GPT",
+                }
+            else:
+                old = old_providers.get(pk, {})
+                new_providers[pk] = {
+                    "base_url": old.get("base_url", ""),
+                    "model": old.get("model", ""),
+                    "nickname": old.get("nickname", "Ollama 本地" if pk == "ollama" else "OpenAI GPT"),
+                }
+
+        try:
+            set_llm_config({
+                "enabled": bool(data.get("enable", True)),
+                "active_provider": provider_name,
+                "api_key": data.get("api_key", ""),
+                "active_preset": int(data.get("persona", {}).get("preset_idx", 0)),
+                "providers": new_providers,
+                "memory": data.get("memory", {}),
+                "profile": data.get("profile", {}),
+                "params": {
+                    "temperature": data.get("temperature", 0.7),
+                    "top_p": data.get("top_p", 0.9),
+                    "freq_pen": data.get("freq_pen", 0.0),
+                    "pres_pen": data.get("pres_pen", 0.0),
+                    "max_ctx": data.get("max_ctx", 16384),
+                    "max_out": data.get("max_out", 2048),
+                },
+            })
+        except Exception as e:
+            QMessageBox.warning(self, "保存失败", f"写入配置文件失败：{e}")
+            return
+
+        # ② 通知主窗口（设置已持久化，emit 异常不影响保存结果）
+        try:
+            self.settings_saved.emit(dict(data))
             self.llm_enabled_changed.emit(bool(data.get("enable", True)))
         except Exception:
             pass
+
+        # ③ 提示 + 关闭
         QMessageBox.information(
-            self, "💾 已保存（打桩）",
-            f"赫萝：收到收到~ 咱记住啦 🍎\n\n（Stub：写入 user_settings.llm，共 {len(data)} 项。\n"
-            f"主题：{data['theme']}；人设：{data['persona']['self']}/{data['persona']['you']}）"
+            self, "💾 已保存",
+            f"赫萝：收到收到~ 咱记住啦 🍎\n\n"
+            f"当前服务：{data.get('provider', 'OpenAI')}\n"
+            f"模型：{data.get('model', '')}\n"
+            f"API Key：{'已设置' if data.get('api_key') else '未设置'}"
         )
         self.accept()
 

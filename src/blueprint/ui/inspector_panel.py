@@ -2334,6 +2334,8 @@ class InspectorPanel(QWidget):
         # 参数名 -> 是否可见 的映射表
         vis_map = {
             "offset": show_offsets,
+            "post_delay_min_ms": show_offsets,
+            "post_delay_max_ms": show_offsets,
             # 特征识别辅助参数（features_json / feature_capture_width / feature_template_w/h 已隐藏，不在此管理）
             "feature_tolerance": use_feat,
             "feature_min_hits": use_feat,
@@ -3171,6 +3173,8 @@ class InspectorPanel(QWidget):
             # --- 通用(空list = 永远显示) ---
             "coord_mode": [],
             "action": [],
+            "post_delay_min_ms": [],
+            "post_delay_max_ms": [],
             # --- 目标点（click/move/scroll 用）---
             "pos": ["click", "move", "scroll"],
             # --- drag 独有 ---
@@ -3182,8 +3186,6 @@ class InspectorPanel(QWidget):
             "click_count": ["click"],
             "hold_ms_min": ["click"],
             "hold_ms_max": ["click"],
-            "post_delay_min_ms": ["click"],
-            "post_delay_max_ms": ["click"],
             # --- scroll 独有 ---
             "scroll_dy": ["scroll"],
             "scroll_steps": ["scroll"],

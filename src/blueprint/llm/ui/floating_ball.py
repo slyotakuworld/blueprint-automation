@@ -134,6 +134,7 @@ class FloatingBall(QWidget):
     """系统级置顶悬浮球。parent 必须是 None（见文件头说明）。"""
 
     user_message = Signal(str)
+    blueprint_imported = Signal(dict)
 
     def __init__(self, parent: Optional[QWidget] = None):
         # ============================================================
@@ -438,10 +439,57 @@ class FloatingBall(QWidget):
 
     def _move_to_default_bottom_right(self):
         geo = self._screen_available()
+        # 记忆开关：如果 remember_window 开启，尝试恢复上次位置
+        try:
+            from src.config.user_settings import get_llm_memory
+            mem = get_llm_memory()
+            if mem.get("remember_window", True):
+                from src.config.app_paths import USER_CONFIG_FILE
+                import json as _json
+                import os as _os
+                if USER_CONFIG_FILE and _os.path.isfile(USER_CONFIG_FILE):
+                    with open(USER_CONFIG_FILE, "r", encoding="utf-8") as f:
+                        cfg = _json.load(f)
+                    pos = cfg.get("llm", {}).get("_ball_pos", None)
+                    if isinstance(pos, list) and len(pos) == 2:
+                        x, y = int(pos[0]), int(pos[1])
+                        # 确保位置在屏幕可用区域内
+                        if geo.left() <= x <= geo.right() - self._size and \
+                           geo.top() <= y <= geo.bottom() - self._size:
+                            self.move(x, y)
+                            return
+        except Exception:
+            pass
+        # 默认：右下角
         self.move(
             geo.right() - self._size - self._default_margin,
             geo.bottom() - self._size - self._default_margin,
         )
+
+    def _save_position(self):
+        """拖动结束后保存悬浮球位置（受 remember_window 开关控制）。"""
+        try:
+            from src.config.user_settings import get_llm_memory
+            mem = get_llm_memory()
+            if not mem.get("remember_window", True):
+                return
+            from src.config.app_paths import USER_CONFIG_FILE
+            import json as _json
+            import os as _os
+            if not USER_CONFIG_FILE:
+                return
+            cfg = {}
+            if _os.path.isfile(USER_CONFIG_FILE):
+                try:
+                    with open(USER_CONFIG_FILE, "r", encoding="utf-8") as f:
+                        cfg = _json.load(f)
+                except Exception:
+                    cfg = {}
+            cfg.setdefault("llm", {})["_ball_pos"] = [self.x(), self.y()]
+            with open(USER_CONFIG_FILE, "w", encoding="utf-8") as f:
+                _json.dump(cfg, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
 
     def _snap_to_edge(self):
         geo = self._screen_available()
@@ -597,6 +645,7 @@ class FloatingBall(QWidget):
             # 只要拖过（_did_drag = True）就保留当前位置（不吸附），绝不触发打开
             if self._did_drag:
                 self._did_drag = False
+                self._save_position()
                 e.accept()
                 return
             # 没拖过：再做一次兜底距离检查（防极短距离的误触），阈值比 startDragDistance 稍大
@@ -623,6 +672,8 @@ class FloatingBall(QWidget):
         if self._full_dlg is None:
             self._full_dlg = FullChatDialog()
             self._full_dlg.message_sent.connect(self._on_user_message_from_full)
+            self._full_dlg.thinking_changed.connect(self.set_avatar_state)
+            self._full_dlg.blueprint_imported.connect(self.blueprint_imported)
         self._full_dlg.show()
         # 尝试拉到前台（对话框是独立 Window，可以主动激活）
         try:
@@ -638,10 +689,13 @@ class FloatingBall(QWidget):
         if self._quick_bubble is None:
             self._quick_bubble = QuickChatBubble(parent=None)
             self._quick_bubble.message_sent.connect(self._on_user_message_quick)
+            self._quick_bubble.thinking_changed.connect(self.set_avatar_state)
         # 确保 FullChatDialog 已创建（不 show），用于共享聊天记录
         if self._full_dlg is None:
             self._full_dlg = FullChatDialog()
             self._full_dlg.message_sent.connect(self._on_user_message_from_full)
+            self._full_dlg.thinking_changed.connect(self.set_avatar_state)
+            self._full_dlg.blueprint_imported.connect(self.blueprint_imported)
         # 从 FullChatDialog 同步当前自由聊天会话记录（共享同一份记录）
         self._quick_bubble.sync_from(self._full_dlg)
 
@@ -676,11 +730,9 @@ class FloatingBall(QWidget):
     # =================================================================
     def _on_user_message_from_full(self, text: str):
         self.user_message.emit(text)
-        self._mock_toast(f"[完整对话] 发送：\n{text[:60]}")
 
     def _on_user_message_quick(self, text: str):
         self.user_message.emit(text)
-        self._mock_toast(f"[快速气泡] 发送：\n{text[:60]}")
 
     def _mock_toast(self, msg: str):
         try:

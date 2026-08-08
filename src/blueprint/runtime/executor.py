@@ -1221,6 +1221,7 @@ def execute_FindImage(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any])
                 if after_action != "none":
                     try:
                         import pyautogui
+                        import random
                         pyautogui.moveTo(abs_cx, abs_cy)
                         if after_action == "click":
                             pyautogui.click()
@@ -1228,6 +1229,13 @@ def execute_FindImage(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any])
                             pyautogui.doubleClick()
                         elif after_action == "right_click":
                             pyautogui.rightClick()
+                        post_min = max(0, int(node.params.get("post_delay_min_ms", 30) or 30))
+                        post_max = max(0, int(node.params.get("post_delay_max_ms", 80) or 80))
+                        post_delay_ms = random.randint(min(post_min, post_max), max(post_min, post_max))
+                        if post_delay_ms > 0:
+                            ctx.log(f"[FindImage] 动作后延迟 {post_delay_ms}ms 再执行下一节点", "DEBUG")
+                            wait_if_paused(ctx)
+                            time.sleep(post_delay_ms / 1000.0)
                     except Exception as ea:
                         ctx.log(f"[FindImage] 找到后执行动作失败: {ea}", "WARN")
                 # 日志
@@ -1629,6 +1637,10 @@ def execute_Mouse(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
     btn = str(p.get("button", "left") or "left")
     ia = getattr(ctx, "input_actions", None)
 
+    post_min = max(0, int(p.get("post_delay_min_ms", 30) or 30))
+    post_max = max(0, int(p.get("post_delay_max_ms", 80) or 80))
+    post_range = (min(post_min, post_max), max(post_min, post_max))
+
     with _temp_window_foreground(ctx, p):
         try:
             pos = _mouse_final_pos(ctx, p, inputs)
@@ -1639,10 +1651,6 @@ def execute_Mouse(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
                 hold_min = max(1, int(p.get("hold_ms_min", 30) or 30))
                 hold_max = max(1, int(p.get("hold_ms_max", 80) or 80))
                 hold_range = (min(hold_min, hold_max), max(hold_min, hold_max))
-                post_min = max(0, int(p.get("post_delay_min_ms", 30) or 30))
-                post_max = max(0, int(p.get("post_delay_max_ms", 80) or 80))
-                post_range = (min(post_min, post_max), max(post_min, post_max))
-                # clicks=1→单击1次; clicks=2→双击(1轮2击); clicks=3→三击(1轮3击,非翻倍)
                 double = (clicks == 2)
                 repeat = 1 if clicks <= 2 else clicks
                 if ia is not None:
@@ -1672,14 +1680,11 @@ def execute_Mouse(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
                 if ia is not None:
                     try:
                         steps = max(2, dur // 20)
-                        # 1. 移动到起点
                         ia._hw_mouse_move(from_x, from_y)
                         time.sleep(0.05)
-                        # 2. 按下鼠标
                         ia._hw_mouse_down(btn)
                         _drag_btn_held = True
                         time.sleep(0.05)
-                        # 3. 逐步移动到终点（真正移动鼠标）
                         for i in range(1, steps + 1):
                             if not getattr(ctx, "is_running", True):
                                 break
@@ -1692,7 +1697,6 @@ def execute_Mouse(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
                     except Exception as e:
                         ctx.log(f"[Mouse] drag error: {e}", "ERROR")
                     finally:
-                        # 4. 无论成功还是异常，都必须释放鼠标按键，避免卡死
                         if _drag_btn_held:
                             try:
                                 time.sleep(0.05)
@@ -1722,6 +1726,12 @@ def execute_Mouse(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
                 ctx.log(f"[Mouse] 未知 action={action}", "ERROR")
                 annotate_step(ctx, node, "mouse", note=f"ERROR: unknown action={action}")
                 return {}, ["err"], ""
+
+            wait_if_paused(ctx)
+            post_delay_ms = random.randint(int(post_range[0]), int(post_range[1]))
+            if post_delay_ms > 0:
+                ctx.log(f"[Mouse] 操作后延迟 {post_delay_ms}ms 再执行下一节点", "DEBUG")
+                time.sleep(post_delay_ms / 1000.0)
 
         except Exception as e:
             ctx.log(f"[Mouse] 执行失败: {type(e).__name__}: {e}", "ERROR")

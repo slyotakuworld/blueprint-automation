@@ -3009,8 +3009,17 @@ class BlueprintMainWindow(QMainWindow):
         except Exception:
             pass
         # 3) 同步用户设置到磁盘（保证设置对话框里改过的热键等下次启动还在）
+        # ⚠ 不能直接用 self._user_settings 覆盖磁盘——它会覆盖 LLM 设置面板刚写入的 llm 配置。
+        # 改为：只把 hotkeys/ui 等主窗口管理的字段合并到磁盘最新内容上。
         try:
-            save_user_settings(self._user_settings)
+            from src.config.user_settings import read_user_settings as _rus
+            disk = _rus()
+            # 只用内存快照中的 hotkeys / ui 字段（这些是 SettingsDialog 管理的）
+            if "hotkeys" in self._user_settings:
+                disk["hotkeys"] = self._user_settings["hotkeys"]
+            if "ui" in self._user_settings:
+                disk["ui"] = self._user_settings["ui"]
+            save_user_settings(disk)
         except Exception:
             pass
         super().closeEvent(event)
@@ -3559,6 +3568,10 @@ class BlueprintMainWindow(QMainWindow):
                         ball.user_message.connect(self._on_ball_user_message_stub)
                     except Exception:
                         pass
+                    try:
+                        ball.blueprint_imported.connect(self._on_llm_blueprint_imported)
+                    except Exception:
+                        pass
                     self._floating_ball = ball
                 except Exception as e:
                     self._status_lbl.setText(f"[LLM] 创建悬浮球失败：{e}")
@@ -3604,6 +3617,41 @@ class BlueprintMainWindow(QMainWindow):
             self._status_lbl.setText(f"[LLM 打桩] 已接收：{short}（真实发送功能待接入）")
         except Exception:
             pass
+
+    def _on_llm_blueprint_imported(self, bp_dict: dict):
+        """LLM 生成的蓝图 JSON 导入画布（含校验）。"""
+        try:
+            from src.blueprint.core.models import BlueprintGraph
+            graph = BlueprintGraph.from_dict(bp_dict)
+
+            # 校验蓝图结构
+            try:
+                from src.blueprint.runtime.validator import validate_graph
+                issues = validate_graph(graph)
+                errors = [i for i in issues if i.level == "ERROR"]
+                warnings = [i for i in issues if i.level == "WARN"]
+                if errors:
+                    err_msgs = "\n".join(f"  · {i.message}" for i in errors[:5])
+                    QMessageBox.warning(
+                        self, "蓝图校验失败",
+                        f"赫萝：这个蓝图有些问题没法直接导入哦~\n\n错误：\n{err_msgs}\n\n"
+                        f"可以让赫萝重新生成，或手动修正后导入。"
+                    )
+                    return
+                if warnings:
+                    warn_msgs = "\n".join(f"  · {i.message}" for i in warnings[:3])
+                    self._log.append_log(f"[LLM] 蓝图校验警告：{warn_msgs}", "WARN")
+            except Exception:
+                pass  # 校验模块异常不阻断导入
+
+            self._bind_new_graph(graph, zoom_fit=True)
+            self._log.append_log(
+                f"[LLM] 蓝图导入成功：{len(graph.nodes)} 节点 / {len(graph.edges)} 连线",
+                "INFO"
+            )
+        except Exception as e:
+            self._log.append_log(f"[LLM] 蓝图导入失败：{type(e).__name__}: {e}", "ERROR")
+            QMessageBox.warning(self, "导入失败", f"蓝图解析失败：{e}\n\n可以让赫萝重新生成一次试试~")
 
 
 def main() -> int:

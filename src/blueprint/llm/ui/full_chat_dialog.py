@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """完整对话大窗口（赫萝风格通用助手版 · 纯 UI Stub）。
 
 结构：
@@ -41,6 +41,7 @@ from PySide6.QtGui import (
     QFont,
     QFontMetrics,
     QIcon,
+    QImage,
     QLinearGradient,
     QMovie,
     QPainter,
@@ -55,6 +56,7 @@ from PySide6.QtWidgets import (
     QButtonGroup,
     QComboBox,
     QDialog,
+    QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -76,6 +78,15 @@ from PySide6.QtWidgets import (
 # ---- 主题 + 图标加载器 ----
 from ._holo_theme import build_qss, get_theme
 from ._icon_loader import circular_pixmap, icon, icon_path, pixmap
+
+# 人设预设索引辅助函数
+def _get_preset() -> int:
+    try:
+        from src.config.user_settings import get_active_preset
+        return get_active_preset()
+    except Exception:
+        return 0
+
 
 _THEME_NAME = "day"  # 固定奶茶白日主题
 _THEME = get_theme(_THEME_NAME)
@@ -158,6 +169,12 @@ class _BubbleContent(QWidget):
         """同步外部实际分配给 self 的宽度上限，让 sizeHint 与 paintEvent 共用同一宽度基准。"""
         self._hint_width = max(220, int(width))
         self.updateGeometry()
+
+    def update_text(self, new_text: str):
+        """流式更新文本（触发重绘 + 重新计算 sizeHint）。"""
+        self._text = new_text
+        self.updateGeometry()
+        self.update()
 
     def sizeHint(self) -> QSize:
         font = QFont()
@@ -539,6 +556,24 @@ class ChatBubble(QWidget):
         self._content.updateGeometry()
         self.updateGeometry()
 
+    def update_text(self, new_text: str):
+        """流式更新文本内容（用于 LLM 流式输出时逐 chunk 刷新气泡）。"""
+        self._text = new_text
+        self._content.update_text(new_text)
+        # 重新计算高度并更新 QListWidgetItem 的 sizeHint
+        self.adjustSize()
+        sh = self.sizeHint()
+        list_w = self.parent()
+        while list_w is not None and not hasattr(list_w, 'itemWidget'):
+            list_w = list_w.parent()
+        if list_w is not None:
+            for i in range(list_w.count()):
+                item = list_w.item(i)
+                if list_w.itemWidget(item) is self:
+                    item.setSizeHint(QSize(max(400, self.width()), max(self.minimumHeight(), sh.height())))
+                    break
+        QTimer.singleShot(10, lambda: list_w.scrollToBottom() if list_w else None)
+
     @staticmethod
     def estimate_height(text: str, bubble_width: int = 520, role: str = "user") -> int:
         font = QFont()
@@ -608,6 +643,10 @@ class _ImageAnalysisPage(QFrame):
         self.setObjectName("holoCard")
         self._parent_dialog = parent_dialog
         self.setAcceptDrops(True)
+        # 运行期状态
+        self._img_worker = None
+        self._img_streaming = ""
+        self._current_pixmap: Optional[QPixmap] = None
         root = QVBoxLayout(self); root.setContentsMargins(24, 24, 24, 24); root.setSpacing(14)
 
         # 标题
@@ -622,41 +661,98 @@ class _ImageAnalysisPage(QFrame):
         col.addWidget(st); hl.addLayout(col, 1)
         root.addLayout(hl)
 
-        # 中央拖拽区（大空框）
+        # 中央拖拽区（缩略图 + 提示 + 按钮）
         self._drop_zone = QFrame(); self._drop_zone.setObjectName("holoCard")
-        self._drop_zone.setMinimumHeight(340)
+        self._drop_zone.setMinimumHeight(280)
         self._drop_zone.setStyleSheet(
             f"#holoCard {{ background:{_THEME['bg_root']};"
             f" border:2px dashed {_THEME['border']}; border-radius:20px; }}"
         )
-        dz = QVBoxLayout(self._drop_zone); dz.setContentsMargins(20, 30, 20, 30); dz.setSpacing(14)
-        big_icon = QLabel(); big_icon.setAlignment(Qt.AlignCenter)
+        dz = QVBoxLayout(self._drop_zone); dz.setContentsMargins(20, 24, 20, 24); dz.setSpacing(12)
+        # 缩略图标签：默认显示大图标，加载图片后显示缩略图
+        self._thumb_label = QLabel(); self._thumb_label.setAlignment(Qt.AlignCenter)
         big_pm = pixmap("icon_image.png", 128)
-        if not big_pm.isNull(): big_icon.setPixmap(big_pm); dz.addWidget(big_icon)
-        big_text = QLabel("把截图拖进来，或点下面 📷 选图~"); big_text.setAlignment(Qt.AlignCenter)
-        big_text.setStyleSheet(f"background:transparent;color:{_THEME['primary_dark']}; font-size:20px; font-weight:800;")
-        dz.addWidget(big_text)
-        sub_text = QLabel("（支持 PNG / JPG / BMP，截图直接 Ctrl+V 粘贴也行哦）"); sub_text.setAlignment(Qt.AlignCenter)
+        if not big_pm.isNull(): self._thumb_label.setPixmap(big_pm)
+        dz.addWidget(self._thumb_label)
+        self._drop_hint = QLabel("把截图拖进来，或点下面 📷 选图~"); self._drop_hint.setAlignment(Qt.AlignCenter)
+        self._drop_hint.setStyleSheet(f"background:transparent;color:{_THEME['primary_dark']}; font-size:20px; font-weight:800;")
+        dz.addWidget(self._drop_hint)
+        sub_text = QLabel("（支持 PNG / JPG / BMP / WEBP，截图直接 Ctrl+V 粘贴也行哦）"); sub_text.setAlignment(Qt.AlignCenter)
         sub_text.setStyleSheet(f"background:transparent;color:{_THEME['text_sub']}; font-size:13px;")
         dz.addWidget(sub_text)
         dz.addStretch(1)
 
         # 2 个快速按钮
         btns = QHBoxLayout(); btns.setSpacing(10); btns.setAlignment(Qt.AlignCenter)
-        b1 = QPushButton("  📷  从剪贴板 / 截图"); b1.setIcon(icon("icon_screenshot.png", 20)); b1.setIconSize(QSize(20,20))
-        b1.setCursor(Qt.PointingHandCursor); b1.setObjectName("holoPrimary"); b1.setMinimumHeight(36)
-        b1.clicked.connect(lambda: QMessageBox.information(
-            self._parent_dialog, "Stub：未来 OCR + VLM 识别",
-            "赫萝：把截图给咱看看~ 🍎\n\n（Stub：下一阶段接 Windows.GraphicsCapture + OCR/VLM，识别结果直接转「找图/点击」蓝图节点。）"
-        ))
-        b2 = QPushButton("  📂  选择图片文件"); b2.setIcon(icon("icon_upload.png", 20)); b2.setIconSize(QSize(20,20))
-        b2.setCursor(Qt.PointingHandCursor); b2.setMinimumHeight(36)
-        b2.clicked.connect(lambda: QMessageBox.information(
-            self._parent_dialog, "Stub：未来 OCR + VLM 识别",
-            "赫萝：唔姆~ 图片选好啦，等下咱帮你认哪个是确定按钮哦~\n\n（Stub：下一阶段接入。）"
-        ))
-        btns.addWidget(b1); btns.addWidget(b2); dz.addLayout(btns)
-        root.addWidget(self._drop_zone, 1)
+        self._btn_clip = QPushButton("  📷  从剪贴板 / 截图")
+        self._btn_clip.setIcon(icon("icon_screenshot.png", 20)); self._btn_clip.setIconSize(QSize(20, 20))
+        self._btn_clip.setCursor(Qt.PointingHandCursor); self._btn_clip.setObjectName("holoPrimary"); self._btn_clip.setMinimumHeight(36)
+        self._btn_clip.clicked.connect(self._load_from_clipboard)
+        self._btn_file = QPushButton("  📂  选择图片文件")
+        self._btn_file.setIcon(icon("icon_upload.png", 20)); self._btn_file.setIconSize(QSize(20, 20))
+        self._btn_file.setCursor(Qt.PointingHandCursor); self._btn_file.setMinimumHeight(36)
+        self._btn_file.clicked.connect(self._load_from_file)
+        btns.addWidget(self._btn_clip); btns.addWidget(self._btn_file); dz.addLayout(btns)
+        root.addWidget(self._drop_zone, 2)
+
+        # 输出区：LLM 视觉分析结果
+        ol = QHBoxLayout(); ol.setSpacing(8); ol.setAlignment(Qt.AlignVCenter)
+        lt = QLabel("📤  分析结果："); lt.setStyleSheet(f"background:transparent;color:{_THEME['primary_dark']}; font-weight:800;")
+        ol.addWidget(lt); ol.addStretch(1)
+        cb = QPushButton("  📋  复制"); cb.setIcon(icon("icon_import.png", 14)); cb.setIconSize(QSize(14, 14))
+        cb.setCursor(Qt.PointingHandCursor)
+        cb.clicked.connect(lambda: (QApplication.clipboard().setText(self._out.toPlainText()),
+                                    QMessageBox.information(self._parent_dialog, "✅", "赫萝：已复制到剪贴板 🍎")))
+        ol.addWidget(cb); root.addLayout(ol)
+        self._out = QPlainTextEdit()
+        self._out.setReadOnly(True)
+        self._out.setPlaceholderText("（把图片扔给赫萝，她的视觉分析结果会显示在这里哦~）")
+        self._out.setMinimumHeight(150)
+        root.addWidget(self._out, 1)
+
+    # ---- 图片加载入口 ----
+    def _set_image(self, qpm: QPixmap):
+        """统一入口：接收 QPixmap → 显示缩略图 → 发送给 LLM 分析。"""
+        if qpm.isNull():
+            QMessageBox.warning(self._parent_dialog, "图片无效",
+                                "赫萝：这张图片咱看不了呀~ 换一张试试？ 🍎")
+            return
+        self._current_pixmap = qpm
+        # 缩略图等比缩放到拖拽区内（替换原来的大图标）
+        thumb = qpm.scaled(360, 220, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self._thumb_label.setPixmap(thumb)
+        self._drop_hint.setText("已加载图片，赫萝正在看哦~ 👀")
+        self._run_image_llm()
+
+    def _load_from_clipboard(self):
+        """从系统剪贴板获取图片（截图 / 复制的图片）。"""
+        cb = QApplication.clipboard()
+        qpm = cb.pixmap()
+        if qpm.isNull():
+            # 部分平台 pixmap() 取不到，回退用 image()
+            img = cb.image()
+            if not img.isNull():
+                qpm = QPixmap.fromImage(img)
+        if qpm.isNull():
+            QMessageBox.information(self._parent_dialog, "剪贴板无图片",
+                                    "赫萝：剪贴板里没有图片呀~\n先截图（Win+Shift+S / PrintScreen）或复制一张图再来~ 🍎")
+            return
+        self._set_image(qpm)
+
+    def _load_from_file(self):
+        """文件对话框选择图片文件。"""
+        path, _ = QFileDialog.getOpenFileName(
+            self._parent_dialog, "选择图片", "",
+            "图片文件 (*.png *.jpg *.jpeg *.bmp *.gif *.webp);;所有文件 (*.*)"
+        )
+        if not path:
+            return
+        qpm = QPixmap(path)
+        if qpm.isNull():
+            QMessageBox.warning(self._parent_dialog, "图片加载失败",
+                                f"赫萝：这个文件打不开呀~\n{path}")
+            return
+        self._set_image(qpm)
 
     # ---- 拖拽高亮 ----
     def dragEnterEvent(self, e):
@@ -673,10 +769,137 @@ class _ImageAnalysisPage(QFrame):
         )
     def dropEvent(self, e):
         self.dragLeaveEvent(e)
-        QMessageBox.information(
-            self._parent_dialog, "Stub：未来 OCR + VLM 识别",
-            "赫萝：收到图片 🍎\n\n（Stub：下一阶段调 OCR + VLM 识别，识别结果直接转成「找图/点击」的蓝图节点。）"
+        md = e.mimeData()
+        qpm = QPixmap()
+        # 优先取内嵌图像数据
+        if md.hasImage():
+            img = QImage(md.imageData())
+            if not img.isNull():
+                qpm = QPixmap.fromImage(img)
+        # 再尝试 URL（本地文件拖入）
+        if qpm.isNull() and md.hasUrls():
+            for url in md.urls():
+                if url.isLocalFile():
+                    qpm = QPixmap(url.toLocalFile())
+                    if not qpm.isNull():
+                        break
+        if qpm.isNull():
+            QMessageBox.information(self._parent_dialog, "图片无效",
+                                    "赫萝：拖进来的不是图片呀~ 支持 PNG / JPG / BMP 哦 🍎")
+            return
+        self._set_image(qpm)
+
+    # ---- LLM 视觉分析 ----
+    def _image_to_base64(self, qpm: QPixmap) -> str:
+        """QPixmap → QImage → QByteArray → base64 字符串。"""
+        from PySide6.QtCore import QBuffer, QIODevice
+        img = qpm.toImage()  # QPixmap → QImage
+        ba = QByteArray()    # QImage → QByteArray
+        buf = QBuffer(ba)
+        buf.open(QIODevice.WriteOnly)
+        img.save(buf, "PNG")
+        buf.close()
+        return bytes(ba.toBase64()).decode("ascii")  # → base64
+
+    def _set_buttons_enabled(self, enabled: bool):
+        self._btn_clip.setEnabled(enabled)
+        self._btn_file.setEnabled(enabled)
+
+    def _run_image_llm(self):
+        """构造 vision messages 并启动 ChatWorker（流式输出）。"""
+        from src.blueprint.llm.llm_worker import ChatWorker
+        from src.blueprint.llm import prompt_builder
+
+        qpm = self._current_pixmap
+        if qpm is None or qpm.isNull():
+            return
+
+        # 上一次还在跑 → 断开旧信号并取消，避免串流
+        if self._img_worker is not None and self._img_worker.isRunning():
+            try:
+                self._img_worker.chunk_received.disconnect()
+                self._img_worker.finished.disconnect()
+                self._img_worker.error.disconnect()
+            except Exception:
+                pass
+            self._img_worker.cancel()
+
+        # 缩放到合理尺寸，避免 base64 体积过大
+        src = qpm
+        max_side = 1024
+        if src.width() > max_side or src.height() > max_side:
+            src = src.scaled(max_side, max_side, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        try:
+            b64 = self._image_to_base64(src)
+        except Exception as exc:
+            QMessageBox.warning(self._parent_dialog, "图片编码失败",
+                                f"赫萝：图片转码失败啦~\n{exc}")
+            return
+
+        # 系统提示词：复用自由聊天人设 + 追加视觉分析指令
+        sys_prompt = prompt_builder.build_chat_prompt(_get_preset())
+        sys_prompt += (
+            "\n\n附加指令：请分析这张截图，识别其中的按钮、文字、UI元素，"
+            "帮助用户理解画面内容。"
         )
+        # OpenAI vision content 列表格式：text + image_url
+        user_content = [
+            {"type": "text",
+             "text": "请分析这张截图，识别其中的按钮、文字、UI元素，帮助用户理解画面内容。"},
+            {"type": "image_url",
+             "image_url": {"url": f"data:image/png;base64,{b64}"}},
+        ]
+        messages = [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": user_content},
+        ]
+
+        self._img_streaming = "赫萝正在看图…"
+        self._out.setPlainText(self._img_streaming)
+        self._set_buttons_enabled(False)
+        try:
+            self._parent_dialog.thinking_changed.emit("thinking")
+        except Exception:
+            pass
+
+        self._img_worker = ChatWorker(messages, stream=True, parent=self)
+        self._img_worker.chunk_received.connect(self._on_img_chunk)
+        self._img_worker.finished.connect(self._on_img_finished)
+        self._img_worker.error.connect(self._on_img_error)
+        self._img_worker.start()
+
+    def _on_img_chunk(self, chunk: str):
+        if self._img_streaming == "赫萝正在看图…":
+            self._img_streaming = chunk
+        else:
+            self._img_streaming += chunk
+        self._out.setPlainText(self._img_streaming)
+
+    def _on_img_finished(self, full_text: str):
+        self._set_buttons_enabled(True)
+        try:
+            self._parent_dialog.thinking_changed.emit("idle")
+        except Exception:
+            pass
+        self._out.setPlainText(full_text)
+        self._img_streaming = ""
+        self._drop_hint.setText("分析完成~ 再扔一张图给咱看看？ 🍎")
+
+    def _on_img_error(self, err_msg: str):
+        self._set_buttons_enabled(True)
+        try:
+            self._parent_dialog.thinking_changed.emit("idle")
+        except Exception:
+            pass
+        self._out.setPlainText(
+            f"分析失败：{err_msg}\n\n"
+            f"小提示：\n"
+            f"· 如果是模型不支持视觉，请在「助手设置」中切换支持视觉的模型\n"
+            f"  （如 GPT-4o / Claude 3.5 Sonnet / Gemini 等）后重试。\n"
+            f"· 如果是图片格式问题，请换一张 PNG / JPG 截图试试。"
+        )
+        self._img_streaming = ""
+        self._drop_hint.setText("分析出错了，再试试？ 🍎")
 
 
 # =====================================================================
@@ -700,31 +923,34 @@ class _GameAssistPage(QFrame):
         root.addLayout(hl)
 
         # 4 卡片（2x2 Grid）
+        # 每张卡片点击后切换到「自由聊天」Tab，并把预填文本塞进输入框；
+        # prefill 为空串时仅切换并聚焦输入框，等用户手动输入（如「攻略问答」）。
+        # 发送流程复用聊天 Tab 的 btn_send，本页不直接调 LLM。
         grid = QGridLayout(); grid.setSpacing(14); grid.setContentsMargins(0, 4, 0, 0)
         cards = [
             ("icon_history.png", "📜  游戏攻略问答",
              "问赫萝任何游戏攻略，她会整理成「操作步骤清单」",
              "攻略问答",
-             "赫萝：唔姆~ 把你想问的游戏攻略告诉咱，咱帮你整理成清晰的步骤清单~\n\n（Stub：下一阶段接 LLM，攻略问答直接在聊天页展开。）🍎"),
+             ""),
             ("icon_code.png",    "🔧  游戏问题诊断",
              "游戏卡顿/崩溃/黑屏/网络延迟？赫萝帮你排查",
              "问题诊断",
-             "赫萝：唔…游戏出问题了？把现象告诉咱，咱帮你找原因~\n\n（Stub：下一阶段接 LLM，根据描述给出排查建议。）🍎"),
+             "我的游戏遇到了问题：[请描述你的问题现象，赫萝帮你排查]"),
             ("icon_chat.png",    "📰  游戏资讯速递",
              "版本更新/活动公告/新闻速报，赫萝帮你整理",
              "资讯速递",
-             "赫萝：唔姆~ 想知道最近有什么游戏新闻？咱帮你整理~\n\n（Stub：下一阶段接资讯源，自动推送最新消息。）🍎"),
+             "最近有什么值得关注的游戏新闻、版本更新或活动公告吗？"),
             ("icon_game.png",    "🎲  游戏推荐",
              "告诉赫萝你的喜好，她帮你挑下一款玩什么",
              "游戏推荐",
-             "赫萝：唔姆~ 不知道玩什么好？告诉咱你喜欢什么类型的，咱给你推荐~\n\n（Stub：下一阶段接 LLM，根据喜好推荐游戏。）🍎"),
+             "我喜欢玩[请填写你喜欢的游戏类型]，帮我推荐几款类似的游戏"),
         ]
-        for i, (icn, title, desc, key, stub) in enumerate(cards):
+        for i, (icn, title, desc, key, prefill) in enumerate(cards):
             r, c = divmod(i, 2)
-            grid.addWidget(self._make_card(icn, title, desc, key, stub), r, c)
+            grid.addWidget(self._make_card(icn, title, desc, key, prefill), r, c)
         root.addLayout(grid, 1)
 
-    def _make_card(self, icn: str, title: str, desc: str, key: str, stub: str) -> QFrame:
+    def _make_card(self, icn: str, title: str, desc: str, key: str, prefill: str) -> QFrame:
         f = QFrame(); f.setObjectName("holoCard"); f.setCursor(Qt.PointingHandCursor)
         f.setStyleSheet(
             f"#holoCard {{ background:{_THEME['bg_card']}; border:1px solid {_THEME['border']};"
@@ -743,11 +969,35 @@ class _GameAssistPage(QFrame):
         tc.addWidget(d); h.addLayout(tc, 1); v.addLayout(h)
         go = QPushButton(f"  打开 {key}  →"); go.setObjectName("holoSuccess"); go.setCursor(Qt.PointingHandCursor)
         go.setIcon(icon("icon_import.png", 16)); go.setIconSize(QSize(16, 16)); go.setMinimumHeight(32)
-        go.clicked.connect(lambda _=False, k=key, s=stub: QMessageBox.information(
-            self._parent_dialog, f"Stub：{k} ✨", s
-        ))
+        go.clicked.connect(lambda _=False, p=prefill: self._open_in_chat(p))
         v.addWidget(go)
         return f
+
+    def _open_in_chat(self, prefill: str = "") -> None:
+        """切换到「自由聊天」Tab，按需预填问题文本并聚焦输入框。
+
+        复用 FullChatDialog 的聊天发送流程：用户编辑/确认后按回车或点击
+        btn_send 即可触发 LLM 调用，本页不直接调 LLM。
+        """
+        dlg = self._parent_dialog
+        # 切换到「自由聊天」Tab（QStackedWidget index 0），并同步左侧侧栏选中态
+        if hasattr(dlg, "_switch_tab"):
+            dlg._switch_tab("chat")  # 内部会 setCurrentIndex(0) 并聚焦 ed_input
+        elif getattr(dlg, "_stack", None) is not None:
+            dlg._stack.setCurrentIndex(0)
+        side = getattr(dlg, "_side_buttons", {}).get("chat")
+        if side is not None:
+            side.setChecked(True)
+        # 预填问题文本（空串 = 仅切换并聚焦，等用户手动输入）
+        ed = getattr(dlg, "ed_input", None)
+        if ed is not None:
+            ed.setPlainText(prefill or "")
+            try:
+                ed.setFocus(Qt.OtherFocusReason)
+                # 光标移到末尾，方便用户接着编辑模板里的占位符
+                ed.setTextCursor(ed.document().end())
+            except Exception:
+                pass
 
 
 # =====================================================================
@@ -774,18 +1024,18 @@ class _CodeAssistPage(QFrame):
 
         # 3 个赫萝按钮
         btn_row = QHBoxLayout(); btn_row.setSpacing(10)
-        b_bug = QPushButton("  �  查找 Bug"); b_bug.setObjectName("holoPrimary"); b_bug.setCursor(Qt.PointingHandCursor); b_bug.setMinimumHeight(34)
-        b_bug.setIcon(icon("icon_code.png", 18)); b_bug.setIconSize(QSize(18,18))
-        b_exp = QPushButton("  💡  解释代码"); b_exp.setCursor(Qt.PointingHandCursor); b_exp.setMinimumHeight(34)
-        b_exp.setIcon(icon("icon_chat.png", 18)); b_exp.setIconSize(QSize(18,18))
-        b_ref = QPushButton("  🪄  重构风格"); b_ref.setCursor(Qt.PointingHandCursor); b_ref.setMinimumHeight(34)
-        b_ref.setIcon(icon("icon_retry.png", 18)); b_ref.setIconSize(QSize(18,18))
-        for b in (b_bug, b_exp, b_ref):
-            b.clicked.connect(lambda _=False, x=b.text(): QMessageBox.information(
-                self._parent_dialog, f"Stub：{x.strip()}",
-                f"赫萝：唔姆~ 代码分析功能马上就好啦~\n\n（Stub：下一阶段接 AST，{x.strip()}结果会写在下面输出框。）🍎"
-            ))
-        btn_row.addWidget(b_bug); btn_row.addWidget(b_exp); btn_row.addWidget(b_ref); btn_row.addStretch(1)
+        self._btn_code_bug = QPushButton("  \U0001F41B  查找 Bug"); self._btn_code_bug.setObjectName("holoPrimary"); self._btn_code_bug.setCursor(Qt.PointingHandCursor); self._btn_code_bug.setMinimumHeight(34)
+        self._btn_code_bug.setIcon(icon("icon_code.png", 18)); self._btn_code_bug.setIconSize(QSize(18,18))
+        self._btn_code_exp = QPushButton("  \U0001F4A1  解释代码"); self._btn_code_exp.setCursor(Qt.PointingHandCursor); self._btn_code_exp.setMinimumHeight(34)
+        self._btn_code_exp.setIcon(icon("icon_chat.png", 18)); self._btn_code_exp.setIconSize(QSize(18,18))
+        self._btn_code_ref = QPushButton("  \U0001FA84  重构风格"); self._btn_code_ref.setCursor(Qt.PointingHandCursor); self._btn_code_ref.setMinimumHeight(34)
+        self._btn_code_ref.setIcon(icon("icon_retry.png", 18)); self._btn_code_ref.setIconSize(QSize(18,18))
+        self._btn_code_bug.clicked.connect(lambda: self._run_code_llm("bug"))
+        self._btn_code_exp.clicked.connect(lambda: self._run_code_llm("explain"))
+        self._btn_code_ref.clicked.connect(lambda: self._run_code_llm("refactor"))
+        self._code_worker = None
+        self._code_streaming = ""
+        btn_row.addWidget(self._btn_code_bug); btn_row.addWidget(self._btn_code_exp); btn_row.addWidget(self._btn_code_ref); btn_row.addStretch(1)
         root.addLayout(btn_row)
 
         # 代码框
@@ -810,6 +1060,69 @@ class _CodeAssistPage(QFrame):
         self._out.setMinimumHeight(150)
         root.addWidget(self._out, 1)
 
+    def _run_code_llm(self, action: str):
+        """代码助手 LLM 调用。"""
+        code = self._code.toPlainText().strip()
+        if not code:
+            QMessageBox.information(self._parent_dialog, "提示", "赫萝：先贴点代码给咱看看嘛~")
+            return
+        from src.blueprint.llm.llm_worker import ChatWorker
+        from src.blueprint.llm import prompt_builder
+
+        action_text = {"bug": "请检查以下代码中的 Bug 和潜在问题，逐条列出：",
+                       "explain": "请解释以下代码的功能和逻辑：",
+                       "refactor": "请重构以下代码，提升可读性和性能，并说明改动点："}
+        user_msg = action_text.get(action, "请分析以下代码：") + "\n\n```\n" + code + "\n```"
+
+        sys_prompt = prompt_builder.build_code_prompt(_get_preset())
+        messages = [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": user_msg},
+        ]
+
+        self._code_streaming = "赫萝正在分析代码…"
+        self._out.setPlainText(self._code_streaming)
+        for btn in (self._btn_code_bug, self._btn_code_exp, self._btn_code_ref):
+            btn.setEnabled(False)
+
+        try:
+            self._parent_dialog.thinking_changed.emit("thinking")
+        except Exception:
+            pass
+
+        self._code_worker = ChatWorker(messages, stream=True, parent=self)
+        self._code_worker.chunk_received.connect(self._on_code_chunk)
+        self._code_worker.finished.connect(self._on_code_finished)
+        self._code_worker.error.connect(self._on_code_error)
+        self._code_worker.start()
+
+    def _on_code_chunk(self, chunk: str):
+        if self._code_streaming == "赫萝正在分析代码…":
+            self._code_streaming = chunk
+        else:
+            self._code_streaming += chunk
+        self._out.setPlainText(self._code_streaming)
+
+    def _on_code_finished(self, full_text: str):
+        for btn in (self._btn_code_bug, self._btn_code_exp, self._btn_code_ref):
+            btn.setEnabled(True)
+        try:
+            self._parent_dialog.thinking_changed.emit("idle")
+        except Exception:
+            pass
+        self._out.setPlainText(full_text)
+        self._code_streaming = ""
+
+    def _on_code_error(self, err_msg: str):
+        for btn in (self._btn_code_bug, self._btn_code_exp, self._btn_code_ref):
+            btn.setEnabled(True)
+        try:
+            self._parent_dialog.thinking_changed.emit("idle")
+        except Exception:
+            pass
+        self._out.setPlainText(f"分析失败：{err_msg}")
+        self._code_streaming = ""
+
 
 # =====================================================================
 # Tab 7: 对话历史专属页（§1.1 #7 QListWidget 会话列表 + 每行两按钮）
@@ -832,31 +1145,32 @@ class _HistoryPage(QFrame):
         # 顶部功能按钮
         clr = QPushButton(" 清空历史"); clr.setIcon(icon("icon_clear.png", 16)); clr.setIconSize(QSize(16,16))
         clr.setCursor(Qt.PointingHandCursor)
-        clr.clicked.connect(lambda: QMessageBox.question(
-            self._parent_dialog, "⚠", "确定要清空所有历史会话吗？",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
-        ))
+        clr.clicked.connect(self._clear_all_sessions)
         hl.addWidget(clr); root.addLayout(hl)
 
         # 会话列表
         self._list = QListWidget(); self._list.setSpacing(6)
         root.addWidget(self._list, 1)
 
-        samples = [
-            ("2026-07-05 14:23", "帮我写日常任务蓝图（启动记事本+延时+输入Hello）"),
-            ("2026-07-05 10:08", "分析启动按钮截图，生成找图点击蓝图"),
-            ("2026-07-04 22:41", "原神每秒点击左键 10 次的连点宏"),
-            ("2026-07-04 18:15", "重构一段 Python 蓝图 JSON 结构"),
-            ("2026-07-03 09:02", "代码解释：QThread worker 的 moveToThread 用法"),
-        ]
-        for time_str, title in samples:
-            self._add_row(time_str, title)
+        # 从 ConversationStore 加载真实会话
+        from src.blueprint.llm.conversation_store import ConversationStore
+        store = ConversationStore()
+        all_sessions = store.list_sessions()
+        if all_sessions:
+            samples = [(s.get("title", "未命名"), s.get("type", "chat"),
+                        s.get("updated_at", ""), s.get("id", ""))
+                       for s in all_sessions[:20]]
+        else:
+            samples = []  # 空列表，不显示假数据
+        for title, sess_type, time_str, sess_id in samples:
+            self._add_row(time_str, title, sess_type, sess_id)
 
         # 底栏统计
         stat = QLabel(f"共 {len(samples)} 条会话 · 最近 7 天"); stat.setStyleSheet(f"background:transparent;color:{_THEME['text_sub']}; font-size:12px;")
         root.addWidget(stat)
 
-    def _add_row(self, time_str: str, title: str):
+    def _add_row(self, time_str: str, title: str, sess_type: str = "chat",
+                 sess_id: str = ""):
         item = QListWidgetItem()
         item.setSizeHint(QSize(0, 72))
         self._list.addItem(item)
@@ -871,26 +1185,50 @@ class _HistoryPage(QFrame):
         # 左：日期小图标 + 时间+标题
         pm = pixmap("icon_history.png", 32); a = QLabel(); a.setPixmap(pm); a.setFixedSize(32,32); h.addWidget(a)
         mid = QVBoxLayout(); mid.setSpacing(2)
-        t1 = QLabel(time_str); t1.setStyleSheet(f"background:transparent;color:{_THEME['text_sub']}; font-size:11px;")
+        type_tag = "蓝图生成" if sess_type == "blueprint" else "自由聊天"
+        t1 = QLabel(f"[{type_tag}]  {time_str}"); t1.setStyleSheet(f"background:transparent;color:{_THEME['text_sub']}; font-size:11px;")
         t2 = QLabel(title); t2.setWordWrap(True)
         t2.setStyleSheet(f"background:transparent;color:{_THEME['text_main']}; font-size:13px; font-weight:600;")
         mid.addWidget(t1); mid.addWidget(t2); h.addLayout(mid, 1)
         # 右：两按钮
         go = QPushButton("继续对话"); go.setObjectName("holoSuccess"); go.setCursor(Qt.PointingHandCursor)
         go.setIcon(icon("icon_chat.png", 14)); go.setIconSize(QSize(14,14)); go.setMinimumHeight(28)
-        go.clicked.connect(lambda _=False, t=title: QMessageBox.information(
-            self._parent_dialog, f"Stub：继续对话「{t[:22]}…」",
-            "赫萝：唔姆~ 让我看看上次聊到哪啦~\n\n（Stub：下一阶段从磁盘 JSON 读对应会话上下文，填入聊天列表。）🍎"
-        ))
+        go.clicked.connect(lambda _=False, st=sess_type, sid=sess_id: self._parent_dialog._load_history_session(st, sid))
         dl = QPushButton(); dl.setIcon(icon("icon_clear.png", 14)); dl.setIconSize(QSize(14,14))
         dl.setFixedSize(32, 28); dl.setCursor(Qt.PointingHandCursor)
         dl.setToolTip("删除这次会话")
-        dl.clicked.connect(lambda _=False, it=item: (
-            QMessageBox.question(self._parent_dialog, "删除会话？", f"确定删除这次会话吗？",
-                                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No),
-        ))
+        dl.clicked.connect(lambda _=False, sid=sess_id, it=item: self._on_delete_session(sid, it))
         h.addWidget(go); h.addWidget(dl)
         self._list.setItemWidget(item, w)
+
+    def _on_delete_session(self, sess_id: str, item):
+        """删除一条历史会话（先确认，再从磁盘和列表移除）。"""
+        r = QMessageBox.question(
+            self._parent_dialog, "删除会话？", "确定删除这次会话吗？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        if r != QMessageBox.Yes:
+            return
+        from src.blueprint.llm.conversation_store import ConversationStore
+        store = ConversationStore()
+        store.delete_session(sess_id)
+        row = self._list.row(item)
+        if row >= 0:
+            self._list.takeItem(row)
+
+    def _clear_all_sessions(self):
+        """清空全部历史会话。"""
+        r = QMessageBox.question(
+            self._parent_dialog, "⚠", "确定要清空所有历史会话吗？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        if r != QMessageBox.Yes:
+            return
+        from src.blueprint.llm.conversation_store import ConversationStore
+        store = ConversationStore()
+        for s in store.list_sessions():
+            store.delete_session(s.get("id", ""))
+        self._list.clear()
 
 
 # =====================================================================
@@ -949,6 +1287,8 @@ class FullChatDialog(QDialog):
     """赫萝风格通用助手完整对话大窗口。"""
 
     message_sent = Signal(str)
+    thinking_changed = Signal(str)  # "thinking"=开始思考, "idle"=结束
+    blueprint_imported = Signal(dict)  # 蓝图 JSON 导入信号
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent, Qt.Window | Qt.WindowCloseButtonHint | Qt.WindowMinimizeButtonHint)
@@ -959,6 +1299,17 @@ class FullChatDialog(QDialog):
         self.setMinimumSize(820, 540)
         self.setStyleSheet(_QSS)
         self._side_buttons: dict[str, QPushButton] = {}
+        self._chat_worker = None
+        self._bp_worker = None
+        self._streaming_bubble = None  # 流式输出中的 assistant 气泡
+        self._streaming_text = ""      # 流式累积文本
+        self._bp_streaming_bubble = None
+        self._bp_streaming_text = ""
+        self._last_bp_user_text = ""  # 上次蓝图请求文本（重写用）
+        from src.blueprint.llm.conversation_store import ConversationStore
+        self._conv_store = ConversationStore()
+        self._current_chat_sess_id = None
+        self._current_bp_sess_id = None
         self._build_ui()
         self._append_welcome()
 
@@ -1291,6 +1642,9 @@ class FullChatDialog(QDialog):
         self._menu_bp_history = QMenu(self.btn_bp_history)
         self._build_bp_history_menu(self._menu_bp_history)
         self.btn_bp_history.setMenu(self._menu_bp_history)
+        # 打开下拉前刷新，确保能看到最新存档的会话
+        self._menu_bp_history.aboutToShow.connect(
+            lambda m=self._menu_bp_history: self._build_bp_history_menu(m))
         tl.addWidget(self.btn_bp_history)
 
         v.addWidget(topbar)
@@ -1479,6 +1833,21 @@ class FullChatDialog(QDialog):
         list_w.setItemWidget(item, bubble)
         QTimer.singleShot(20, lambda: list_w.scrollToBottom())
 
+    def _append_chat_msg_ex(self, role: str, text: str) -> ChatBubble:
+        """追加消息并返回 bubble 引用（用于流式更新）。"""
+        list_w = self.list_msg
+        bubble_w = max(400, list_w.width() - 30)
+        bubble = ChatBubble(role, text, mode="chat")
+        bubble.update_bubble_width(bubble_w)
+        bubble.adjustSize()
+        sh = bubble.sizeHint()
+        item = QListWidgetItem()
+        item.setSizeHint(QSize(bubble_w, max(74, sh.height())))
+        list_w.addItem(item)
+        list_w.setItemWidget(item, bubble)
+        QTimer.singleShot(20, lambda: list_w.scrollToBottom())
+        return bubble
+
     def get_chat_messages(self):
         """返回自由聊天 Tab 的所有 (role, text) 对，供外部同步（如 QuickChatBubble）。"""
         out = []
@@ -1503,6 +1872,24 @@ class FullChatDialog(QDialog):
         list_w.setItemWidget(item, bubble)
         QTimer.singleShot(20, lambda: list_w.scrollToBottom())
 
+    def _append_bp_msg_ex(self, role: str, text: str) -> ChatBubble:
+        """追加蓝图消息并返回 bubble 引用（用于流式更新）。"""
+        list_w = self.list_bp
+        bubble_w = max(400, list_w.width() - 30)
+        bubble = ChatBubble(role, text, mode="blueprint")
+        bubble.update_bubble_width(bubble_w)
+        bubble.adjustSize()
+        sh = bubble.sizeHint()
+        item = QListWidgetItem()
+        item.setSizeHint(QSize(bubble_w, max(74, sh.height())))
+        list_w.addItem(item)
+        list_w.setItemWidget(item, bubble)
+        # 接线导入/重写按钮
+        bubble.import_clicked.connect(lambda b=bubble: self._on_bp_import(b))
+        bubble.retry_clicked.connect(lambda b=bubble: self._on_bp_retry(b))
+        QTimer.singleShot(20, lambda: list_w.scrollToBottom())
+        return bubble
+
     # =================================================================
     # 打桩事件
     # =================================================================
@@ -1515,7 +1902,87 @@ class FullChatDialog(QDialog):
         self.message_sent.emit(text)
         self.btn_send.setEnabled(False)
         self.btn_send.setToolTip("赫萝正在思考…")
-        QTimer.singleShot(450, lambda: self._mock_reply(text))
+        self._start_chat_llm(text)
+
+    def _start_chat_llm(self, user_text: str):
+        """启动自由聊天 LLM 调用。"""
+        from src.blueprint.llm.llm_worker import ChatWorker
+        from src.blueprint.llm import prompt_builder
+
+        # 构建消息列表
+        sys_prompt = prompt_builder.build_chat_prompt(_get_preset(), user_query=user_text)
+        history = self.get_chat_messages()
+        messages = [{"role": "system", "content": sys_prompt}]
+        for role, text in history:
+            if role == "user":
+                messages.append({"role": "user", "content": text})
+            elif role == "assistant":
+                messages.append({"role": "assistant", "content": text})
+
+        # 创建占位气泡（流式更新）
+        self._streaming_text = "赫萝正在思考…"
+        self._streaming_bubble = self._append_chat_msg_ex("assistant", self._streaming_text)
+
+        # 启动 worker
+        self.thinking_changed.emit("thinking")
+        self._chat_worker = ChatWorker(messages, stream=True, parent=self)
+        self._chat_worker.chunk_received.connect(self._on_chat_chunk)
+        self._chat_worker.finished.connect(self._on_chat_finished)
+        self._chat_worker.error.connect(self._on_chat_error)
+        self._chat_worker.start()
+
+    def _on_chat_chunk(self, chunk: str):
+        """流式回调：逐 chunk 更新气泡。"""
+        if self._streaming_bubble is None:
+            return
+        if self._streaming_text == "赫萝正在思考…":
+            self._streaming_text = chunk
+        else:
+            self._streaming_text += chunk
+        self._streaming_bubble.update_text(self._streaming_text)
+
+    def _on_chat_finished(self, full_text: str):
+        """LLM 完成。"""
+        self.btn_send.setEnabled(True)
+        self.btn_send.setToolTip("发送给赫萝 🍎")
+        self.thinking_changed.emit("idle")
+        if self._streaming_bubble is not None:
+            self._streaming_bubble.update_text(full_text)
+            self._streaming_bubble = None
+        self._streaming_text = ""
+        # 结果卡片
+        try:
+            card_layout = self.result_card.findChild(QVBoxLayout)
+            if card_layout is not None and card_layout.count() >= 2:
+                w = card_layout.itemAt(1).widget()
+                if isinstance(w, QLabel):
+                    w.setText(
+                        f"🗒 类型：自由回复 &nbsp; 回复字数：{len(full_text)} 字<br>"
+                        f"<span style='color:{_THEME['text_sub']};'>💡 提示：可复制回复内容，或在下方继续对话。</span>"
+                    )
+        except Exception:
+            pass
+        self.result_card.show()
+        # 自动保存会话（受 remember_ctx 记忆开关控制）
+        try:
+            from src.config.user_settings import get_llm_memory
+            mem = get_llm_memory()
+            if mem.get("remember_ctx", True):
+                history = self.get_chat_messages()
+                msgs = [{"role": r, "content": t} for r, t in history]
+                self._current_chat_sess_id = self._conv_store.auto_save_current("chat", msgs)
+        except Exception:
+            pass
+
+    def _on_chat_error(self, err_msg: str):
+        """LLM 调用失败。"""
+        self.btn_send.setEnabled(True)
+        self.btn_send.setToolTip("发送给赫萝 🍎")
+        self.thinking_changed.emit("idle")
+        if self._streaming_bubble is not None:
+            self._streaming_bubble.update_text(f"呜……出了点问题：\n\n{err_msg}")
+            self._streaming_bubble = None
+        self._streaming_text = ""
 
     def _mock_reply(self, user_text: str):
         self.btn_send.setEnabled(True)
@@ -1555,23 +2022,277 @@ class FullChatDialog(QDialog):
         self.ed_bp_input.clear()
         self.btn_bp_send.setEnabled(False)
         self.btn_bp_send.setToolTip("赫萝正在生成蓝图草稿…")
-        QTimer.singleShot(500, lambda: self._mock_bp_reply(text))
+        self._start_bp_llm(text)
 
-    def _mock_bp_reply(self, user_text: str):
+    def _start_bp_llm(self, user_text: str):
+        """启动蓝图生成 LLM 调用。"""
+        from src.blueprint.llm.llm_worker import ChatWorker
+        from src.blueprint.llm import prompt_builder
+
+        self._last_bp_user_text = user_text
+        sys_prompt = prompt_builder.build_blueprint_prompt(_get_preset(), user_query=user_text)
+        messages = [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": user_text},
+        ]
+
+        # 占位气泡
+        self._bp_streaming_text = "赫萝正在生成蓝图…"
+        self._bp_streaming_bubble = self._append_bp_msg_ex("assistant", self._bp_streaming_text)
+
+        self.thinking_changed.emit("thinking")
+        self._bp_worker = ChatWorker(messages, stream=True, parent=self)
+        self._bp_worker.chunk_received.connect(self._on_bp_chunk)
+        self._bp_worker.finished.connect(self._on_bp_finished)
+        self._bp_worker.error.connect(self._on_bp_error)
+        self._bp_worker.start()
+
+    def _on_bp_chunk(self, chunk: str):
+        if self._bp_streaming_bubble is None:
+            return
+        if self._bp_streaming_text == "赫萝正在生成蓝图…":
+            self._bp_streaming_text = chunk
+        else:
+            self._bp_streaming_text += chunk
+        self._bp_streaming_bubble.update_text(self._bp_streaming_text)
+
+    def _on_bp_finished(self, full_text: str):
         self.btn_bp_send.setEnabled(True)
         self.btn_bp_send.setToolTip("发送蓝图需求给赫萝 📋")
-        self._append_bp_msg(
-            "assistant",
-            f"唔姆~ 你的蓝图需求收到啦：『{user_text[:24]}{'…' if len(user_text)>24 else ''}』\n\n"
-            f"咱按蓝图专用规范生成草稿：\n"
-            f"  · 节点 1（Start）：入口\n"
-            f"  · 节点 2（OpenApp）：打开记事本 notepad.exe\n"
-            f"  · 节点 3（Wait）：等待 2 秒\n"
-            f"  · 节点 4（PressKey）：输入 Hello 并回车\n"
-            f"  · 节点 5（CloseApp）：关闭记事本窗口\n\n"
-            f"（Stub：真实接入后这里会显示可折叠的节点树 + JSON 预览，支持逐节点修改。）"
-        )
+        self.thinking_changed.emit("idle")
+        if self._bp_streaming_bubble is not None:
+            self._bp_streaming_bubble.update_text(full_text)
+            self._bp_streaming_bubble = None
+        self._bp_streaming_text = ""
         self.result_bp_card.show()
+
+        # 蓝图校验闭环：解析 JSON → 校验 → 失败自动重试
+        bp_json = self._extract_bp_json(full_text)
+        if bp_json is not None:
+            # R1 JSON 解析成功 → R2+R3 结构校验
+            errors = self._validate_bp_json(bp_json)
+            if errors:
+                # 校验失败，尝试自动修复
+                self._bp_attempt = getattr(self, "_bp_attempt", 0) + 1
+                max_attempts = self._get_bp_max_attempts()
+                if self._bp_attempt < max_attempts:
+                    # 自动重试：把错误信息反馈给 LLM
+                    self._retry_bp_with_errors(full_text, errors)
+                    return
+                else:
+                    # 超过最大重试次数，告知用户
+                    err_summary = "\n".join(f"  · {e}" for e in errors[:5])
+                    self._append_bp_msg_ex(
+                        "assistant",
+                        f"⚠️ 蓝图校验未通过（已尝试 {self._bp_attempt} 次）：\n\n{err_summary}\n\n"
+                        f"可以点击「重试」让赫萝再试一次，或修改需求描述后重新发送。"
+                    )
+            else:
+                # 校验通过，绑定 JSON 到最后一条气泡
+                self._bind_bp_json_to_last_bubble(bp_json)
+        # 重置重试计数
+        self._bp_attempt = 0
+
+        # 自动保存会话（受 remember_ctx 记忆开关控制）
+        try:
+            from src.config.user_settings import get_llm_memory
+            mem = get_llm_memory()
+            if mem.get("remember_ctx", True):
+                bp_msgs = []
+                for i in range(self.list_bp.count()):
+                    item = self.list_bp.item(i)
+                    w = self.list_bp.itemWidget(item)
+                    if w is not None and hasattr(w, "_role") and hasattr(w, "_text"):
+                        bp_msgs.append({"role": w._role, "content": w._text})
+                self._current_bp_sess_id = self._conv_store.auto_save_current("blueprint", bp_msgs)
+        except Exception:
+            pass
+
+    def _get_bp_max_attempts(self) -> int:
+        """从 llm_defaults.json 读取蓝图最大尝试次数。"""
+        try:
+            from src.blueprint.llm.prompt_builder import _load_llm_defaults
+            defaults = _load_llm_defaults()
+            return max(1, int(defaults.get("blueprint", {}).get("max_attempts", 3)))
+        except Exception:
+            return 3
+
+    def _validate_bp_json(self, bp_json: dict) -> list:
+        """校验蓝图 JSON 结构，返回错误列表（空列表=通过）。
+
+        R1: JSON 语法（已在外层 _extract_bp_json 完成）
+        R2: 节点类型 + 参数合法性
+        R3: 连线合法性（exec→exec / Start 唯一）
+        """
+        errors = []
+
+        nodes = bp_json.get("nodes", {})
+        links = bp_json.get("links", [])
+
+        if not isinstance(nodes, dict) or len(nodes) == 0:
+            errors.append("nodes 为空或格式错误")
+            return errors
+
+        # R2: 检查节点类型合法性
+        try:
+            from src.blueprint.core.node_library import NODE_TYPES_ORDERED
+            valid_types = set(NODE_TYPES_ORDERED)
+        except Exception:
+            valid_types = set()
+
+        start_count = 0
+        for nid, node in nodes.items():
+            if not isinstance(node, dict):
+                errors.append(f"节点 {nid} 格式错误")
+                continue
+            ntype = node.get("type", "")
+            if valid_types and ntype not in valid_types:
+                errors.append(f"节点 {nid} 类型 '{ntype}' 不存在")
+            if ntype == "Start":
+                start_count += 1
+            # 检查 id 一致性
+            if node.get("id", "") != nid:
+                errors.append(f"节点 {nid} 的 id 字段不匹配")
+
+        if start_count == 0:
+            errors.append("缺少 Start 节点")
+        elif start_count > 1:
+            errors.append(f"存在 {start_count} 个 Start 节点（必须唯一）")
+
+        # R3: 检查连线合法性
+        for i, link in enumerate(links):
+            if not isinstance(link, dict):
+                errors.append(f"连线 #{i} 格式错误")
+                continue
+            from_node = link.get("from_node", "")
+            to_node = link.get("to_node", "")
+            if from_node not in nodes:
+                errors.append(f"连线 #{i} 起始节点 '{from_node}' 不存在")
+            if to_node not in nodes:
+                errors.append(f"连线 #{i} 目标节点 '{to_node}' 不存在")
+            ltype = link.get("type", "")
+            if ltype not in ("exec", "data"):
+                errors.append(f"连线 #{i} 类型 '{ltype}' 无效（只能 exec 或 data）")
+
+        # 尝试用 runtime validator 做更深层校验
+        try:
+            from src.blueprint.core.models import BlueprintGraph
+            from src.blueprint.runtime.validator import validate_graph
+            graph = BlueprintGraph.from_dict(bp_json)
+            issues = validate_graph(graph)
+            for issue in issues:
+                if issue.level == "ERROR":
+                    errors.append(issue.message)
+        except Exception:
+            pass  # 深层校验失败不阻断
+
+        return errors
+
+    def _retry_bp_with_errors(self, prev_response: str, errors: list):
+        """校验失败后，把错误信息反馈给 LLM 自动重试。"""
+        from src.blueprint.llm.llm_worker import ChatWorker
+        from src.blueprint.llm import prompt_builder
+
+        err_text = "\n".join(f"  · {e}" for e in errors[:8])
+        retry_msg = (
+            f"你上次生成的蓝图有以下校验错误：\n\n{err_text}\n\n"
+            f"请修正这些问题，重新生成完整的蓝图 JSON。只输出 JSON，不要附加解释。"
+        )
+
+        sys_prompt = prompt_builder.build_blueprint_prompt(_get_preset(), user_query=self._last_bp_user_text)
+        messages = [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": self._last_bp_user_text},
+            {"role": "assistant", "content": prev_response},
+            {"role": "user", "content": retry_msg},
+        ]
+
+        # 占位气泡
+        self._bp_streaming_text = f"赫萝正在修正蓝图（第 {self._bp_attempt + 1} 次尝试）…"
+        self._bp_streaming_bubble = self._append_bp_msg_ex("assistant", self._bp_streaming_text)
+
+        self.thinking_changed.emit("thinking")
+        self._bp_worker = ChatWorker(messages, stream=True, parent=self)
+        self._bp_worker.chunk_received.connect(self._on_bp_chunk)
+        self._bp_worker.finished.connect(self._on_bp_finished)
+        self._bp_worker.error.connect(self._on_bp_error)
+        self._bp_worker.start()
+
+    def _bind_bp_json_to_last_bubble(self, bp_json: dict):
+        """校验通过后，把 JSON 绑定到蓝图列表最后一条助手气泡。"""
+        for i in range(self.list_bp.count() - 1, -1, -1):
+            item = self.list_bp.item(i)
+            w = self.list_bp.itemWidget(item)
+            if w is not None and hasattr(w, "_role") and w._role == "assistant":
+                w._bp_json = bp_json
+                break
+
+        # autosave_draft：自动保存校验通过的草稿
+        try:
+            from src.blueprint.llm.prompt_builder import _load_llm_defaults
+            defaults = _load_llm_defaults()
+            if defaults.get("blueprint", {}).get("autosave_draft", True):
+                import json as _json
+                import os
+                import time
+                draft_dir = os.path.join(os.path.expanduser("~"), ".blueprintautomation", "llm_bp_drafts")
+                os.makedirs(draft_dir, exist_ok=True)
+                draft_name = f"draft_{int(time.time())}.json"
+                draft_path = os.path.join(draft_dir, draft_name)
+                with open(draft_path, "w", encoding="utf-8") as f:
+                    _json.dump(bp_json, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def _extract_bp_json(self, text: str):
+        """从 LLM 回复中提取蓝图 JSON，失败返回 None。"""
+        import json as _json
+        import re
+        # 尝试从 ```json ... ``` 代码块提取
+        m = re.search(r'```(?:json)?\s*\n(.*?)\n```', text, re.DOTALL)
+        raw = m.group(1) if m else text.strip()
+        try:
+            d = _json.loads(raw)
+            if isinstance(d, dict) and "nodes" in d:
+                return d
+        except _json.JSONDecodeError:
+            pass
+        # 尝试找第一个 { 到最后一个 } 的子串
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                d = _json.loads(raw[start:end+1])
+                if isinstance(d, dict) and "nodes" in d:
+                    return d
+            except _json.JSONDecodeError:
+                pass
+        return None
+
+    def _on_bp_import(self, bubble):
+        """导入按钮：将蓝图 JSON 发送给主窗口加载到画布。"""
+        bp_json = getattr(bubble, "_bp_json", None)
+        if bp_json is None:
+            QMessageBox.warning(self, "无法导入", "赫萝：这段回复里没有找到有效的蓝图 JSON 哦~\n可以让赫萝重新生成一次试试 🍎")
+            return
+        self.blueprint_imported.emit(bp_json)
+        QMessageBox.information(self, "✅ 已导入", f"赫萝：蓝图已导入画布！\n节点数：{len(bp_json.get('nodes', {}))}\n连线数：{len(bp_json.get('links', []))}")
+
+    def _on_bp_retry(self, bubble):
+        """重写按钮：用上次的用户需求重新生成。"""
+        if not self._last_bp_user_text:
+            QMessageBox.information(self, "提示", "赫萝：没有找到上次的需求文本呢~")
+            return
+        self._start_bp_llm(self._last_bp_user_text)
+
+    def _on_bp_error(self, err_msg: str):
+        self.btn_bp_send.setEnabled(True)
+        self.btn_bp_send.setToolTip("发送蓝图需求给赫萝 📋")
+        self.thinking_changed.emit("idle")
+        if self._bp_streaming_bubble is not None:
+            self._bp_streaming_bubble.update_text(f"呜……蓝图生成失败：\n\n{err_msg}")
+            self._bp_streaming_bubble = None
+        self._bp_streaming_text = ""
 
     def _on_bp_clear_clicked(self):
         r = QMessageBox.question(
@@ -1607,79 +2328,10 @@ class FullChatDialog(QDialog):
             self._append_welcome()
 
     # =================================================================
-    # 会话管理：Mock 历史会话数据 + 下拉菜单 + 切换加载
-    # （Stup：真实接入后这些数据应从 LLMConversationStore / 数据库读取）
+    # 会话管理：对话历史持久化（ConversationStore）+ 下拉菜单 + 切换加载
+    # 自由聊天 / 蓝图生成 的会话在 LLM 回复完成后自动存档到磁盘 JSON，
+    # 历史页和下拉菜单都从 ConversationStore 实时读取。
     # =================================================================
-
-    # 自由聊天类型的 mock 历史会话
-    _MOCK_CHAT_HISTORY: dict = {
-        "chat_1": {
-            "title": "🍎 赫萝的苹果闲聊 (7/5)",
-            "messages": [
-                ("user", "赫萝，你今天吃了几个苹果呀？"),
-                ("assistant", "唔姆…咱今天已经吃了 3 颗了，汝不介意和咱一起分享吗～"),
-                ("user", "那我给你带两斤来，下次不许抢我的零食了啊。"),
-                ("assistant", "好~ 咱不抢就是了，两斤苹果换汝的零食，算啦算啦 🐺🍎"),
-            ],
-        },
-        "chat_2": {
-            "title": "🎮 游戏宅赫萝·今日吐槽 (7/4)",
-            "messages": [
-                ("user", "今天肝到哪了？"),
-                ("assistant", "唔…原神深渊第 12 层第三间又没满星，最后差 8 秒！好气哦…"),
-                ("user", "明天加油，我陪你凹。"),
-                ("assistant", "哼，汝说的，不许跑路！凹满星报酬要给咱 3 颗苹果 ♡"),
-            ],
-        },
-        "chat_3": {
-            "title": "😌 贤狼赫萝·人生相谈 (7/3)",
-            "messages": [
-                ("user", "赫萝，最近工作压力好大，怎么办？"),
-                ("assistant", "呼，咱活了几百岁，这种事见多啦——放下手上的事，去吃点好的、散散步、睡个好觉。"),
-                ("user", "明天我就请假去旅游。"),
-                ("assistant", "这就对了嘛，汝不是机器，要对自己好一点~ 咱陪汝一起去。"),
-            ],
-        },
-    }
-
-    # 蓝图生成类型的 mock 历史会话
-    _MOCK_BP_HISTORY: dict = {
-        "bp_1": {
-            "title": "📋 记事本自动输入 (7/4)",
-            "messages": [
-                ("user", "打开记事本，等 2 秒，输入 Hello 再关掉。"),
-                ("assistant",
-                 "好，咱生成的蓝图草稿：\n"
-                 "  · Start → OpenApp(notepad.exe)\n"
-                 "  · Wait(2s) → PressKey(Hello, ENTER)\n"
-                 "  · CloseApp(notepad) → End\n\n"
-                 "共 5 节点 4 连线，支持直接导入画布。"),
-            ],
-        },
-        "bp_2": {
-            "title": "⚡ 游戏连点宏·每秒 10 次 (7/2)",
-            "messages": [
-                ("user", "给我写一个连点宏，每秒点鼠标左键 10 次，按 F8 开始、F9 停止。"),
-                ("assistant",
-                 "好，蓝图草稿：\n"
-                 "  · Start → HotkeyListener(F8)\n"
-                 "  · Loop(Counter=∞) → MouseClick(Left, Repeat=10, Interval=100ms)\n"
-                 "  · HotkeyListener(F9) → End\n\n"
-                 "注：实际使用时请确认不违反游戏用户协议哦~"),
-            ],
-        },
-        "bp_3": {
-            "title": "🚀 每日工作启动器·批量启动 (6/30)",
-            "messages": [
-                ("user", "帮我一键启动：微信、VSCode、Chrome、钉钉，再打开 G:\\work\\BlueprintAutomation 工作目录。"),
-                ("assistant",
-                 "好，蓝图草稿：\n"
-                 "  · Start → Parallel{ OpenApp(WeChat) / OpenApp(VSCode) / OpenApp(Chrome) / OpenApp(DingTalk) }\n"
-                 "  · OpenDir(G:\\work\\BlueprintAutomation) → End\n\n"
-                 "可设置为开机自启，点『导入画布』后按你机器的实际路径微调即可。"),
-            ],
-        },
-    }
 
     def _build_chat_history_menu(self, menu: QMenu):
         """构造「自由聊天」Tab 的历史会话下拉菜单（点击直接切换，不跳转到 history 页）。"""
@@ -1688,14 +2340,20 @@ class FullChatDialog(QDialog):
         header = menu.addAction("📚 自由聊天·历史会话")
         header.setEnabled(False)
         menu.addSeparator()
-        # 每个会话一个 Action
-        for sess_id, data in self._MOCK_CHAT_HISTORY.items():
-            action = QAction(data.get("title", sess_id), menu)
+        # 从 ConversationStore 读取自由聊天类型的历史会话
+        sessions = self._conv_store.list_sessions("chat")
+        for s in sessions[:30]:
+            sess_id = s.get("id", "")
+            title = s.get("title", "未命名")
+            action = QAction(title, menu)
             action.setToolTip("点击直接在当前自由聊天 Tab 加载该会话")
-            action.triggered.connect(lambda _=False, s=sess_id: self._load_history_session("chat", s))
+            action.triggered.connect(lambda _=False, sid=sess_id: self._load_history_session("chat", sid))
             menu.addAction(action)
+        if not sessions:
+            empty = menu.addAction("（暂无历史会话）")
+            empty.setEnabled(False)
         menu.addSeparator()
-        tip = menu.addAction("💡 提示：真实接入后这里会读取 LLM 历史会话库")
+        tip = menu.addAction("💡 提示：发送消息后会自动存档到这里")
         tip.setEnabled(False)
 
     def _build_bp_history_menu(self, menu: QMenu):
@@ -1704,21 +2362,33 @@ class FullChatDialog(QDialog):
         header = menu.addAction("📚 蓝图生成·历史会话")
         header.setEnabled(False)
         menu.addSeparator()
-        for sess_id, data in self._MOCK_BP_HISTORY.items():
-            action = QAction(data.get("title", sess_id), menu)
+        # 从 ConversationStore 读取蓝图类型的历史会话
+        sessions = self._conv_store.list_sessions("blueprint")
+        for s in sessions[:30]:
+            sess_id = s.get("id", "")
+            title = s.get("title", "未命名")
+            action = QAction(title, menu)
             action.setToolTip("点击直接在当前蓝图 Tab 加载该会话草稿")
-            action.triggered.connect(lambda _=False, s=sess_id: self._load_history_session("blueprint", s))
+            action.triggered.connect(lambda _=False, sid=sess_id: self._load_history_session("blueprint", sid))
             menu.addAction(action)
+        if not sessions:
+            empty = menu.addAction("（暂无历史会话）")
+            empty.setEnabled(False)
         menu.addSeparator()
         tip = menu.addAction("💡 提示：选择后可点气泡右下角「➕ 导入」直接写入画布")
         tip.setEnabled(False)
 
     def _load_history_session(self, hist_type: str, sess_id: str):
-        """加载一条 mock 历史会话到对应的 Tab 聊天列表里。
+        """加载一条历史会话到对应的 Tab 聊天列表里。
         hist_type: 'chat' -> 自由聊天 list_msg；'blueprint' -> 蓝图生成 list_bp
         """
-        hist = (self._MOCK_CHAT_HISTORY if hist_type == "chat" else self._MOCK_BP_HISTORY).get(sess_id)
-        if not hist or "messages" not in hist:
+        from src.blueprint.llm.conversation_store import ConversationStore
+        store = ConversationStore()
+        data = store.load_session(sess_id)
+        if not data or "messages" not in data:
+            QMessageBox.information(
+                self, "提示", "赫萝：找不到这个会话呢~ 🐺"
+            )
             return
         # 切到对应 Tab（历史会话可能从别的 Tab 点，但菜单只在对应 Tab 上显示，这里加个保险）
         if hist_type == "chat":
@@ -1727,15 +2397,19 @@ class FullChatDialog(QDialog):
             list_w = self.list_msg
             append_fn = self._append_chat_msg
             self.result_card.hide()
+            self._current_chat_sess_id = sess_id
         else:
             self._side_buttons["blueprint"].setChecked(True)
             self._switch_tab("blueprint")
             list_w = self.list_bp
             append_fn = self._append_bp_msg
             self.result_bp_card.hide()
+            self._current_bp_sess_id = sess_id
         # 先清空当前列表，再逐条追加历史消息
         list_w.clear()
-        for role, text in hist["messages"]:
+        for m in data["messages"]:
+            role = m.get("role", "user")
+            text = m.get("content", "")
             append_fn(role, text)
 
     # =================================================================
@@ -1788,3 +2462,4 @@ class FullChatDialog(QDialog):
             self.ed_input.setFocus(Qt.OtherFocusReason)
         except Exception:
             pass
+

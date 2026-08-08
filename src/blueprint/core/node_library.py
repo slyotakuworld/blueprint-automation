@@ -430,6 +430,10 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
             ),
             ParamDef(name="offset", editor=EDITOR_TUPLE2, default=(0, 0), label="点击偏移",
                      help="找到目标后，相对模板中心的像素偏移 (X, Y)。X 正值向右，负值向左；Y 正值向下，负值向上。\n例如找到的图片中心在窗口(100,200)，偏移设(10,-5)，则实际点击位置为(110,195)。\nout_pos 输出的是「模板中心+偏移」后的最终坐标。"),
+            ParamDef(name="post_delay_min_ms", editor=EDITOR_INT, default=30, min=0, max=5000,
+                     label="动作后最小延迟(ms)", help="「找到后执行」动作做完后、继续下一节点之前的等待时间下限。\n上下限一致=固定等待；否则在两者间随机取值。\n常用于点击按钮后等菜单弹出来、场景加载完，避免下一节点立刻跑时画面还没变。"),
+            ParamDef(name="post_delay_max_ms", editor=EDITOR_INT, default=80, min=0, max=5000,
+                     label="动作后最大延迟(ms)", help="「找到后执行」动作做完后、继续下一节点之前的等待时间上限。"),
             # ===== 特征识别辅助 =====
             ParamDef(name="use_feature_assist", editor=EDITOR_ENUM, default="off",
                      options=["off", "verify", "fallback"],
@@ -573,9 +577,9 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
             ParamDef(name="hold_ms_max", editor=EDITOR_INT, default=80, min=1, max=5000,
                      label="按下保持最大(ms)"),
             ParamDef(name="post_delay_min_ms", editor=EDITOR_INT, default=30, min=0, max=5000,
-                     label="操作后最小延迟(ms)", help="鼠标操作完成后的额外等待时间下限。上下限一致=固定等待；否则在两者间随机。"),
+                     label="节点后最小延迟(ms)", help="本节点全部操作完成后、继续执行下一个节点之前的等待时间下限。\n上下限一致=固定等待；否则在两者间随机取值。\n常用于点击后等待游戏/程序响应（比如弹菜单、切换场景），避免立刻跑下一节点时目标还没就绪。"),
             ParamDef(name="post_delay_max_ms", editor=EDITOR_INT, default=80, min=0, max=5000,
-                     label="操作后最大延迟(ms)", help="鼠标操作完成后的额外等待时间上限"),
+                     label="节点后最大延迟(ms)", help="本节点全部操作完成后、继续执行下一个节点之前的等待时间上限"),
 
             # --- scroll 独有 ---
             ParamDef(name="scroll_dy", editor=EDITOR_INT, default=400, min=-5000, max=5000,

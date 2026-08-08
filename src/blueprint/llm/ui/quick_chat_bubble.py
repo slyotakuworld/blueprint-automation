@@ -40,6 +40,15 @@ from ._icon_loader import icon
 # ---- 共享 ChatBubble（尖角气泡 + 赫萝圆形头像）----
 from .full_chat_dialog import ChatBubble
 
+# 人设预设索引辅助函数
+def _get_preset() -> int:
+    try:
+        from src.config.user_settings import get_active_preset
+        return get_active_preset()
+    except Exception:
+        return 0
+
+
 _THEME_NAME = "day"  # 固定奶茶白日主题
 _THEME = get_theme(_THEME_NAME)
 _QSS = build_qss(_THEME_NAME)
@@ -49,6 +58,7 @@ class QuickChatBubble(QDialog):
     """悬浮球旁弹出的迷你聊天气泡窗口。"""
 
     message_sent = Signal(str)
+    thinking_changed = Signal(str)
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent, Qt.Popup | Qt.FramelessWindowHint | Qt.NoDropShadowWindowHint)
@@ -62,6 +72,9 @@ class QuickChatBubble(QDialog):
         self._anchor: Optional[QPoint] = None
         self._full_dlg = None       # FullChatDialog 引用，用于消息同步
         self._syncing = False       # sync_from 拉取中标志，避免 _append_msg 回写
+        self._chat_worker = None
+        self._streaming_bubble = None
+        self._streaming_text = ""
         self._build_ui()
         self._append_welcome()
 
@@ -245,21 +258,88 @@ class QuickChatBubble(QDialog):
 
     def _on_send_clicked(self):
         t = self.ed_input.toPlainText().strip()
-        if not t:
-            return
+        if not t: return
         self._append_msg("user", t)
         self.ed_input.clear()
         self.message_sent.emit(t)
         self.btn_send.setEnabled(False)
-        QTimer.singleShot(380, lambda: self._mock_reply(t))
+        self._start_llm(t)
 
-    def _mock_reply(self, t: str):
+    def _start_llm(self, user_text: str):
+        """启动 LLM 调用。"""
+        from src.blueprint.llm.llm_worker import ChatWorker
+        from src.blueprint.llm import prompt_builder
+
+        sys_prompt = prompt_builder.build_chat_prompt(_get_preset(), user_query=user_text)
+        messages = [{"role": "system", "content": sys_prompt}]
+        # 从 FullChatDialog 同步历史
+        if self._full_dlg is not None:
+            for role, text in self._full_dlg.get_chat_messages():
+                if role == "user":
+                    messages.append({"role": "user", "content": text})
+                elif role == "assistant":
+                    messages.append({"role": "assistant", "content": text})
+
+        # 占位气泡
+        self._streaming_text = "赫萝正在思考…"
+        self._streaming_bubble = self._append_msg_ex("assistant", self._streaming_text)
+
+        self.thinking_changed.emit("thinking")
+        self._chat_worker = ChatWorker(messages, stream=True, parent=self)
+        self._chat_worker.chunk_received.connect(self._on_chunk)
+        self._chat_worker.finished.connect(self._on_finished)
+        self._chat_worker.error.connect(self._on_error)
+        self._chat_worker.start()
+
+    def _on_chunk(self, chunk: str):
+        if self._streaming_bubble is None:
+            return
+        if self._streaming_text == "赫萝正在思考…":
+            self._streaming_text = chunk
+        else:
+            self._streaming_text += chunk
+        self._streaming_bubble.update_text(self._streaming_text)
+
+    def _on_finished(self, full_text: str):
         self.btn_send.setEnabled(True)
-        self._append_msg(
-            "assistant",
-            f"唔姆~ 收到：『{t[:24]}{'…' if len(t)>24 else ''}』\n"
-            f"咱记下啦，需要详细聊就再问咱哦 🍎"
-        )
+        self.thinking_changed.emit("idle")
+        if self._streaming_bubble is not None:
+            self._streaming_bubble.update_text(full_text)
+            self._streaming_bubble = None
+        self._streaming_text = ""
+        # 回写助手回复到 FullChatDialog（设置 _syncing 避免递归回写）
+        if getattr(self, "_full_dlg", None) is not None:
+            self._syncing = True
+            try:
+                self._full_dlg._append_chat_msg("assistant", full_text)
+            except Exception:
+                pass
+            finally:
+                self._syncing = False
+
+    def _on_error(self, err_msg: str):
+        self.btn_send.setEnabled(True)
+        self.thinking_changed.emit("idle")
+        if self._streaming_bubble is not None:
+            self._streaming_bubble.update_text(f"呜……出了点问题：\n\n{err_msg}")
+            self._streaming_bubble = None
+        self._streaming_text = ""
+
+    def _append_msg_ex(self, role: str, text: str):
+        """追加消息并返回 bubble 引用（用于流式更新）。"""
+        from .full_chat_dialog import ChatBubble
+        list_w = self.list_msg
+        bubble_w = max(280, list_w.width() - 20)
+        bubble = ChatBubble(role, text, mode="chat")
+        bubble.update_bubble_width(bubble_w)
+        bubble.adjustSize()
+        sh = bubble.sizeHint()
+        item = QListWidgetItem()
+        item.setSizeHint(QSize(bubble_w, max(60, sh.height())))
+        list_w.addItem(item)
+        list_w.setItemWidget(item, bubble)
+        QTimer.singleShot(20, lambda: list_w.scrollToBottom())
+        return bubble
 
     def eventFilter(self, obj, event):
         if obj is self.ed_input and event.type() == QEvent.KeyPress:

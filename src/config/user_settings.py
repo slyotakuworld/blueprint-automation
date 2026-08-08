@@ -484,18 +484,121 @@ _LLM_DEFAULT_CFG: Dict[str, Any] = {
     "enabled": True,
     "active_provider": "openai",
     "api_key": "",
+    "active_preset": 0,
     "providers": {k: dict(v) for k, v in _LLM_DEFAULT_PROVIDERS.items()},
+    "memory": {},
+    "profile": {},
+    "params": {
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "freq_pen": 0.0,
+        "pres_pen": 0.0,
+        "max_ctx": 16384,
+        "max_out": 2048,
+    },
 }
 
 
+def get_active_preset() -> int:
+    """获取当前激活的人设预设索引。"""
+    try:
+        cfg = get_llm_config()
+        return int(cfg.get("active_preset", 0))
+    except Exception:
+        return 0
+
+
+def get_llm_profile() -> dict:
+    """获取用户档案（注入 system prompt 用）。"""
+    try:
+        cfg = get_llm_config()
+        return cfg.get("profile", {}) if isinstance(cfg.get("profile"), dict) else {}
+    except Exception:
+        return {}
+
+
+def get_llm_params() -> dict:
+    """获取通用参数（temperature/top_p/freq_pen/pres_pen/max_ctx/max_out）。"""
+    try:
+        cfg = get_llm_config()
+        params = cfg.get("params", {})
+        if not isinstance(params, dict):
+            params = {}
+        defaults = _LLM_DEFAULT_CFG["params"]
+        return {
+            "temperature": float(params.get("temperature", defaults["temperature"])),
+            "top_p": float(params.get("top_p", defaults["top_p"])),
+            "freq_pen": float(params.get("freq_pen", defaults["freq_pen"])),
+            "pres_pen": float(params.get("pres_pen", defaults["pres_pen"])),
+            "max_ctx": int(params.get("max_ctx", defaults["max_ctx"])),
+            "max_out": int(params.get("max_out", defaults["max_out"])),
+        }
+    except Exception:
+        return dict(_LLM_DEFAULT_CFG["params"])
+
+
+def get_llm_memory() -> dict:
+    """获取记忆库开关配置。"""
+    try:
+        cfg = get_llm_config()
+        mem = cfg.get("memory", {})
+        if not isinstance(mem, dict):
+            mem = {}
+        return {
+            "remember_window": bool(mem.get("remember_window", True)),
+            "remember_games": bool(mem.get("remember_games", True)),
+            "remember_hotkeys": bool(mem.get("remember_hotkeys", True)),
+            "remember_ctx": bool(mem.get("remember_ctx", True)),
+        }
+    except Exception:
+        return {"remember_window": True, "remember_games": True,
+                "remember_hotkeys": True, "remember_ctx": True}
+
+
+def _migrate_legacy_llm(cfg: Dict[str, Any]):
+    """迁移旧格式 LLM 配置（v1: 5-provider + api_key嵌套 + 死字段）→ v2 格式。"""
+    if not isinstance(cfg, dict):
+        return
+    # 删除死字段
+    for dead in ("_version", "temperature", "max_tokens",
+                 "auto_fix_rounds", "float_always_on_top", "float_click_left_full"):
+        cfg.pop(dead, None)
+    # api_key 从 provider 内部提到顶层
+    if "api_key" not in cfg:
+        providers = cfg.get("providers", {})
+        if isinstance(providers, dict):
+            active = cfg.get("active_provider", "")
+            prov = providers.get(active, {})
+            if isinstance(prov, dict) and prov.get("api_key"):
+                cfg["api_key"] = prov["api_key"]
+            else:
+                cfg["api_key"] = ""
+    # providers 只保留 openai / ollama
+    old_providers = cfg.get("providers", {})
+    if isinstance(old_providers, dict):
+        new_providers = {}
+        for pk in ("openai", "ollama"):
+            old = old_providers.get(pk, {})
+            new_providers[pk] = {
+                "base_url": old.get("base_url", _LLM_DEFAULT_PROVIDERS[pk]["base_url"]),
+                "model": old.get("model", _LLM_DEFAULT_PROVIDERS[pk]["model"]),
+                "nickname": old.get("nickname", _LLM_DEFAULT_PROVIDERS[pk]["nickname"]),
+            }
+        cfg["providers"] = new_providers
+    # active_provider 如果不在 openai/ollama 中，回退到 openai
+    if cfg.get("active_provider") not in ("openai", "ollama"):
+        cfg["active_provider"] = "openai"
+
+
 def get_llm_config() -> Dict[str, Any]:
-    """读取 LLM 配置（缺字段自动补默认值）。"""
+    """读取 LLM 配置（缺字段自动补默认值 + 旧格式自动迁移）。"""
     try:
         s = read_user_settings()
         llm_raw = s.get("llm") if isinstance(s, dict) else None
         cfg = dict(llm_raw) if isinstance(llm_raw, dict) else {}
     except Exception:
         cfg = {}
+    _migrate_legacy_llm(cfg)
     _merge_defaults(cfg, _LLM_DEFAULT_CFG)
     return cfg
 
