@@ -95,4 +95,4 @@ headers_json = {
 → 不管 HTTP 状态码（200/404/500 都一样）都走 out_done，err 仅在网络错误（DNS 失败、超时、SSL 错误等）时触发。接一个 VarSwitch，条件写 `{status_code} == 200` 判断是不是成功。
 
 **Q：HTTPS 自签证书报错？**
-→ 目前统一跳过 SSL 验证（llm_defaults.json 里 `skip_ssl_verify=true` 控制），有需要可以去改配置。
+→ 程序按系统默认规则校验 SSL 证书，自签或不受信任的证书会导致请求失败（走 err 分支）。需要访问此类接口时，请让服务端使用受信任的证书。

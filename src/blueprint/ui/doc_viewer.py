@@ -25,26 +25,24 @@ from __future__ import annotations
 import json
 import os
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
-from PySide6.QtCore import Qt, QSize, Signal
-from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPixmap
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QColor, QFont, QIcon
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QScrollArea,
-    QSizePolicy,
     QSplitter,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
-    QWidget,
 )
 
-# 仅在需要小图标时借用 LLM 子模块的 icon 加载器（纯视觉资产，不耦合归属）
-from src.blueprint.llm.ui._icon_loader import icon, pixmap
+# 章节小图标统一走通用图标加载器（图标源目录 images/doc_icons）
+from src.blueprint.ui.icon_loader import pixmap
 
 
 # =====================================================================

@@ -330,7 +330,6 @@ class InputActions:
             time.sleep(0.03)
         if dy_px != 0:
             # 像素 → 滚轮格数（每格经验值 40px）；极小值保证至少 ±1 格，让小距离也有体感
-            import math
             detents_raw = dy_px / SCROLL_PX_PER_DETENT
             detents = int(round(detents_raw))
             if detents == 0 and dy_px != 0:

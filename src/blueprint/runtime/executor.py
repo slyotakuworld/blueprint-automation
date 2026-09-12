@@ -11,16 +11,14 @@ from typing import Any, Deque, Dict, List, Optional, Tuple
 import numpy as np
 from PIL import Image
 
-from PySide6.QtCore import QObject, QThread, Signal
+from PySide6.QtCore import QThread, Signal
 
 from ..core.models import (
     BlueprintGraph,
     ExecutionContext,
     Node,
-    PortDirection,
     PortType,
 )
-from ..core.node_library import NODE_LIBRARY
 from .debug_annotator import annotate_step
 from .input_actions import InputActions
 from .screen_capture import ScreenCapture
@@ -34,8 +32,8 @@ from ...config.app_paths import debug_dir
 def _apply_target_hwnd(ctx: ExecutionContext, hwnd, res_w=1920, res_h=1080):
     """
     把一个 HWND（目标窗口程序）应用到运行时所有下游服务和变量。
-    这就是「设置目标程序」的统一逻辑：可在蓝图启动时调用（初始下拉框选中的目标），
-    也可在 BindWindow 节点执行时调用（中途切换目标程序）。
+    这就是「设置目标窗口」的统一逻辑：可在蓝图启动时调用（首次初始化），
+    也可在 BindWindow 节点执行时调用（中途切换目标窗口）。
 
     参数:
       hwnd   - 窗口句柄(int) 或 None（None=回退为全屏模式）
@@ -3645,20 +3643,23 @@ class BlueprintRunner(QThread):
         self._ctx = ctx
         ctx.last_progress_ts = time.time()
 
-        # 初始化目标程序（右上角下拉框选中的 HWND；None=全屏）
+        # 初始化目标窗口（initial_hwnd；None=全屏）
+        #   注意：编辑器内运行与导出的独立 EXE 都传 None。
+        #   运行时目标窗口统一由蓝图自身决定（BindWindow 节点 / 各节点「临时目标」），
+        #   不再接受主界面「🎯 截图目标」下拉的选择，保证两条运行路径行为一致。
         init_hwnd = getattr(self, "_initial_hwnd", None)
         try:
             if init_hwnd:
                 win_rect, win_title = _apply_target_hwnd(ctx, int(init_hwnd), 0, 0)
                 hwnd_hex = f"0x{int(init_hwnd):08X}" if int(init_hwnd) else "None"
                 _write_log(
-                    f"[Runtime] 初始目标程序来自主界面下拉框：HWND={hwnd_hex}  "
+                    f"[Runtime] 初始目标窗口（由调用方指定）：HWND={hwnd_hex}  "
                     f"title='{(win_title or '')[:32]}'  rect={win_rect}",
                     "INFO",
                 )
             else:
                 _apply_target_hwnd(ctx, None, 0, 0)
-                _write_log("[Runtime] 初始目标程序：未指定（全屏模式），请用 BindWindow 节点或主界面下拉框设置。", "INFO")
+                _write_log("[Runtime] 初始目标窗口：未指定（全屏模式），将由 BindWindow 节点或各节点的「临时目标」决定。", "INFO")
         except Exception as _ie:
             _write_log(f"[Runtime] 应用初始目标程序失败（不影响后续）: {_ie}", "WARN")
 

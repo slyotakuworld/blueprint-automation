@@ -1,5 +1,9 @@
 # -*- coding: utf-8 -*-
-"""赫萝 Icon 资源统一加载 + 缓存（避免每次 QPixmap 解码大图 1.8MB）。"""
+"""蓝图编辑器通用图标资源统一加载 + 缓存（避免每次 QPixmap 重复解码大图）。
+
+图标源目录：<APP_DIR>/images/doc_icons/
+（打包后为 INTERNAL_DIR/images/doc_icons，开发模式为源码根 images/doc_icons）
+"""
 from __future__ import annotations
 
 import os
@@ -8,28 +12,34 @@ from functools import lru_cache
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QIcon, QPixmap, QPainter, QPainterPath, QPen, QColor
 
+
 def _resolve_icon_dir() -> str:
     try:
         from src.config.app_paths import INTERNAL_DIR
-        internal = os.path.normpath(os.path.join(INTERNAL_DIR, "images", "llm_icons"))
+        internal = os.path.normpath(os.path.join(INTERNAL_DIR, "images", "doc_icons"))
         if os.path.isdir(internal):
             return internal
     except Exception:
         pass
+    # 源码模式：本文件在 src/blueprint/ui/ 下，向上 3 级即项目根
     return os.path.normpath(os.path.join(
         os.path.abspath(os.path.dirname(__file__)),
-        "..", "..", "..", "..", "images", "llm_icons",
+        "..", "..", "..", "images", "doc_icons",
     ))
+
 
 _ICON_DIR = _resolve_icon_dir()
 
+
 def icon_path(filename: str) -> str:
     return os.path.join(_ICON_DIR, filename).replace("\\", "/")
+
 
 @lru_cache(maxsize=64)
 def _load_raw(filename: str) -> QPixmap:
     pm = QPixmap(icon_path(filename))
     return QPixmap() if pm.isNull() else pm
+
 
 def pixmap(filename: str, size: int = 32) -> QPixmap:
     raw = _load_raw(filename)
@@ -37,11 +47,14 @@ def pixmap(filename: str, size: int = 32) -> QPixmap:
         return QPixmap()
     return raw.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
 
+
 def icon(filename: str, size: int = 24) -> QIcon:
     pm = pixmap(filename, size)
     return QIcon() if pm.isNull() else QIcon(pm)
 
+
 def circular_pixmap(filename: str, size: int = 32) -> QPixmap:
+    """裁成圆形并描边（用于头像类图标）。"""
     raw = pixmap(filename, size)
     if raw.isNull():
         return QPixmap()

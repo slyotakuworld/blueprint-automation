@@ -17,7 +17,7 @@ from __future__ import annotations
 from typing import Callable, Dict, Optional
 
 try:
-    from PySide6.QtCore import QObject, QThread, Signal, QTimer
+    from PySide6.QtCore import QObject, Signal
     _HAS_QT = True
 except Exception:  # pragma: no cover
     _HAS_QT = False

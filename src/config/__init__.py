@@ -19,10 +19,7 @@ from .app_paths import (
     auto_extract_configs,
     auto_extract_images,
 )
-from .recognition_profiles import (
-    DEFAULT_RECOGNITION_PROFILES,
-    get_recognition_profile,
-)
+from .recognition_profiles import DEFAULT_RECOGNITION_PROFILES
 
 __all__ = [
     "APP_DIR",
@@ -45,5 +42,4 @@ __all__ = [
     "auto_extract_configs",
     "auto_extract_images",
     "DEFAULT_RECOGNITION_PROFILES",
-    "get_recognition_profile",
 ]

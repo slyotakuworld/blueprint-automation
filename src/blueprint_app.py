@@ -30,11 +30,10 @@ if os.name == "nt":
         pass
 
 
-from PySide6.QtCore import Qt, QObject, QPointF, QThread, Signal, QSize, QTimer
-from PySide6.QtGui import QAction, QKeySequence, QFont, QIcon, QPixmap, QPainter, QColor
+from PySide6.QtCore import Qt, QPointF, QSize, QTimer
+from PySide6.QtGui import QAction, QKeySequence, QIcon, QPixmap, QPainter, QColor
 from PySide6.QtWidgets import (
     QApplication,
-    QCheckBox,
     QComboBox,
     QDialog,
     QDockWidget,
@@ -49,7 +48,6 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSizePolicy,
     QStatusBar,
-    QSplitter,
     QTabWidget,
     QToolBar,
     QToolButton,
@@ -66,7 +64,7 @@ if _PROJECT_ROOT not in sys.path:
 import uuid
 
 from src.blueprint.core.graph_store import BlueprintStore
-from src.blueprint.core.models import BlueprintGraph, Node, Edge, Port
+from src.blueprint.core.models import BlueprintGraph, Edge, Port
 from src.blueprint.core.node_library import NODE_LIBRARY, create_node
 from src.blueprint.project_manager import ProjectManager
 from src.blueprint.runtime.executor import BlueprintRunner
@@ -85,10 +83,7 @@ from src.blueprint.ui.settings_dialog import SettingsDialog
 # 全局热键 + 用户设置
 from src.tools.hotkey_manager import GlobalHotkeyManager
 from src.config.user_settings import (
-    get_hotkey_capture_target,
-    set_hotkey_capture_target,
     get_shortcut,
-    set_shortcut,
     all_shortcut_keys,
     is_global_shortcut,
     shortcut_label,
@@ -99,7 +94,7 @@ from src.config.user_settings import (
     _DEFAULT_BY_KEY,
     SHORTCUT_REGISTRY,
 )
-from src.tools.window_utils import list_visible_windows, start_exe
+from src.tools.window_utils import list_visible_windows
 
 
 # ============================================================
@@ -257,9 +252,6 @@ class BlueprintMainWindow(QMainWindow):
         self._applying_undo_redo: bool = False
         self._paste_batch_collecting: bool = False
         self._paste_batch_node_ids: list = []
-        # ---- LLM 集成（UI 壳子） ----
-        self._llm_settings_dialog_ref = None   # LLM 设置对话框（单例，避免点两次开两窗）
-        self._floating_ball = None             # 悬浮球（None=未启用或被隐藏）
         # ---- 内嵌文档对话框（UI 壳子） ----
         self._doc_dialog_ref = None            # 文档攻略对话框（单例）
 
@@ -278,27 +270,6 @@ class BlueprintMainWindow(QMainWindow):
 
         # 最后：把 settings 中所有快捷键应用（global 注册到 _hotkey_mgr + local 到 QAction）
         self._apply_shortcuts_from_settings(changed_keys=None, log_success=True)
-
-        # LLM 壳子：启动时按设置决定是否显示悬浮球（关闭开关时不创建，避免无意义窗口占用）
-        try:
-            from src.config.user_settings import is_llm_enabled
-            en = is_llm_enabled()
-            if en:
-                self._ensure_floating_ball(show=True)
-            try:
-                # 无论成功失败都写一条日志到面板，让用户知道启动时发生了什么
-                self._log.append_log(
-                    f"[LLM] 启动时 enabled={'ON' if en else 'OFF'}，悬浮球{'已创建并显示（右下角）' if en and self._floating_ball is not None else '未显示'}",
-                    "SUCCESS" if en and self._floating_ball is not None else "INFO"
-                )
-            except Exception:
-                # 日志面板还没初始化好时用 print 兜底（PyCharm/终端能看到）
-                print(f"[LLM][Boot] enabled={en}, floating_ball_created={self._floating_ball is not None}")
-        except Exception as e:
-            try:
-                self._log.append_log(f"[LLM] 启动时创建悬浮球异常：{type(e).__name__}: {e}", "ERROR")
-            except Exception:
-                print(f"[LLM][Boot][ERROR] {type(e).__name__}: {e}", flush=True)
 
         # 程序图标双保险：从全局 QApplication 取已经加载好的多尺寸图标，应用到主窗口
         # （main() 里已经 app.setWindowIcon 并存到 property("app_icon_multi") 了，这里优先拿多尺寸的）
@@ -867,13 +838,29 @@ class BlueprintMainWindow(QMainWindow):
         self._act_split = mk_act("#7C3AED", "✂ 切分UI元素", self._on_open_split_dialog)
         add_toolbtn(self._act_split, bg="#2A1B4F", color="#A371F7", hover_bg="#381E6F", hover_border="#7C3AED")
 
-        # --------------- 右侧: 文档攻略 + LLM 入口按钮 + 目标程序 全局选择器 ---------------
+        # --------------- 右侧: 文档攻略 + 截图目标 全局选择器 ---------------
         tb.addSeparator()
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         tb.addWidget(spacer)
 
-        # ---- 📚 文档攻略按钮（LLM 设置 的 左边，符合用户最新要求） ----
+        # ---- 📦 导出为独立 EXE（放在文档攻略左侧） ----
+        btn_export = QPushButton("📦 导出 EXE")
+        btn_export.setCursor(Qt.PointingHandCursor)
+        btn_export.setStyleSheet(
+            "QPushButton { background:#238636; color:#FFFFFF; border:1px solid #1A7F37; border-radius:4px; padding:3px 12px; font-weight:600; }"
+            "QPushButton:hover { background:#1A7F37; border-color:#3FB950; }"
+            "QPushButton:pressed { background:#146C2E; }"
+        )
+        btn_export.setToolTip("把当前蓝图打包成一个可脱离本项目、单独双击运行的 EXE（自动带上蓝图引用的图片资源）")
+        btn_export.clicked.connect(self._on_export_clicked)
+        tb.addWidget(btn_export)
+        # 视觉分隔：和文档攻略之间留点小空隙
+        sep_exp = QLabel("  ")
+        sep_exp.setStyleSheet("color:#30363D;")
+        tb.addWidget(sep_exp)
+
+        # ---- 📚 文档攻略按钮 ----
         btn_doc = QPushButton("📚 文档攻略")
         btn_doc.setCursor(Qt.PointingHandCursor)
         btn_doc.setStyleSheet(
@@ -884,28 +871,12 @@ class BlueprintMainWindow(QMainWindow):
         btn_doc.setToolTip("打开蓝图自动化使用手册（软件怎么用、功能说明、所有节点的属性与参数详解）")
         btn_doc.clicked.connect(self._on_doc_guide_clicked)
         tb.addWidget(btn_doc)
-        # 视觉分隔：和 LLM 设置 之间留点小空隙
-        sep_doc = QLabel("  ")
-        sep_doc.setStyleSheet("color:#30363D;")
-        tb.addWidget(sep_doc)
-
-        # ---- 🤖 LLM 入口按钮（在🎯 目标程序 左边 / 文档攻略 的 右边） ----
-        btn_llm = QPushButton("🤖 LLM 设置")
-        btn_llm.setCursor(Qt.PointingHandCursor)
-        btn_llm.setStyleSheet(
-            "QPushButton { background:#1F6FEB; color:#FFFFFF; border:1px solid #1158C8; border-radius:4px; padding:3px 12px; font-weight:600; }"
-            "QPushButton:hover { background:#1158C8; border-color:#58A6FF; }"
-            "QPushButton:pressed { background:#0F50B5; }"
-        )
-        btn_llm.setToolTip("打开 LLM 智能助手设置（启用后桌面右下角将出现悬浮球）")
-        btn_llm.clicked.connect(self._on_llm_settings_clicked)
-        tb.addWidget(btn_llm)
-        # 视觉分隔：和目标程序下拉之间留点空间
+        # 视觉分隔：和截图目标下拉之间留点空间
         sep2 = QLabel("  ·  ")
         sep2.setStyleSheet("color:#30363D;")
         tb.addWidget(sep2)
 
-        target_hint = QLabel("🎯 目标程序:")
+        target_hint = QLabel("🎯 截图目标:")
         target_hint.setStyleSheet("color:#C9D1D9; padding: 0 4px 0 8px;")
         tb.addWidget(target_hint)
 
@@ -913,6 +884,13 @@ class BlueprintMainWindow(QMainWindow):
         self._target_combo.setMinimumWidth(280)
         self._target_combo.setMaximumWidth(280)
         self._target_combo.setStyleSheet("QComboBox { background:#161B22; color:#C9D1D9; padding:3px 8px; border:1px solid #30363D; border-radius:4px; } QComboBox:hover { border-color:#484F58; } QComboBox::drop-down { border:none; width:20px; } QComboBox QAbstractItemView { min-width: 480px; }")
+        self._target_combo.setToolTip(
+            "仅用于编辑器内的「截图取素材」：\n"
+            "  · 全局热键截图（默认 F8）截的就是这个窗口\n"
+            "  · Mouse 节点「📍 坐标拾取」的相对坐标基准\n"
+            "不影响蓝图运行——蓝图跑哪个窗口由蓝图自身的 BindWindow 节点 / 各节点「临时目标」决定，\n"
+            "与导出后的独立 EXE 行为一致。"
+        )
         self._target_combo.currentIndexChanged.connect(self._on_target_window_changed)
         tb.addWidget(self._target_combo)
 
@@ -924,8 +902,9 @@ class BlueprintMainWindow(QMainWindow):
         # 【构建完菜单后】先填一次"最近工程"子菜单内容
         self._refresh_recent_projects_menu()
 
-    # ---------------- 目标程序选择器 ----------------
+    # ---------------- 截图目标选择器（仅服务编辑器内截图取素材，不影响蓝图运行） ----------------
     def get_active_hwnd(self) -> Optional[int]:
+        """返回当前选中的截图目标窗口 HWND（None=全屏）。仅供热键截图 / 坐标拾取使用。"""
         return self._active_hwnd
 
     def _reload_target_windows(self):
@@ -950,7 +929,7 @@ class BlueprintMainWindow(QMainWindow):
             c.setCurrentIndex(0)
         self._active_hwnd = c.currentData()
         c.blockSignals(False)
-        self._status_lbl.setText(f"目标窗口列表已刷新，共 {len(wins_sorted)} 个窗口" + (f"，当前：HWND={self._active_hwnd:08X}" if self._active_hwnd else "，当前：全屏"))
+        self._status_lbl.setText(f"截图目标列表已刷新，共 {len(wins_sorted)} 个窗口" + (f"，当前：HWND={self._active_hwnd:08X}" if self._active_hwnd else "，当前：全屏"))
 
     def _on_target_window_changed(self, idx: int):
         self._active_hwnd = self._target_combo.currentData()
@@ -959,11 +938,11 @@ class BlueprintMainWindow(QMainWindow):
             txt = self._target_combo.currentText() or ""
             title_only = txt.split("] ", 1)[1] if "] " in txt else txt
             self._active_hwnd_title_key = title_only
-            self._status_lbl.setText(f"已选定目标窗口 HWND={self._active_hwnd:08X}")
-            self._log.append_log(f"[Target] 目标窗口已选定：HWND={self._active_hwnd:08X}  → {self._target_combo.currentText()}", "INFO")
+            self._status_lbl.setText(f"已选定截图目标窗口 HWND={self._active_hwnd:08X}")
+            self._log.append_log(f"[Target] 截图目标窗口已选定：HWND={self._active_hwnd:08X}  → {self._target_combo.currentText()}", "INFO")
         else:
             self._active_hwnd_title_key = None
-            self._status_lbl.setText("目标未指定：截图/找图将使用全屏")
+            self._status_lbl.setText("截图目标未指定：热键截图/坐标拾取将使用全屏")
 
     # ---------------- 工程 ▾：最近工程菜单 ----------------
     def _refresh_recent_projects_menu(self):
@@ -1762,7 +1741,67 @@ class BlueprintMainWindow(QMainWindow):
             self._log.append_log(f"裁图失败: {e}", "ERROR")
             traceback.print_exc()
 
-    # ---------- IfImageDetect / StillnessDetect 全屏 SnipOverlay 处理 ----------
+    # ---------- 截图范围：把「临时目标窗口」解析成屏幕矩形 ----------
+    def _resolve_snip_limit(self, node):
+        """解析节点的「临时目标窗口」，用于把框选范围限定在该窗口内。
+
+        返回 (rect, label, status)：
+          status = "none"     未配置临时目标 → 按原逻辑全屏框选
+                 = "ok"       已找到窗口，rect=(x, y, w, h) 为该窗口屏幕矩形
+                 = "notfound" 配置了但当前找不到该窗口 → 回退全屏并告警
+
+        匹配口径与运行时 _find_window_3d 保持一致：title 子串 / exe 子串 /
+        class 全等，命中一个维度 +10，配置了却没命中 -1000（直接淘汰）。
+        """
+        params = getattr(node, "params", None) or {}
+        title = str(params.get("temp_target_title", "") or "").strip()
+        exe = str(params.get("temp_target_exe", "") or "").strip()
+        cls = str(params.get("temp_target_class", "") or "").strip()
+        if not (title or exe or cls):
+            return None, "", "none"
+        try:
+            from src.blueprint.ui.window_picker_overlay import enumerate_valid_windows
+            wins = enumerate_valid_windows()
+        except Exception as e:
+            self._log.append_log(f"[Snip] 窗口枚举失败: {e}", "WARN")
+            return None, "", "notfound"
+        best = None
+        best_score = -(10 ** 9)
+        for w in wins:
+            s = 0
+            w_title = str(w.get("title", "") or "")
+            w_exe = str(w.get("exe_name", "") or "").lower()
+            w_cls = str(w.get("class_name", "") or "")
+            if title:
+                s += 10 if title.lower() in w_title.lower() else -1000
+            if exe:
+                ok_exe = bool(w_exe) and (exe.lower() in w_exe or w_exe.endswith(exe.lower()))
+                s += 10 if ok_exe else -1000
+            if cls:
+                s += 10 if cls.lower() == w_cls.lower() else -1000
+            if s > best_score:
+                best, best_score = w, s
+        if best is None or best_score <= 0:
+            return None, "", "notfound"
+        # 把临时目标窗口提到最前，避免截到盖在它上面的其它窗口
+        try:
+            hwnd = int(best.get("hwnd") or 0)
+            if hwnd:
+                from src.tools.window_utils import bring_window_to_front
+                bring_window_to_front(hwnd)
+        except Exception:
+            pass
+        rect = best.get("rect")
+        try:
+            lx, ly, lw, lh = (int(v) for v in rect)
+        except Exception:
+            return None, "", "notfound"
+        if lw < 5 or lh < 5:
+            return None, "", "notfound"
+        name = str(best.get("title", "") or "") or exe or cls
+        return (lx, ly, lw, lh), f"临时目标窗口：{name}", "ok"
+
+    # ---------- IfImageDetect / StillnessDetect / FindImage 全屏 SnipOverlay 处理 ----------
     def _on_snip_for_node(self, node_id: str, mode: str):
         """处理 Inspector 发来的截图请求：
         mode ∈ {
@@ -1771,6 +1810,7 @@ class BlueprintMainWindow(QMainWindow):
             "if_static_roi",        # StillnessDetect 框选 ROI
             "findimg_target",       # FindImage 截取目标（保存PNG到templates）
         }
+        若该节点配置了临时目标窗口，框选范围会被限定在该窗口内。
         """
         if not self._graph or node_id not in self._graph.nodes:
             return
@@ -1783,6 +1823,23 @@ class BlueprintMainWindow(QMainWindow):
         except Exception as e:
             self._log.append_log(f"SnipOverlay 加载失败: {e}（降级为 region_selector）", "WARN")
             return
+
+        # ---- 有了临时目标窗口就以它为框选范围；否则维持全屏 ----
+        limit_rect, limit_label, limit_status = (None, "", "none")
+        try:
+            node0 = self._graph.nodes.get(node_id)
+            if node0 is not None:
+                limit_rect, limit_label, limit_status = self._resolve_snip_limit(node0)
+        except Exception as e:
+            self._log.append_log(f"[Snip] 解析临时目标窗口失败: {e}", "WARN")
+        if limit_status == "ok":
+            self._log.append_log(
+                f"[Snip] {limit_label}，框选范围已限定在该窗口内 {limit_rect}", "INFO"
+            )
+        elif limit_status == "notfound":
+            self._log.append_log(
+                "[Snip] 节点已配置临时目标窗口，但当前找不到该窗口，本次回退为全屏框选", "WARN"
+            )
 
         def _on_result(result, nid=node_id, m=mode):
             try:
@@ -1801,12 +1858,31 @@ class BlueprintMainWindow(QMainWindow):
                 if not bbox or pil is None:
                     self._log.append_log("[Snip] 截图结果为空", "WARN")
                     return
-                x1, y1, x2, y2 = bbox
+                ox1, oy1, ox2, oy2 = (int(v) for v in bbox)
+                x1, y1, x2, y2 = ox1, oy1, ox2, oy2
+                # 兜底：再夹一次到临时目标窗口范围（遮罩已夹过，防坐标口径漂移）
+                if limit_rect:
+                    try:
+                        lx, ly, lw, lh = (int(v) for v in limit_rect)
+                        x1 = max(x1, lx)
+                        y1 = max(y1, ly)
+                        x2 = min(x2, lx + lw)
+                        y2 = min(y2, ly + lh)
+                    except Exception:
+                        x1, y1, x2, y2 = ox1, oy1, ox2, oy2
                 w = max(0, x2 - x1)
                 h = max(0, y2 - y1)
                 if w < 5 or h < 5:
                     self._log.append_log("[Snip] 选区太小 (宽<5 或 高<5)，忽略", "WARN")
                     return
+                # 夹过之后图片要跟着裁，否则图片与坐标对不上
+                if (x1, y1, x2, y2) != (ox1, oy1, ox2, oy2):
+                    try:
+                        pil = pil.crop((x1 - ox1, y1 - oy1, x2 - ox1, y2 - oy1))
+                    except Exception:
+                        x1, y1, x2, y2 = ox1, oy1, ox2, oy2
+                        w = max(0, x2 - x1)
+                        h = max(0, y2 - y1)
                 node = self._graph.nodes.get(nid)
                 if node is None:
                     return
@@ -1930,9 +2006,16 @@ class BlueprintMainWindow(QMainWindow):
                 traceback.print_exc()
 
         try:
-            overlay = SnipOverlay.prepare_and_run(self, delay_ms=400)
+            overlay = SnipOverlay.prepare_and_run(
+                self, delay_ms=400, limit_rect=limit_rect, limit_label=limit_label
+            )
             overlay.finished.connect(_on_result)
-            self._log.append_log("[Snip] 请在屏幕上框选矩形（ESC取消）...", "INFO")
+            if limit_rect:
+                self._log.append_log(
+                    f"[Snip] 请在临时目标窗口内框选矩形（范围 {limit_rect}，ESC取消）...", "INFO"
+                )
+            else:
+                self._log.append_log("[Snip] 请在屏幕上框选矩形（ESC取消）...", "INFO")
         except Exception as e:
             self._log.append_log(f"[Snip] 启动失败: {e}", "ERROR")
             traceback.print_exc()
@@ -2227,7 +2310,12 @@ class BlueprintMainWindow(QMainWindow):
             else:
                 self._log.append_log("静态校验提示：\n" + msg, "WARN")
         # 2. 启动 runner（QThread 硬约束 §4）
-        runner = BlueprintRunner(self._graph, self, initial_hwnd=self.get_active_hwnd())
+        # ⚠ 这里刻意不传 initial_hwnd：
+        #   主界面「🎯 截图目标」下拉只服务截图取素材，不再影响蓝图运行。
+        #   蓝图跑哪个窗口 100% 由蓝图自身决定（BindWindow 节点 / 各节点临时目标），
+        #   这样「编辑器内点▶运行」与「导出后的挂机 EXE」行为完全一致，
+        #   避免出现「编辑器里能跑、导出后找不到图」的口径偏差。
+        runner = BlueprintRunner(self._graph, self, initial_hwnd=None)
         runner.log_message.connect(self._log.append_log, Qt.QueuedConnection)
         runner.highlight_node.connect(
             lambda nid, s=self._scene: s.set_running_node(nid), Qt.QueuedConnection,
@@ -2478,9 +2566,10 @@ class BlueprintMainWindow(QMainWindow):
 
     # ==================== 截图 / 切分工具 (S3 / S4 hooks) ====================
     def _build_tool_hooks(self) -> dict:
+        # 只暴露切图工具真正会消费的回调（ElementSplitDialog 只用到 create_find_image_node）。
+        # 原先这里还注册过 "get_active_hwnd"，但消费方从未调用（_resolve_hook 全项目零调用点），已移除。
         return {
             "create_find_image_node": self._hook_create_find_image_node,
-            "get_active_hwnd": self.get_active_hwnd,
         }
 
     def _on_open_split_dialog(self):
@@ -2989,28 +3078,8 @@ class BlueprintMainWindow(QMainWindow):
                     pass
         except Exception:
             pass
-        # 2.5) 销毁 LLM 相关窗口（悬浮球 + 聊天窗口 + 设置对话框）
-        try:
-            for _attr in ("_llm_settings_dialog_ref", "_floating_ball"):
-                w = getattr(self, _attr, None)
-                if w is None:
-                    continue
-                try:
-                    # full_chat_dialog / quick_bubble 是子窗口挂在 floating_ball 上的，这里关父窗口就行
-                    w.close()
-                except Exception:
-                    pass
-                try:
-                    w.deleteLater()
-                except Exception:
-                    pass
-            setattr(self, "_llm_settings_dialog_ref", None)
-            setattr(self, "_floating_ball", None)
-        except Exception:
-            pass
         # 3) 同步用户设置到磁盘（保证设置对话框里改过的热键等下次启动还在）
-        # ⚠ 不能直接用 self._user_settings 覆盖磁盘——它会覆盖 LLM 设置面板刚写入的 llm 配置。
-        # 改为：只把 hotkeys/ui 等主窗口管理的字段合并到磁盘最新内容上。
+        # 只把 hotkeys/ui 等主窗口管理的字段合并到磁盘最新内容上，避免覆盖磁盘上的其他设置。
         try:
             from src.config.user_settings import read_user_settings as _rus
             disk = _rus()
@@ -3220,7 +3289,7 @@ class BlueprintMainWindow(QMainWindow):
             # 没工程：把警告当用户打日志也写警告到状态栏且不往下执行（因为写资源要先建工程）
             return
         """
-        按主界面「🎯目标程序」下拉选中的 HWND 直接截图：
+        按主界面「🎯截图目标」下拉选中的 HWND 直接截图：
           1. 不弹窗、不抢焦点（所以游戏不会被切到暂停界面）
           2. 默认 BitBlt 前台帧（D3D/Vulkan 游戏不黑屏）
           3. 保存 PNG 到 screenshots/（裁剪为模板小图单独点「裁图为模板」才写 templates/）
@@ -3233,13 +3302,13 @@ class BlueprintMainWindow(QMainWindow):
 
         hwnd = self._active_hwnd
         if not hwnd:
-            msg = "[热键] 请先在主界面「🎯目标程序」下拉里选好要截的窗口！（按 ↻ 刷新后选）"
+            msg = "[热键] 请先在主界面「🎯截图目标」下拉里选好要截的窗口！（按 ↻ 刷新后选）"
             self._log.append_log(msg, "WARN")
             self._status_lbl.setText(msg.replace("[热键] ", ""))
             return
 
         # ========== 预校验 & 自动恢复 ==========
-        #   1. IsWindow 失效 → 说明用户关掉/重启过目标程序，旧HWND句柄已被系统回收
+        #   1. IsWindow 失效 → 说明用户关掉/重启过截图目标窗口，旧HWND句柄已被系统回收
         #      → 自动刷新目标列表 + 按上次选中的"标题文本"尝试重新匹配同程序窗口
         #   2. IsIconic 最小化 → 提前警告用户用 PrintWindow 兜底（可能D3D游戏是黑的）
         try:
@@ -3289,7 +3358,7 @@ class BlueprintMainWindow(QMainWindow):
                 else:
                     msg = (
                         f"[热键] ❌ 原目标窗口已关闭/重启（旧HWND={old_hwnd:#X}），"
-                        f"已自动刷新下拉框但未匹配到同名窗口，请在主界面「🎯目标程序」下拉中重新选择。"
+                        f"已自动刷新下拉框但未匹配到同名窗口，请在主界面「🎯截图目标」下拉中重新选择。"
                     )
                     self._log.append_log(msg, "ERROR")
                     self._status_lbl.setText(msg.replace("[热键] ", ""))
@@ -3299,8 +3368,8 @@ class BlueprintMainWindow(QMainWindow):
                 self._active_hwnd_title_key = None
                 msg = (
                     f"[热键] ❌ 原目标窗口已关闭/重启（旧HWND={old_hwnd:#X}），"
-                    f"已自动刷新目标程序下拉框，但未找到同名窗口。"
-                    f"请在主界面「🎯目标程序」下拉中重新选择要截的窗口。"
+                    f"已自动刷新截图目标下拉框，但未找到同名窗口。"
+                    f"请在主界面「🎯截图目标」下拉中重新选择要截的窗口。"
                 )
                 self._log.append_log(msg, "ERROR")
                 self._status_lbl.setText(msg.replace("[热键] ", ""))
@@ -3427,6 +3496,42 @@ class BlueprintMainWindow(QMainWindow):
         except Exception:
             pass
 
+    # ==================== 导出为独立 EXE ====================
+    def _on_export_clicked(self):
+        """工具栏 📦 导出 EXE：把当前蓝图打包成一个可脱离本项目单独运行的 EXE。
+
+        导出逻辑见 src/blueprint/export/（载荷打包）与 src/blueprint/ui/export_dialog.py（界面）。
+        产物 = 运行时模板 BlueprintRuntime.exe 的副本 + 尾部追加的「蓝图 + 图片资源」载荷。
+        """
+        if self._graph is None:
+            QMessageBox.warning(self, "无法导出", "当前没有打开任何蓝图。")
+            return
+        # 取一个友好的蓝图名：优先 graph.name，其次当前文件名
+        name = str(getattr(self._graph, "name", "") or "").strip()
+        if (not name or name == "Untitled") and self._current_path:
+            try:
+                _, stem, _ = BlueprintStore._split_bp_path(self._current_path)
+                if stem:
+                    name = stem
+            except Exception:
+                pass
+        if not name:
+            name = "未命名蓝图"
+        try:
+            project_root = self._pm.project_root
+        except Exception:
+            project_root = None
+        try:
+            from src.blueprint.ui.export_dialog import ExportDialog
+        except Exception as e:
+            QMessageBox.critical(self, "模块加载失败", f"加载导出对话框失败：\n{e}")
+            return
+        dlg = ExportDialog(self, self._graph, name, project_root=project_root)
+        if dlg.exec():
+            out_path = getattr(dlg, "_result_path", "")
+            if out_path:
+                self._log.append_log(f"📦 已导出独立 EXE: {out_path}", "SUCCESS")
+
     # ==================== 内嵌文档攻略 UI 壳子 ====================
     def _clear_doc_dialog_ref(self):
         try:
@@ -3444,7 +3549,7 @@ class BlueprintMainWindow(QMainWindow):
             self._doc_dialog_ref, "isVisible", lambda: False)():
             try:
                 from PySide6.QtWidgets import QDialog, QVBoxLayout
-                # 文档查看器：蓝图模块通用 UI 组件，不是 LLM 子模块的一部分
+                # 文档查看器：蓝图模块通用 UI 组件
                 from src.blueprint.ui.doc_viewer import DocViewerPage
             except Exception as e:
                 QMessageBox.critical(
@@ -3485,173 +3590,6 @@ class BlueprintMainWindow(QMainWindow):
                 dlg.activateWindow()
             except Exception:
                 pass
-
-    # ==================== LLM UI 壳子 ====================
-    def _on_llm_settings_clicked(self):
-        """工具栏 🤖 LLM 设置按钮点击 → 打开/激活对话框（单例，不会开多个）。"""
-        try:
-            from src.blueprint.llm.ui.llm_settings_panel import LLMSettingsDialog
-        except Exception as e:
-            QMessageBox.critical(
-                self, "模块加载失败",
-                f"加载 LLM 设置面板失败（UI 壳子文件缺失或语法错误）：\n{e}"
-            )
-            return
-
-        if self._llm_settings_dialog_ref is None or not getattr(
-            self._llm_settings_dialog_ref, "isVisible", lambda: False)():
-            dlg = LLMSettingsDialog(self)
-            # 保存后如果启用开关变了 → 立即显示/隐藏悬浮球（两个信号都监听，双保险）
-            try:
-                dlg.llm_enabled_changed.connect(self._on_llm_enabled_changed_from_dialog)
-            except Exception as e:
-                try: self._log.append_log(f"[LLM] 连接信号 llm_enabled_changed 失败：{e}", "WARN")
-                except Exception: pass
-            try:
-                dlg.settings_saved.connect(self._on_llm_settings_saved_from_dialog)
-            except Exception as e:
-                try: self._log.append_log(f"[LLM] 连接信号 settings_saved 失败：{e}", "WARN")
-                except Exception: pass
-            try:
-                dlg.destroyed.connect(lambda *_: setattr(self, "_llm_settings_dialog_ref", None))
-            except Exception:
-                pass
-            self._llm_settings_dialog_ref = dlg
-            dlg.show()
-            dlg.raise_()
-            dlg.activateWindow()
-        else:
-            # 已打开 → 提到前台
-            try:
-                dlg = self._llm_settings_dialog_ref
-                dlg.showNormal()
-                dlg.raise_()
-                dlg.activateWindow()
-            except Exception:
-                pass
-
-    def _on_llm_settings_saved_from_dialog(self, data: dict):
-        """设置对话框保存 → 根据 data['enable'] 同步悬浮球。"""
-        try:
-            en = bool(data.get("enable", True))
-            self._ensure_floating_ball(show=en)
-            try: self._log.append_log(f"[LLM] 设置已保存，悬浮球状态：{'显示' if en else '隐藏'}", "INFO")
-            except Exception: pass
-        except Exception:
-            pass
-
-    def _on_llm_enabled_changed_from_dialog(self, enabled: bool):
-        """设置对话框里勾/取消「启用 LLM」 → 立即创建/销毁悬浮球（实时，不等保存）。"""
-        try:
-            self._ensure_floating_ball(show=bool(enabled))
-            try: self._log.append_log(f"[LLM] 开关切换：悬浮球{'显示' if enabled else '隐藏'}（实时生效）", "INFO")
-            except Exception: pass
-        except Exception as e:
-            try: self._log.append_log(f"[LLM] 创建/销毁悬浮球失败：{type(e).__name__}: {e}", "ERROR")
-            except Exception: pass
-
-    def _ensure_floating_ball(self, show: bool):
-        """
-        show=True  → 若没创建就创建悬浮球并显示；已存在就 raise_ 到前面
-        show=False → 若存在就关闭并销毁并置 None
-        """
-        if show:
-            if self._floating_ball is None:
-                try:
-                    from src.blueprint.llm.ui.floating_ball import FloatingBall
-                    # ⚠ 传 parent=None —— 必须让 FloatingBall 成为独立顶层窗口：
-                    #   - 主窗口最小化后悬浮球仍可见
-                    #   - Z-order 不跟随主窗口（游戏全屏时能压在游戏上面）
-                    ball = FloatingBall(None)
-                    # （预留）用户在悬浮球发送的消息，可以接信号连到 BlueprintGenerator
-                    try:
-                        ball.user_message.connect(self._on_ball_user_message_stub)
-                    except Exception:
-                        pass
-                    try:
-                        ball.blueprint_imported.connect(self._on_llm_blueprint_imported)
-                    except Exception:
-                        pass
-                    self._floating_ball = ball
-                except Exception as e:
-                    self._status_lbl.setText(f"[LLM] 创建悬浮球失败：{e}")
-                    return
-            try:
-                self._floating_ball.show()
-                self._floating_ball.raise_()
-            except Exception:
-                pass
-        else:
-            if self._floating_ball is None:
-                return
-            try:
-                # 先把挂在它下面的气泡/完整对话框关掉
-                for attr in ("_full_dlg", "_quick_bubble"):
-                    sub = getattr(self._floating_ball, attr, None)
-                    if sub is not None:
-                        try:
-                            sub.close()
-                        except Exception:
-                            pass
-                        try:
-                            sub.deleteLater()
-                        except Exception:
-                            pass
-                    try:
-                        setattr(self._floating_ball, attr, None)
-                    except Exception:
-                        pass
-                self._floating_ball.close()
-                try:
-                    self._floating_ball.deleteLater()
-                except Exception:
-                    pass
-            except Exception:
-                pass
-            self._floating_ball = None
-
-    def _on_ball_user_message_stub(self, msg: str):
-        """悬浮球发送消息打桩：在状态栏显示一条提示（真正接入 LLMClient 后改这里）。"""
-        try:
-            short = msg if len(msg) <= 40 else msg[:37] + "..."
-            self._status_lbl.setText(f"[LLM 打桩] 已接收：{short}（真实发送功能待接入）")
-        except Exception:
-            pass
-
-    def _on_llm_blueprint_imported(self, bp_dict: dict):
-        """LLM 生成的蓝图 JSON 导入画布（含校验）。"""
-        try:
-            from src.blueprint.core.models import BlueprintGraph
-            graph = BlueprintGraph.from_dict(bp_dict)
-
-            # 校验蓝图结构
-            try:
-                from src.blueprint.runtime.validator import validate_graph
-                issues = validate_graph(graph)
-                errors = [i for i in issues if i.level == "ERROR"]
-                warnings = [i for i in issues if i.level == "WARN"]
-                if errors:
-                    err_msgs = "\n".join(f"  · {i.message}" for i in errors[:5])
-                    QMessageBox.warning(
-                        self, "蓝图校验失败",
-                        f"赫萝：这个蓝图有些问题没法直接导入哦~\n\n错误：\n{err_msgs}\n\n"
-                        f"可以让赫萝重新生成，或手动修正后导入。"
-                    )
-                    return
-                if warnings:
-                    warn_msgs = "\n".join(f"  · {i.message}" for i in warnings[:3])
-                    self._log.append_log(f"[LLM] 蓝图校验警告：{warn_msgs}", "WARN")
-            except Exception:
-                pass  # 校验模块异常不阻断导入
-
-            self._bind_new_graph(graph, zoom_fit=True)
-            self._log.append_log(
-                f"[LLM] 蓝图导入成功：{len(graph.nodes)} 节点 / {len(graph.edges)} 连线",
-                "INFO"
-            )
-        except Exception as e:
-            self._log.append_log(f"[LLM] 蓝图导入失败：{type(e).__name__}: {e}", "ERROR")
-            QMessageBox.warning(self, "导入失败", f"蓝图解析失败：{e}\n\n可以让赫萝重新生成一次试试~")
 
 
 def main() -> int:

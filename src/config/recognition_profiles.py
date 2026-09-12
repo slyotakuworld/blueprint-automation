@@ -1,8 +1,7 @@
-import copy
-import logging
+"""识别参数预设表。
 
-_log = logging.getLogger(__name__)
-
+供 src.blueprint.runtime.template_matcher 按 key 取阈值/超时等默认参数。
+"""
 
 DEFAULT_RECOGNITION_PROFILES = {
     "match.default":       {"threshold": 0.80, "timeout": 30, "interval": 0.30, "fast_mode": True},
@@ -12,14 +11,3 @@ DEFAULT_RECOGNITION_PROFILES = {
     "match.element_stable":{"threshold": 0.85, "timeout": 30, "interval": 0.25, "fast_mode": False},
     "combo.default":       {"main_threshold": 0.80, "like_threshold": 0.70, "final_threshold": 0.75, "fast_mode": True},
 }
-
-
-def get_recognition_profile(bot, key, **overrides):
-    base = copy.deepcopy(DEFAULT_RECOGNITION_PROFILES.get(key, {}))
-    user_profiles = getattr(bot, "config", {}).get("recognition_profiles", {}) or {}
-    user_profile = user_profiles.get(key, {})
-    if isinstance(user_profile, dict):
-        base.update(user_profile)
-    if overrides:
-        base.update({k: v for k, v in overrides.items() if v is not None})
-    return base

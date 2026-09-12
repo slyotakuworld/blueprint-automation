@@ -1,6 +1,6 @@
 import json
 import os
-from typing import Callable, List, Optional
+from typing import List, Optional
 
 from PySide6.QtCore import QObject, Signal
 

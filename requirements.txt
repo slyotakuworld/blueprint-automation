@@ -9,4 +9,3 @@ pywin32
 psutil
 soundcard>=0.4.3
 PyAudio>=0.2.14
-openai

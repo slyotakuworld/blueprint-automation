@@ -1,3 +1,3 @@
-from .region_selector import RegionSelector, pil_to_bgr as _rs_pil_to_bgr
+from .region_selector import RegionSelector
 
 __all__ = ["RegionSelector"]

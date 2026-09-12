@@ -27,7 +27,7 @@ class RegionSelector:
 
     def _build_fullscreen_toplevel(self):
         import tkinter as tk
-        from PIL import Image, ImageTk
+        from PIL import ImageTk
 
         self._fullscreen_img = ImageGrab.grab(all_screens=True)
         self._screen_width = self._fullscreen_img.width

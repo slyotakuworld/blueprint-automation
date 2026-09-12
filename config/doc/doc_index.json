@@ -218,6 +218,11 @@
           "id": "adv_optimize",
           "title": "4. 性能优化与调试",
           "file": "34_adv_optimize.md"
+        },
+        {
+          "id": "adv_export",
+          "title": "5. 导出为独立 EXE",
+          "file": "35_adv_export.md"
         }
       ]
     },

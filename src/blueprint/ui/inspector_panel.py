@@ -3,10 +3,10 @@ import io
 import json
 import os
 import re
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from PySide6.QtCore import QEvent, QObject, QSize, Qt, Signal
-from PySide6.QtGui import QFont, QIcon, QPixmap
+from PySide6.QtGui import QFont, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -27,7 +27,6 @@ from PySide6.QtWidgets import (
     QProgressDialog,
     QPushButton,
     QScrollArea,
-    QSizePolicy,
     QSpinBox,
     QToolButton,
     QVBoxLayout,
@@ -364,7 +363,10 @@ class InspectorPanel(QWidget):
         if node.type == "IfImageDetect":
             btn_add = QPushButton("📷 截图新增一张")
             btn_add.setStyleSheet(self._btn_style("#ef6c00", "#ff9800"))
-            btn_add.setToolTip("全屏框选一张参考图，追加到下方列表")
+            btn_add.setToolTip(
+                "框选一张参考图，追加到下方列表\n"
+                "若已设置「临时目标窗口」，框选范围将自动限定在该窗口内"
+            )
             nid = node.id
             btn_add.clicked.connect(lambda _=False, n=nid: self.request_snip_for_node.emit(n, "if_img_add"))
             self._add_action_btn(btn_add)
@@ -397,7 +399,10 @@ class InspectorPanel(QWidget):
         if node.type == "FindImage":
             btn_snip = QPushButton("📸 截取目标")
             btn_snip.setStyleSheet(self._btn_style("#0969DA", "#58A6FF"))
-            btn_snip.setToolTip("全屏框选一个目标区域，自动保存为PNG到templates文件夹并回填模板路径+预览图")
+            btn_snip.setToolTip(
+                "框选一个目标区域，自动保存为PNG到templates文件夹并回填模板路径+预览图\n"
+                "若已设置「临时目标窗口」，框选范围将自动限定在该窗口内，避免截到窗口外的画面"
+            )
             nid = node.id
             btn_snip.clicked.connect(lambda _=False, n=nid: self.request_snip_for_node.emit(n, "findimg_target"))
             self._add_action_btn(btn_snip)
@@ -848,8 +853,12 @@ class InspectorPanel(QWidget):
 
         # 打开特征截取对话框
         from PySide6.QtWidgets import (
-            QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-            QListWidget, QListWidgetItem, QScrollArea, QSplitter,
+            QDialog,
+            QVBoxLayout,
+            QHBoxLayout,
+            QLabel,
+            QPushButton,
+            QScrollArea,
         )
         from PySide6.QtCore import Qt, QRect, QPointF
         from PySide6.QtGui import QPixmap, QImage, QPainter, QPen, QColor, QBrush
@@ -1172,7 +1181,7 @@ class InspectorPanel(QWidget):
             return
         node = self._current_node
         try:
-            from src.blueprint.core.variable_engine import VariableEngine, assemble_runtime_params
+            from src.blueprint.core.variable_engine import VariableEngine
             # 取当前蓝图的 variables 字典（如果有）；取不到就空
             vars_now: Dict[str, Any] = {}
             try:
@@ -2738,7 +2747,10 @@ class InspectorPanel(QWidget):
         bl.setSpacing(6)
         btn_roi = QPushButton("📍 框选ROI区域")
         btn_roi.setStyleSheet(self._btn_style("#d84315", "#ff7043"))
-        btn_roi.setToolTip("全屏框选一个矩形区域作为静止检测ROI")
+        btn_roi.setToolTip(
+            "框选一个矩形区域作为静止检测ROI\n"
+            "若已设置「临时目标窗口」，框选范围将自动限定在该窗口内"
+        )
         nid = node.id
         btn_roi.clicked.connect(lambda _=False, n=nid: self.request_snip_for_node.emit(n, "if_static_roi"))
         bl.addWidget(btn_roi)

@@ -1,7 +1,7 @@
 import uuid
 from typing import Dict, List, Optional
 
-from PySide6.QtCore import QPointF, QRectF, Qt, Signal, QMimeData
+from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import (
     QBrush,
     QColor,
@@ -12,13 +12,11 @@ from PySide6.QtGui import (
     QKeyEvent,
     QPainter,
     QPen,
-    QColorConstants,
 )
 from PySide6.QtWidgets import (
     QGraphicsScene,
     QGraphicsSceneMouseEvent,
     QGraphicsView,
-    QGraphicsItem,
     QWidget,
     QLineEdit,
     QHBoxLayout,
@@ -31,7 +29,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..core.models import BlueprintGraph, Edge, Node, PortDirection
-from ..core.node_library import create_node, NODE_LIBRARY, NODE_TYPES_ORDERED
+from ..core.node_library import NODE_LIBRARY, NODE_TYPES_ORDERED
 from .graphics_items import EdgeItem, NodeItem, PortItem
 
 

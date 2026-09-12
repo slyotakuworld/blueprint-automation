@@ -56,7 +56,6 @@ echo [BUILD] Running PyInstaller (--onedir, single dist layout) ...
   --distpath "%SCRIPT_DIR%dist" ^
   --specpath "%SCRIPT_DIR%dist\build" ^
   --add-data "%SCRIPT_DIR%config\doc;config\doc" ^
-  --add-data "%SCRIPT_DIR%config\llm_defaults.json;config" ^
   --add-data "%SCRIPT_DIR%images;images" ^
   --add-data "%SCRIPT_DIR%icon.png;." ^
   "%SCRIPT_DIR%src\blueprint_app.py"
@@ -64,6 +63,15 @@ echo [BUILD] Running PyInstaller (--onedir, single dist layout) ...
 set "EXIT_CODE=%ERRORLEVEL%"
 
 if exist "BlueprintAutomation.spec" echo [CLEAN] Removing stray spec from root (moved to dist/build) ... & del /q "BlueprintAutomation.spec" 2>nul
+
+REM ---------- 生成运行时模板 BlueprintRuntime.exe（供编辑器「导出为独立 EXE」使用）----------
+if "%EXIT_CODE%"=="0" (
+    echo.
+    echo [RUNTIME] Building standalone runtime template ...
+    set "BP_NO_PAUSE=1"
+    call "%SCRIPT_DIR%build_runtime.cmd" "%SCRIPT_DIR%dist\BlueprintAutomation"
+    set "BP_NO_PAUSE="
+)
 
 echo.
 if "%EXIT_CODE%"=="0" (

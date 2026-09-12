@@ -1,7 +1,5 @@
-import math
 import os
-import uuid
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import (
@@ -27,7 +25,6 @@ from PySide6.QtWidgets import (
     QMenu,
     QStyle,
     QStyleOptionGraphicsItem,
-    QWidget,
 )
 
 from ..core.models import Edge, Node, Port, PortDirection, PortType

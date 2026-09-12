@@ -3,14 +3,7 @@ from typing import Dict, Optional
 from PySide6.QtCore import Qt, QMimeData, Signal
 from PySide6.QtGui import QColor, QDrag, QFont
 from PySide6.QtWidgets import (
-    QFrame,
-    QGroupBox,
-    QHBoxLayout,
     QLabel,
-    QListWidget,
-    QListWidgetItem,
-    QScrollArea,
-    QSizePolicy,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,

@@ -1,6 +1,5 @@
 import os
-from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -13,12 +12,9 @@ from PySide6.QtGui import (
     QPainter,
     QPen,
     QPixmap,
-    QMouseEvent,
 )
 from PySide6.QtWidgets import (
-    QAbstractButton,
     QAbstractItemView,
-    QCheckBox,
     QComboBox,
     QDialog,
     QFileDialog,
@@ -35,15 +31,13 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMessageBox,
     QPushButton,
-    QScrollArea,
     QSizePolicy,
     QSplitter,
-    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
-from ...config.app_paths import get_app_dir, screenshot_dir, template_dir
+from ...config.app_paths import screenshot_dir, template_dir
 from ...automation.cv.splitter_integration import (
     list_elements_in_dir,
     run_splitter_on_image_bgr,
@@ -1800,17 +1794,3 @@ class ElementSplitDialog(QDialog):
                 f"✅ 模板已保存到:\n  {dst}\n\n"
                 f"（未找到主窗口的「生成节点」回调，未在画布上新增节点。）"
             )
-
-    def _resolve_hook(self, name: str):
-        """返回指定 name 的 hook 回调：兼容 dict / 对象属性两种方式。"""
-        h = self._hooks
-        if isinstance(h, dict):
-            v = h.get(name)
-            if callable(v):
-                return v
-            return None
-        # 对象方式
-        fn = getattr(h, name, None)
-        if callable(fn):
-            return fn
-        return None
