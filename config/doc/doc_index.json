@@ -113,16 +113,26 @@
           "title": "结束",
           "file": "node_End.md"
         },
-        {
-          "id": "node_loop",
-          "title": "循环",
-          "file": "node_Loop.md"
-        },
-        {
-          "id": "node_sequence",
-          "title": "顺序执行",
-          "file": "node_Sequence.md"
-        },
+    {
+      "id": "node_loop",
+      "title": "循环",
+      "file": "node_Loop.md"
+    },
+    {
+      "id": "node_component",
+      "title": "调用组件",
+      "file": "node_Component.md"
+    },
+    {
+      "id": "node_sequence",
+      "title": "顺序执行",
+      "file": "node_Sequence.md"
+    },
+    {
+      "id": "node_parallel",
+      "title": "并行执行",
+      "file": "node_Parallel.md"
+    },
         {
           "id": "node_setvariable",
           "title": "设置变量",
@@ -191,6 +201,16 @@
           "id": "node_sounddetect",
           "title": "声音检测",
           "file": "node_SoundDetect.md"
+        },
+        {
+          "id": "node_screenshot",
+          "title": "截图",
+          "file": "node_Screenshot.md"
+        },
+        {
+          "id": "node_ocrrecognize",
+          "title": "文字识别",
+          "file": "node_OcrRecognize.md"
         }
       ]
     },

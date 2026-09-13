@@ -43,9 +43,18 @@ class CoordOverlay(FullscreenOverlayBase):
             self._bound_rect = QRect(int(l), int(t), int(w), int(h))
         elif self._hwnd is not None:
             try:
-                import win32gui
-
-                l, t, r, b = win32gui.GetWindowRect(self._hwnd)
+                # 高亮框与拾取基准同口径：DWM 可见边界优先（裸 GetWindowRect 在
+                # Win10/11 含不可见边框，会让框比用户看到的窗口大几像素）
+                try:
+                    from src.tools.window_utils import get_window_rect_dwm
+                    rect = get_window_rect_dwm(self._hwnd)
+                except Exception:
+                    rect = None
+                if rect is not None:
+                    l, t, r, b = (int(v) for v in rect)
+                else:
+                    import win32gui
+                    l, t, r, b = win32gui.GetWindowRect(self._hwnd)
                 self._bound_rect = QRect(int(l), int(t), int(r - l), int(b - t))
                 if not self._exe_name:
                     try:

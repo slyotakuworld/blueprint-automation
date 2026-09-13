@@ -48,6 +48,7 @@ class NodeScene(QGraphicsScene):
     node_will_remove = Signal(str, dict, list)  # node_id, node_snapshot, related_edge_snapshots
     edge_will_remove = Signal(str, dict)  # edge_id, edge_snapshot
     nodes_dragged = Signal(list)  # list of (node_id, old_pos_tuple, new_pos_tuple)
+    node_double_clicked = Signal(str)  # node_id，双击节点（进入子图/循环体子画布）
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -169,6 +170,7 @@ class NodeScene(QGraphicsScene):
         self._node_items[node.id] = ni
         ni.node_position_changed.connect(lambda nid, p, s=self: s._on_node_moved(nid))
         ni.node_selected_changed.connect(self._on_node_sel)
+        ni.node_double_clicked.connect(self.node_double_clicked.emit)
         # 给所有 PortItem 连接交互信号（端口拖动连线 + 右键菜单）
         self._connect_port_signals_for_node(node.id)
         if emit:

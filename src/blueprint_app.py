@@ -229,6 +229,12 @@ class BlueprintMainWindow(QMainWindow):
         # ---- 内嵌文档对话框（UI 壳子） ----
         self._doc_dialog_ref = None            # 文档攻略对话框（单例）
 
+        # ---- 子图导航栈（组件/循环体子画布） ----
+        # 进入 Loop 循环体子画布 / 组件子图时，把父上下文压栈；返回时弹栈。
+        # 每项 = {"kind": "loop_body"|"component", "parent_graph": BlueprintGraph, "node_id": str}
+        self._subgraph_stack: list = []
+        self._breadcrumb_bar = None            # 面包屑导航条（进入子图时显示）
+
         self._build_central()
         self._build_toolbar()
         self._build_statusbar()
@@ -574,6 +580,10 @@ class BlueprintMainWindow(QMainWindow):
         cl = QVBoxLayout(center_wrap)
         cl.setContentsMargins(0, 0, 0, 0)
         cl.setSpacing(0)
+        # 面包屑导航条（进入循环体子画布 / 组件子图时显示，返回父图时隐藏）
+        self._breadcrumb_bar = self._build_breadcrumb_bar()
+        self._breadcrumb_bar.setVisible(False)
+        cl.addWidget(self._breadcrumb_bar)
         cl.addWidget(self._view)
         root_layout.addWidget(center_wrap, 1)
 
@@ -1030,6 +1040,149 @@ class BlueprintMainWindow(QMainWindow):
             return
         self._open_blueprint_path(path)
 
+    # ==================== 子图导航（循环体子画布 / 组件子图） ====================
+    def _build_breadcrumb_bar(self):
+        """顶部面包屑导航条：进入子图时显示「返回」按钮 + 当前层级路径。"""
+        bar = QWidget()
+        bar.setStyleSheet(
+            "background: #161B22; border-bottom: 1px solid #30363D;"
+        )
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(8, 3, 8, 3)
+        lay.setSpacing(6)
+        btn_back = QPushButton("← 返回父图")
+        btn_back.setStyleSheet(
+            "QPushButton { background: #21262D; color: #58A6FF; border: 1px solid #30363D;"
+            " border-radius: 4px; padding: 3px 10px; font-size: 11px; }"
+            "QPushButton:hover { background: #30363D; }"
+        )
+        btn_back.clicked.connect(self._exit_subgraph)
+        lay.addWidget(btn_back)
+        self._breadcrumb_label = QLabel("")
+        self._breadcrumb_label.setStyleSheet("color: #C9D1D9; font-size: 11px;")
+        lay.addWidget(self._breadcrumb_label, 1)
+        return bar
+
+    def _refresh_breadcrumb(self):
+        """刷新面包屑路径文案与可见性。"""
+        if self._breadcrumb_bar is None:
+            return
+        if not self._subgraph_stack:
+            self._breadcrumb_bar.setVisible(False)
+            return
+        # 从栈底到栈顶拼接路径
+        parts = []
+        for item in self._subgraph_stack:
+            node = None
+            pg = item.get("parent_graph")
+            nid = item.get("node_id", "")
+            if pg is not None:
+                node = pg.nodes.get(nid)
+            title = (node.type if node else "子图")
+            kind = item.get("kind")
+            kind_label = {"loop": "循环体", "seq": "顺序体", "parallel": "并行体"}.get(kind, "")
+            label = f"{title} {kind_label}" if kind_label else title
+            parts.append(label)
+        self._breadcrumb_label.setText("  ▸  ".join(parts))
+        self._breadcrumb_bar.setVisible(True)
+
+    def _on_node_double_clicked(self, node_id: str):
+        """双击节点：Loop → 循环体子画布；Sequence → 顺序体子画布；Parallel → 并行体子画布。"""
+        if self._graph is None or node_id not in self._graph.nodes:
+            return
+        node = self._graph.nodes[node_id]
+        # 三种子画布容器节点：参数键名 -> 子画布 kind
+        _container_map = {
+            "Loop": ("loop_body", "loop"),
+            "Sequence": ("seq_body", "seq"),
+            "Parallel": ("par_body", "parallel"),
+        }
+        if node.type in _container_map:
+            body_key, kind = _container_map[node.type]
+            body = node.params.get(body_key)
+            if isinstance(body, dict) and body.get("nodes"):
+                self._enter_subgraph(node, body_key, kind)
+            else:
+                self._create_empty_subgraph(node, body_key, kind)
+                self._enter_subgraph(node, body_key, kind)
+
+    def _create_empty_subgraph(self, host_node, body_key: str, kind: str):
+        """给子画布容器节点创建一个空的子图（含一个起始节点）。
+
+        起始节点按容器类型区分：并行体用「分支入口 Branch」（运行时只认 Branch，
+        开始节点在并行体里不参与执行），循环体/顺序体用「开始 Start」。
+        """
+        from src.blueprint.core.node_library import create_node as _cn
+        start_type = "Branch" if kind == "parallel" else "Start"
+        start = _cn(start_type, pos=(0, 0), node_id="start")
+        body = {
+            "nodes": {start.id: start.to_dict()},
+            "links": [],
+        }
+        host_node.params[body_key] = body
+        title = {"loop": "循环", "seq": "顺序执行", "parallel": "并行执行"}.get(kind, "子画布")
+        self._log.append_log(
+            f"已为「{title}」节点创建空的子画布（含「{'分支入口' if kind == 'parallel' else '开始'}」），双击即可进入编辑。",
+            "INFO",
+        )
+
+    def _enter_subgraph(self, host_node, body_key: str, kind: str):
+        """进入子画布容器节点（Loop/Sequence/Parallel）的子画布：父图压栈，切换渲染。"""
+        from src.blueprint.core.models import BlueprintGraph
+        body = host_node.params.get(body_key)
+        if not (isinstance(body, dict) and body.get("nodes")):
+            return
+        self._subgraph_stack.append({
+            "kind": kind,            # "loop" | "seq" | "parallel"
+            "body_key": body_key,    # 回写参数键名（loop_body / seq_body / par_body）
+            "parent_graph": self._graph,
+            "node_id": host_node.id,
+        })
+        sub = BlueprintGraph.from_dict({
+            "nodes": body.get("nodes", {}),
+            "links": body.get("links", []),
+            "metadata": {"name": f"{host_node.id}::{body_key}"},
+        })
+        sub._host_node_id = host_node.id
+        self._scene.set_graph(sub)
+        self._graph = sub
+        self._inspector.set_node(None)
+        # 上下文节点：循环体注入 Continue/Break；并行体注入 Branch
+        if kind == "loop":
+            self._palette.set_context_nodes(["Continue", "Break"])
+        elif kind == "parallel":
+            self._palette.set_context_nodes(["Branch"])
+        else:
+            self._palette.set_context_nodes([])
+        self._refresh_breadcrumb()
+        title = {"loop": "循环", "seq": "顺序执行", "parallel": "并行执行"}.get(kind, "子画布")
+        self._log.append_log(
+            f"进入「{title}」节点 {host_node.id[:8]} 的子画布。双击节点内容可编辑；点「← 返回父图」退出。",
+            "INFO",
+        )
+
+    def _exit_subgraph(self):
+        """退出当前子画布，返回父图。"""
+        if not self._subgraph_stack:
+            return
+        item = self._subgraph_stack.pop()
+        parent_graph = item.get("parent_graph")
+        if parent_graph is None:
+            return
+        # 回写子图内容到宿主节点
+        body_key = item.get("body_key")
+        if body_key and self._graph is not None:
+            node_id = item.get("node_id")
+            host = parent_graph.nodes.get(node_id)
+            if host is not None:
+                host.params[body_key] = self._graph.to_dict()
+        self._scene.set_graph(parent_graph)
+        self._graph = parent_graph
+        self._inspector.set_node(None)
+        self._palette.set_context_nodes([])  # 清空子画布专用节点
+        self._refresh_breadcrumb()
+        self._log.append_log("已返回父图。", "INFO")
+
     def _build_statusbar(self):
         self._status = QStatusBar(self)
         self.setStatusBar(self._status)
@@ -1051,6 +1204,7 @@ class BlueprintMainWindow(QMainWindow):
     def _wire_signals(self):
         self._scene.node_selected.connect(self._on_scene_node_selected)
         self._scene.graph_changed.connect(self._update_title)
+        self._scene.node_double_clicked.connect(self._on_node_double_clicked)
         self._inspector.param_changed.connect(self._on_param_changed)
         self._inspector.request_pick_template.connect(self._on_pick_template)
         self._inspector.request_snip_for_node.connect(self._on_snip_for_node)
@@ -1066,6 +1220,18 @@ class BlueprintMainWindow(QMainWindow):
         """
         # 0) 停止正在运行的 runner（防止旧 runner 继续执行旧图、高亮串到新图节点）
         self._stop_and_detach_runner()
+        # 0.5) 重置子图导航栈 + palette 上下文（切换蓝图后不再停留在旧的子画布）
+        self._subgraph_stack.clear()
+        if self._palette is not None:
+            try:
+                self._palette.set_context_nodes([])
+            except Exception:
+                pass
+        if self._breadcrumb_bar is not None:
+            try:
+                self._breadcrumb_bar.setVisible(False)
+            except Exception:
+                pass
         # 1) 先清理旧选中状态：画布取消所有高亮 + Inspector面板清空
         try:
             self._scene.clearSelection()
@@ -1244,6 +1410,12 @@ class BlueprintMainWindow(QMainWindow):
     def _on_save(self):
         if self._graph is None:
             return
+        # 若当前正处在子画布（循环体/组件），先把子图内容回写进宿主节点，再保存真正的父图
+        if self._subgraph_stack:
+            self._flush_subgraph_to_host()
+            parent_graph = self._subgraph_stack[0].get("parent_graph")
+            if parent_graph is not None:
+                self._graph = parent_graph
         if not self._current_path:
             self._on_save_as()
             return
@@ -1258,6 +1430,22 @@ class BlueprintMainWindow(QMainWindow):
             self._update_title()
         else:
             QMessageBox.warning(self, "保存失败", "写入文件失败，请检查路径与权限。")
+
+    def _flush_subgraph_to_host(self):
+        """把当前子图内容回写到宿主节点的 params（loop_body/seq_body/par_body），不改变导航栈、不切画布。"""
+        if not self._subgraph_stack or self._graph is None:
+            return
+        item = self._subgraph_stack[-1]
+        body_key = item.get("body_key")
+        if not body_key:
+            return
+        parent_graph = item.get("parent_graph")
+        node_id = item.get("node_id")
+        if parent_graph is None or node_id is None:
+            return
+        host = parent_graph.nodes.get(node_id)
+        if host is not None:
+            host.params[body_key] = self._graph.to_dict()
 
     def _on_save_as(self):
         if self._graph is None:
@@ -1534,8 +1722,33 @@ class BlueprintMainWindow(QMainWindow):
             # 注意：每次端口变化后，必须延迟刷新 inspector，退出当前信号栈再重建 UI，防止 sender 控件被中途删除导致 0xC0000005 ACCESS_VIOLATION
             try:
                 need_refresh_ports = False
-                # ---- Sequence：num_paths 变 → 输出端口数变 ----
-                if node.type == "Sequence" and param_name == "num_paths":
+                # ---- Component：num_inputs / num_outputs 变 → 输入/输出端口数变 ----
+                if node.type == "Component" and param_name in ("num_inputs", "num_outputs"):
+                    from src.blueprint.core.node_library import _resolve_input_ports_default, _resolve_output_ports_default
+                    p = dict(node.params or {})
+                    new_in = _resolve_input_ports_default(node.type, p)
+                    new_out = _resolve_output_ports_default(node.type, p)
+                    cur_in_names = [pp.name for pp in node.inputs]
+                    cur_out_names = [pp.name for pp in node.outputs]
+                    new_in_names = [pp.name for pp in new_in]
+                    new_out_names = [pp.name for pp in new_out]
+                    if cur_in_names != new_in_names or cur_out_names != new_out_names:
+                        removed_in_set = set(cur_in_names) - set(new_in_names)
+                        removed_out_set = set(cur_out_names) - set(new_out_names)
+                        if removed_in_set or removed_out_set:
+                            edges_to_remove = []
+                            for edge in list(self._graph.edges.values()):
+                                if (edge.to_node == node_id and edge.to_port in removed_in_set) or \
+                                   (edge.from_node == node_id and edge.from_port in removed_out_set):
+                                    edges_to_remove.append(edge.id)
+                            for eid in edges_to_remove:
+                                if self._scene is not None:
+                                    self._scene.remove_edge(eid, _emit_will=False)
+                        node.inputs = list(new_in)
+                        node.outputs = list(new_out)
+                        need_refresh_ports = True
+                # ---- Start：num_params 变 → 输出端口数变（组件蓝图入参）----
+                if node.type == "Start" and param_name == "num_params":
                     from src.blueprint.core.node_library import _resolve_output_ports_default
                     p = dict(node.params or {})
                     new_out = _resolve_output_ports_default(node.type, p)
@@ -1544,7 +1757,6 @@ class BlueprintMainWindow(QMainWindow):
                     if cur_out_names != new_out_names:
                         removed_out_set = set(cur_out_names) - set(new_out_names)
                         removed_in_set = set()
-                        new_in_names = []
                         if removed_out_set or removed_in_set:
                             edges_to_remove = []
                             for edge in list(self._graph.edges.values()):
@@ -1555,6 +1767,27 @@ class BlueprintMainWindow(QMainWindow):
                                 if self._scene is not None:
                                     self._scene.remove_edge(eid, _emit_will=False)
                         node.outputs = list(new_out)
+                        need_refresh_ports = True
+                # ---- End：num_returns 变 → 输入端口数变（组件蓝图返回值）----
+                if node.type == "End" and param_name == "num_returns":
+                    from src.blueprint.core.node_library import _resolve_input_ports_default
+                    p = dict(node.params or {})
+                    new_in = _resolve_input_ports_default(node.type, p)
+                    cur_in_names = [pp.name for pp in node.inputs]
+                    new_in_names = [pp.name for pp in new_in]
+                    if cur_in_names != new_in_names:
+                        removed_in_set = set(cur_in_names) - set(new_in_names)
+                        removed_out_set = set()
+                        if removed_in_set or removed_out_set:
+                            edges_to_remove = []
+                            for edge in list(self._graph.edges.values()):
+                                if (edge.to_node == node_id and edge.to_port in removed_in_set) or \
+                                   (edge.from_node == node_id and edge.from_port in removed_out_set):
+                                    edges_to_remove.append(edge.id)
+                            for eid in edges_to_remove:
+                                if self._scene is not None:
+                                    self._scene.remove_edge(eid, _emit_will=False)
+                        node.inputs = list(new_in)
                         need_refresh_ports = True
                 # ---- VarSwitch / SetVariable：num_data_inputs 变 → 输入端口数变 ----
                 if node.type in ("VarSwitch", "SetVariable") and param_name == "num_data_inputs":
@@ -1650,9 +1883,11 @@ class BlueprintMainWindow(QMainWindow):
                = "ok"        已找到（window_dict 含 hwnd/title/exe_name/class_name/rect）
                = "notfound"  配置了但当前找不到
 
-        匹配口径与运行时 _find_window_3d 保持一致：title 子串 / exe 子串 /
-        class 全等，命中一个维度 +10，配置了却没命中 -1000（直接淘汰）。
-        这是「编辑器 / 运行时口径一致」原则的落点，改这里必须同步 executor 那边。
+        匹配一律走运行时同款 _find_window_3d（title 子串 / exe 子串 / class 全等，
+        填了就必须命中；不过滤最小化窗口）。
+        「编辑器 / 运行时口径一致」原则：可见窗口枚举 enumerate_valid_windows
+        只允许用于「📋 从列表选择」这个配置入口，禁止参与任何匹配 / 运行路径。
+        改这里必须同步 executor._find_window_3d。
         """
         params = getattr(node, "params", None) or {}
         title = str(params.get("temp_target_title", "") or "").strip()
@@ -1661,28 +1896,20 @@ class BlueprintMainWindow(QMainWindow):
         if not (title or exe or cls):
             return None, "none"
         try:
-            from src.blueprint.ui.window_picker_overlay import enumerate_valid_windows
-            wins = enumerate_valid_windows()
+            from src.blueprint.runtime.executor import _find_window_3d
+            hwnd = _find_window_3d(title, exe, cls)
         except Exception as e:
-            self._log.append_log(f"[Target] 窗口枚举失败: {e}", "WARN")
+            self._log.append_log(f"[Target] 临时目标窗口匹配失败: {e}", "WARN")
             return None, "notfound"
-        best = None
-        best_score = -(10 ** 9)
-        for w in wins:
-            s = 0
-            w_title = str(w.get("title", "") or "")
-            w_exe = str(w.get("exe_name", "") or "").lower()
-            w_cls = str(w.get("class_name", "") or "")
-            if title:
-                s += 10 if title.lower() in w_title.lower() else -1000
-            if exe:
-                ok_exe = bool(w_exe) and (exe.lower() in w_exe or w_exe.endswith(exe.lower()))
-                s += 10 if ok_exe else -1000
-            if cls:
-                s += 10 if cls.lower() == w_cls.lower() else -1000
-            if s > best_score:
-                best, best_score = w, s
-        if best is None or best_score <= 0:
+        if not hwnd:
+            return None, "notfound"
+        try:
+            from src.blueprint.ui.window_picker_overlay import _get_window_info
+            best = _get_window_info(hwnd)
+        except Exception as e:
+            self._log.append_log(f"[Target] 窗口信息读取失败: {e}", "WARN")
+            best = None
+        if not best:
             return None, "notfound"
         return best, "ok"
 
@@ -1698,13 +1925,23 @@ class BlueprintMainWindow(QMainWindow):
         if status != "ok" or best is None:
             return None, "", status
         # 把临时目标窗口提到最前，避免截到盖在它上面的其它窗口
-        try:
-            hwnd = int(best.get("hwnd") or 0)
-            if hwnd:
+        # （bring_window_to_front 会自动还原最小化窗口；还原后矩形会变，需重取）
+        hwnd = int(best.get("hwnd") or 0) or None
+        if hwnd:
+            try:
                 from src.tools.window_utils import bring_window_to_front
                 bring_window_to_front(hwnd)
-        except Exception:
-            pass
+            except Exception:
+                pass
+            try:
+                from src.blueprint.ui.window_picker_overlay import _get_window_info
+                fresh = _get_window_info(hwnd)
+                if fresh:
+                    best = fresh
+            except Exception:
+                pass
+        # 矩形：DWM 可见边界（与运行时 _resolve_temp_target_rect 同口径），
+        # _get_window_info 返回的 rect 本就是 DWM 口径 (x,y,w,h)
         try:
             lx, ly, lw, lh = (int(v) for v in best.get("rect"))
         except Exception:
@@ -1823,6 +2060,15 @@ class BlueprintMainWindow(QMainWindow):
                     self._on_param_changed(nid, "roi_preview_b64", b64)
                     self._log.append_log(
                         f"[if_static] ROI框选完成: ({x1},{y1}) {w}×{h}", "SUCCESS"
+                    )
+                    self._inspector.set_node(node)
+                    return
+                # Screenshot / OcrRecognize：roi 是 tuple4 (x,y,w,h)
+                if m in ("screenshot_roi", "ocr_roi"):
+                    self._on_param_changed(nid, "roi", (int(x1), int(y1), int(w), int(h)))
+                    self._on_param_changed(nid, "roi_preview_b64", b64)
+                    self._log.append_log(
+                        f"[{m}] ROI框选完成: ({x1},{y1}) {w}×{h}", "SUCCESS"
                     )
                     self._inspector.set_node(node)
                     return
@@ -3241,6 +3487,21 @@ class BlueprintMainWindow(QMainWindow):
 
 
 def main() -> int:
+    # ============================================================
+    # OCR 测试识别 worker 模式：frozen（发布版编辑器 exe）下
+    # BlueprintAutomation.exe --bp-ocr-worker <img> <lang> <result>
+    # 不启动 GUI，直接跑 OCR 并把 JSON 结果写入 result 文件后退出。
+    # 开发模式则直接跑 ocr_test_worker.py 脚本，不走这里。
+    # ============================================================
+    if "--bp-ocr-worker" in sys.argv:
+        try:
+            i = sys.argv.index("--bp-ocr-worker")
+            from src.blueprint.runtime.ocr_test_worker import main as _worker_main
+            _worker_main(sys.argv[i + 1:])
+        except Exception:
+            pass
+        return 0
+
     # ============================================================
     # 打包 --windowed 模式下 sys.stdout/stderr 为 None，print() 会抛异常
     # 安装一个空的 writer 兜底（开发模式有控制台不受影响）

@@ -24,7 +24,12 @@ DATA_TYPES = [
     "tuple4",
     "path",
     "string",
+    "str",
     "list_path",
+    "list",
+    "dict",
+    "image",
+    "bytes",
 ]
 
 
@@ -167,6 +172,22 @@ class Node:
         else:
             outputs = []
 
+        # 4.5 端口迁移：非动态端口节点，若 JSON 里保存的端口与当前节点库定义不一致
+        #     （多为旧版节点定义遗留，如旧版 Sequence 的 out_1/out_2/out_3 分支输出），
+        #     以当前定义为准重建端口。动态端口节点（has_dynamic_ports=True，端口由参数
+        #     生成）仍以 JSON 为准，避免把用户配置的端口数量弄丢。
+        if meta is not None and not bool(getattr(meta, "has_dynamic_ports", False)):
+            try:
+                from .node_library import _resolve_input_ports_default, _resolve_output_ports_default
+                want_in = [pp.name for pp in _resolve_input_ports_default(ba_type, params)]
+                want_out = [pp.name for pp in _resolve_output_ports_default(ba_type, params)]
+                if [pp.name for pp in inputs] != want_in:
+                    inputs = [Port(**pp.__dict__) for pp in _resolve_input_ports_default(ba_type, params)]
+                if [pp.name for pp in outputs] != want_out:
+                    outputs = [Port(**pp.__dict__) for pp in _resolve_output_ports_default(ba_type, params)]
+            except Exception:
+                pass
+
         n = Node(
             id=d["id"],
             type=ba_type,
@@ -302,6 +323,21 @@ class BlueprintGraph:
 
         nodes: Dict[str, Node] = {nid: Node.from_dict(nd) for nid, nd in nodes_d.items()}
         edges: Dict[str, Edge] = {eid: Edge.from_dict(ed) for eid, ed in edges_d.items()}
+
+        # 过滤悬空连线：端口在（迁移后的）节点上不存在的连线直接丢弃，
+        # 避免旧版端口（如旧 Sequence 的 out_1/out_2/out_3）被清理后留下坏连线。
+        valid_edges: Dict[str, Edge] = {}
+        for eid, e in edges.items():
+            fn = nodes.get(e.from_node)
+            tn = nodes.get(e.to_node)
+            if fn is None or tn is None:
+                continue
+            if e.from_port not in {pp.name for pp in fn.outputs}:
+                continue
+            if e.to_port not in {pp.name for pp in tn.inputs}:
+                continue
+            valid_edges[eid] = e
+        edges = valid_edges
 
         # 合并断点：顶层 breakpoints list + 每个节点自己的 breakpoint 字段
         for nid, n in nodes.items():

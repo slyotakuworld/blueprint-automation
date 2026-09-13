@@ -58,7 +58,14 @@ class NodePalette(QWidget):
         super().__init__(parent)
         self.setMinimumWidth(220)
         self.setMaximumWidth(220)
+        self._context_nodes: list = []  # 子画布上下文额外节点（如循环体里的 Continue/Break）
         self._build_ui()
+
+    def set_context_nodes(self, extra_types):
+        """设置子画布上下文额外节点（如循环体子画布里的 Continue/Break）。
+        传空列表清空。会重新填充节点树。"""
+        self._context_nodes = list(extra_types or [])
+        self._fill_tree()
 
     def _build_ui(self):
         outer = QVBoxLayout(self)
@@ -135,6 +142,18 @@ class NodePalette(QWidget):
             tip_parts = [ntype, meta.description or ""]
             it.setForeground(0, QColor("#C9D1D9"))
             it.setToolTip(0, "\n".join(t for t in tip_parts if t))
+        # 2) 子画布上下文节点（如循环体里的 Continue/Break）追加到各自分类
+        for ntype in self._context_nodes:
+            meta = NODE_LIBRARY.get(ntype)
+            if not meta:
+                continue
+            parent = category_items.get(meta.category)
+            if parent is None:
+                continue
+            it = QTreeWidgetItem(parent, [meta.title])
+            it.setData(0, Qt.UserRole, ntype)
+            it.setForeground(0, QColor("#A371F7"))
+            it.setToolTip(0, f"{ntype}\n{meta.description or ''}")
         self._tree.expandAll()
 
     def current_node_type(self) -> Optional[str]:

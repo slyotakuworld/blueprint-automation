@@ -60,6 +60,49 @@ def preview_assets(graph) -> Any:
     return scan_assets(graph.to_dict())
 
 
+def uses_ocr(graph, project_root: Optional[str] = None) -> bool:
+    """判断蓝图（递归地）是否包含 OCR 识别节点。
+
+    用于「动态打包」：含 OcrRecognize 节点时才需要携带 OCR 运行时（ocr_runtime/ 目录），
+    不含则导出的 EXE 完全不带 OCR，体积不涨。
+
+    递归遍历：
+      - 内嵌子图（loop_body 等塞在 node.data 里的 dict）→ 按结构递归。
+      - Component 组件（node.data.blueprint_path 文件引用）→ 加载组件蓝图文件递归检测。
+    """
+    def _walk(obj: Any, depth: int = 0) -> bool:
+        if depth > 20:
+            return False
+        if isinstance(obj, dict):
+            t = str(obj.get("type", ""))
+            # 序列化后的蓝图用 type_short_name（ocr_recognize），也兼容完整名 OcrRecognize
+            if t in ("OcrRecognize", "ocr_recognize"):
+                return True
+            # Component 组件：加载引用文件递归检测
+            if t in ("Component", "component"):
+                data = obj.get("data") or {}
+                bp = str(data.get("blueprint_path", "") or "").strip()
+                if bp and project_root:
+                    cand = bp if os.path.isabs(bp) else os.path.join(project_root, bp)
+                    if os.path.isfile(cand):
+                        try:
+                            from src.blueprint.core.graph_store import BlueprintStore
+                            sub = BlueprintStore.load(cand)
+                            if sub is not None and _walk(sub.to_dict(), depth + 1):
+                                return True
+                        except Exception:
+                            pass
+            return any(_walk(v, depth + 1) for v in obj.values())
+        if isinstance(obj, (list, tuple)):
+            return any(_walk(v, depth + 1) for v in obj)
+        return False
+
+    try:
+        return _walk(graph.to_dict())
+    except Exception:
+        return False
+
+
 def export_blueprint(
     graph,
     blueprint_name: str,

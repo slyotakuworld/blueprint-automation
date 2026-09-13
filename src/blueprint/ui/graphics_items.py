@@ -241,6 +241,7 @@ class NodeItem(QGraphicsObject):
     node_selected_changed = Signal(str, bool)
     request_delete = Signal(str)
     breakpoint_toggled = Signal(str, bool)   # (node_id, new_state) 断点切换后通知外部（scene 可更新 persist 缓存）
+    node_double_clicked = Signal(str)        # node_id，双击节点（用于进入子图/循环体子画布）
 
     def __init__(self, node: Node):
         super().__init__()
@@ -304,6 +305,15 @@ class NodeItem(QGraphicsObject):
     # ---------------- 结构 ----------------
     def _meta(self):
         return NODE_LIBRARY.get(self.node.type)
+
+    def mouseDoubleClickEvent(self, event):
+        """节点双击：发射 node_double_clicked，供外部进入子图/循环体子画布。
+        不拦截事件，继续交给默认处理（选中等）。"""
+        try:
+            self.node_double_clicked.emit(self.node.id)
+        except Exception:
+            pass
+        super().mouseDoubleClickEvent(event)
 
     def _summary_text(self) -> str:
         """返回节点关键参数摘要（显示在画布节点端口区域下方）。

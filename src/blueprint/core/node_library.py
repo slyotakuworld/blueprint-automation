@@ -52,11 +52,13 @@ CATEGORY_NODE_ORDER: Dict[str, List[str]] = {
         "Start",         # 1、开始
         "End",           # 2、结束
         "Loop",          # 3、循环
-        "Sequence",      # 4、序列
-        "SetVariable",   # 5、变量
-        "VarSwitch",     # 6、条件判断 → AND 多条件判断，每行 变量名 运算符 值，全部同时满足 → yes / 任一不满足 → no
-        "Clipboard",     # 7、剪贴板
-        "Notify",        # 8、提示
+        "Component",     # 4、调用组件（蓝图复用/预制体）
+        "Sequence",      # 5、顺序执行（纯串行队列，子画布容器）
+        "Parallel",      # 6、并行执行（多分支并发，子画布容器）
+        "SetVariable",   # 7、变量
+        "VarSwitch",     # 8、条件判断 → AND 多条件判断，每行 变量名 运算符 值，全部同时满足 → yes / 任一不满足 → no
+        "Clipboard",     # 9、剪贴板
+        "Notify",        # 10、提示
     ],
     CATEGORY_EXECUTE: [
         "Mouse",         # 1、鼠标
@@ -68,6 +70,8 @@ CATEGORY_NODE_ORDER: Dict[str, List[str]] = {
         "IfImageDetect", # 2、检索 → 多图AND
         "StillnessDetect",# 3、静止
         "SoundDetect",   # 4、声音
+        "Screenshot",    # 5、截图 → 截目标窗口 ROI 输出图像
+        "OcrRecognize",  # 6、文字/数字识别 → 内置 OCR 引擎
     ],
 }
 
@@ -161,23 +165,36 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         type="Start",
         category=CATEGORY_LOGIC,
         title="开始",
-        description="咱是整张蓝图唯一的起点哟~每张蓝图只能放一个咱，从这里开始往下跑！",
+        description="咱是整张蓝图唯一的起点哟~每张蓝图只能放一个咱，从这里开始往下跑！\n\n作为「组件蓝图」的入口时，还能声明入参端口（param_0/param_1…），调用它的「组件」节点会按序把传入的值喂给这些端口。",
         color="#238636",
         accent="#3FB950",
         outputs=[_exec_out()],
+        params=[
+            ParamDef(name="num_params", editor=EDITOR_INT, default=0, min=0, max=20,
+                     label="入参端口数",
+                     help="本蓝图作为「组件」被调用时的入参端口数量（param_0/param_1…，数据输出端口）。\n"
+                          "普通蓝图保持 0 即可；设为 N 后，调用方「组件」节点需按序传入 N 个值。"),
+        ],
         type_short_name="start",
+        has_dynamic_ports=True,
     ),
     "End": NodeMeta(
         type="End",
         category=CATEGORY_LOGIC,
         title="结束",
-        description="和Start配对的终点~跑到咱这里就算这条分支收工啦，不会再继续往下走咯。",
+        description="和Start配对的终点~跑到咱这里就算这条分支收工啦，不会再继续往下走咯。\n\n作为「组件蓝图」的出口时，还能声明返回值端口（ret_0/ret_1…），把值交还给调用它的「组件」节点。",
         color="#0b3d91",
         accent="#1565c0",
         inputs=[_exec_in("in_exec", label="▶")],
         outputs=[],
-        params=[],
+        params=[
+            ParamDef(name="num_returns", editor=EDITOR_INT, default=0, min=0, max=20,
+                     label="返回值端口数",
+                     help="本蓝图作为「组件」被调用时的返回值端口数量（ret_0/ret_1…，数据输入端口）。\n"
+                          "普通蓝图保持 0 即可；设为 N 后，连到这些端口的值会按序交还给调用方「组件」节点的输出端口。"),
+        ],
         type_short_name="end",
+        has_dynamic_ports=True,
     ),
     "Loop": NodeMeta(
         type="Loop",
@@ -202,6 +219,70 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
                      help="每轮循环体执行完后的等待时间（秒）"),
         ],
         type_short_name="loop",
+    ),
+    "Continue": NodeMeta(
+        type="Continue",
+        category=CATEGORY_LOGIC,
+        title="再次循环",
+        description="只出现在循环体子画布内~跑到咱这里就立即结束本轮、开始下一轮循环，不会继续往下走后续节点。",
+        color="#8250DF",
+        accent="#A371F7",
+        inputs=[_exec_in("in_exec", label="▶")],
+        outputs=[],
+        params=[],
+        type_short_name="continue",
+        hidden_in_palette=True,
+    ),
+    "Break": NodeMeta(
+        type="Break",
+        category=CATEGORY_LOGIC,
+        title="跳出循环",
+        description="只出现在循环体子画布内~跑到咱这里就立即结束整个循环，跳到循环节点的「退出」出口。",
+        color="#DA3633",
+        accent="#FF7B72",
+        inputs=[_exec_in("in_exec", label="▶")],
+        outputs=[],
+        params=[],
+        type_short_name="break",
+        hidden_in_palette=True,
+    ),
+    "Branch": NodeMeta(
+        type="Branch",
+        category=CATEGORY_LOGIC,
+        title="分支入口",
+        description="只出现在并行体子画布内~每个咱代表一条并行分支的起点，从咱的 out_exec 往下连就是这条分支要跑的动作。运行时所有「分支入口」会同时用线程并发执行。",
+        color="#0E6B5C",
+        accent="#2DD4BF",
+        inputs=[],
+        outputs=[_exec_out("out_exec", label="▶")],
+        params=[],
+        type_short_name="branch",
+        hidden_in_palette=True,
+    ),
+    "Component": NodeMeta(
+        type="Component",
+        category=CATEGORY_LOGIC,
+        title="调用组件",
+        description="把一个蓝图当作「预制体/组件」复用~选中工程 components/ 目录下的一张蓝图，跑到咱这里就跳到那张蓝图去跑一遍，跑完再回来继续。\n\n支持显式传参：左侧 in_0/in_1… 输入端口把值传给子蓝图的 Start 入参端口，子蓝图 End 的返回值会回到右侧 out_0/out_1… 输出端口。变量仍然全局共享。",
+        color="#1F6FEB",
+        accent="#58A6FF",
+        inputs=[_exec_in("in_exec", label="▶")],
+        outputs=[_exec_out("out_done", label="完成")],
+        params=[
+            ParamDef(name="blueprint_path", editor=EDITOR_STRING, default="", label="组件蓝图",
+                     placeholder="从下拉列表选择 components/ 目录下的蓝图",
+                     help="要复用的那张蓝图（工程 components/ 目录下的 .bp.json）。从下拉列表选择即可，无需手填路径。"),
+            ParamDef(name="num_inputs", editor=EDITOR_INT, default=0, min=0, max=20,
+                     label="输入参数端口数",
+                     help="传给子蓝图 Start 入参端口的参数个数（in_0/in_1… 数据输入端口）。\n"
+                          "应与子蓝图 Start 的「入参端口数」一致，按序一一对应。"),
+            ParamDef(name="num_outputs", editor=EDITOR_INT, default=0, min=0, max=20,
+                     label="输出参数端口数",
+                     help="从子蓝图 End 返回值端口接收的返回值个数（out_0/out_1… 数据输出端口）。\n"
+                          "应与子蓝图 End 的「返回值端口数」一致，按序一一对应。"),
+        ],
+        type_short_name="component",
+        has_dynamic_ports=True,
     ),
     "Wait": NodeMeta(
         type="Wait",
@@ -277,32 +358,37 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         type="Sequence",
         category=CATEGORY_LOGIC,
         title="顺序执行",
-        description="按顺序一条条试路径~短路模式只要一条失败就立马退出走失败口；完全模式得条条都跑完才判；一真即真只要一条成功就收工走完成；每两条之间还能歇一会儿哟。",
+        description="纯串行队列~把要顺序执行的一串动作都塞进咱的子画布里，从上到下一条条跑，不做任何条件判断。双击咱进入子画布编辑，跑完就继续往下走。",
         color="#57606A",
         accent="#58A6FF",
         inputs=[_exec_in()],
-        outputs=[
-            _exec_out("1", label="#1"),
-            _exec_out("2", label="#2"),
-            _exec_out("3", label="#3"),
-            _exec_out("else", label="失败"),
-            _exec_out("out_done", label="完成"),
-        ],
+        outputs=[_exec_out("out_done", label="完成")],
         params=[
-            ParamDef(name="mode", editor=EDITOR_ENUM, default="short_circuit",
-                     options=["short_circuit", "complete", "or_true"],
-                     option_labels={"short_circuit": "短路模式", "complete": "完全求值", "or_true": "一真即真"},
-                     label="模式",
-                     help="短路模式(short_circuit)（AND短路）：任一分支失败即立即退出走 else；全部成功才走 out_done。与完全模式的区别：完全模式会跑完所有分支再判定，短路模式遇到第一个失败就停。\n完全模式(complete)：所有分支都必须跑到成功语义出口才算通过，走 out_done；任一分支失败则走 else。\n一真即真(or_true)（逻辑或）：按顺序尝试各条分支，只要有任意一条分支返回成功语义就立即结束并走 out_done；全部失败才走 else。"),
-            ParamDef(name="num_paths", editor=EDITOR_INT, default=3, label="路径数",
-                     min=1, max=50, step=1, required=True,
-                     help="分支路径数量（1~50）。建议用属性面板的 +/- 按钮调整，避免误操作"),
-            ParamDef(name="interval_sec", editor=EDITOR_FLOAT, default=1.0, label="路径间隔(s)",
-                     min=0.0, max=3600.0, step=0.05,
-                     help="每条路径尝试之间的等待时间（秒）"),
+            ParamDef(name="seq_body", editor=EDITOR_MULTILINE, default="", label="顺序体子图(只读)",
+                     help="内部字段，保存顺序执行的子画布内容。双击本节点进入子画布编辑，无需手填。"),
         ],
         type_short_name="seq",
-        has_dynamic_ports=True,
+    ),
+    "Parallel": NodeMeta(
+        type="Parallel",
+        category=CATEGORY_LOGIC,
+        title="并行执行",
+        description="并行跑~把多条分支都塞进咱的子画布里，每条分支用线程同时跑，各跑各的互不等待。全部跑完走「完成」，任意一条出错走「失败」（但不打断其它分支）。双击咱进入子画布编辑。",
+        color="#0E6B5C",
+        accent="#2DD4BF",
+        inputs=[_exec_in()],
+        outputs=[
+            _exec_out("out_done", label="完成"),
+            _exec_out("err", label="失败"),
+        ],
+        params=[
+            ParamDef(name="par_body", editor=EDITOR_MULTILINE, default="", label="并行体子图(只读)",
+                     help="内部字段，保存并行执行的子画布内容。双击本节点进入子画布编辑，无需手填。"),
+        ],
+        type_short_name="parallel",
+        # 分支数量由子画布里「分支入口(Branch)」节点数量决定，运行时只认 Branch，
+        # 端口固定（完成/失败），无需动态端口机制
+        has_dynamic_ports=False,
     ),
     # ---------------- 场景/窗口绑定（拆分后OpenApp + BindWindow） ----------------
     "OpenApp": NodeMeta(
@@ -993,6 +1079,102 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         ],
         type_short_name="if_sound",
     ),
+    "Screenshot": NodeMeta(
+        type="Screenshot",
+        category=CATEGORY_VISION,
+        title="截图",
+        description="把目标窗口（或屏幕）的某个 ROI 区域截下来，输出成图像给下游用~可以直接喂给网络请求节点，把图交给别的程序处理，也能存成文件。",
+        color="#0e3a5c",
+        accent="#1f8dd6",
+        inputs=[_exec_in()],
+        outputs=[
+            _exec_out("out_done", label="完成"),
+            _exec_out("err", label="失败"),
+            _data_out("image_bgr", "image", label="图像(BGR)"),
+            _data_out("image_png_bytes", "bytes", label="PNG字节"),
+            _data_out("image_path", "str", label="保存路径"),
+        ],
+        params=[
+            ParamDef(name="capture_mode", editor=EDITOR_ENUM, default="target",
+                     options=["target", "fullscreen"],
+                     option_labels={"target": "目标窗口", "fullscreen": "全屏"},
+                     label="截取范围",
+                     help="目标窗口(target)：截「临时目标」窗口（用下面的标题/程序名/类名定位）；\n全屏(fullscreen)：截整个虚拟桌面。"),
+            ParamDef(name="temp_target_title", editor=EDITOR_STRING, default="",
+                     label="临时目标·标题",
+                     help="窗口标题子串匹配（仅截取范围=目标窗口时生效）。留空=不按标题匹配。支持 {var} 插值。"),
+            ParamDef(name="temp_target_exe", editor=EDITOR_STRING, default="",
+                     label="临时目标·程序名",
+                     help="程序名子串匹配（如 notepad.exe）。留空=不按程序名匹配。支持 {var} 插值。"),
+            ParamDef(name="temp_target_class", editor=EDITOR_STRING, default="",
+                     label="临时目标·类名",
+                     help="窗口类名精确匹配。留空=不按类名匹配。支持 {var} 插值。"),
+            ParamDef(name="roi", editor=EDITOR_TUPLE4, default=(0, 0, 0, 0),
+                     label="ROI区域(x,y,w,h)",
+                     help="相对窗口/屏幕左上角的区域，格式 (x, y, w, h)。全 0 = 截整个范围。"),
+            ParamDef(name="roi_preview_b64", editor=EDITOR_STRING, default="",
+                     label="ROI缩略图(只读)",
+                     help="框选 ROI 时写入的缩略图，便于画布/面板预览，无需手填。"),
+            ParamDef(name="save_path", editor=EDITOR_STRING, default="",
+                     label="保存路径(可选)",
+                     help="留空=只输出图像不落盘；填了就把 PNG 存到这个路径（支持 {var} 插值），并输出 image_path。"),
+        ],
+        type_short_name="screenshot",
+    ),
+    "OcrRecognize": NodeMeta(
+        type="OcrRecognize",
+        category=CATEGORY_VISION,
+        title="文字识别",
+        description="用内置 OCR 引擎识别图像里的文字和数字~可以自己截 ROI，也能直接吃上游截图节点给的图像，识别结果存成变量、还能按整行/逐条输出。",
+        color="#0b3d61",
+        accent="#29b6f6",
+        inputs=[
+            _exec_in(),
+            _data_in("in_image", "image", label="图像(BGR)"),
+        ],
+        outputs=[
+            _exec_out("out_done", label="完成"),
+            _exec_out("err", label="失败/无文字"),
+            _data_out("text", "str", label="整屏文本"),
+            _data_out("items", "list", label="识别条目(列表)"),
+            _data_out("first_text", "str", label="第一条文字"),
+            _data_out("count", "int", label="识别条数"),
+        ],
+        params=[
+            ParamDef(name="source_mode", editor=EDITOR_ENUM, default="roi",
+                     options=["roi", "input_image"],
+                     option_labels={"roi": "自己截 ROI", "input_image": "用输入图像"},
+                     label="图片来源",
+                     help="自己截 ROI(roi)：按下面临时目标+ROI 现场截图识别；\n用输入图像(input_image)：直接识别上游截图节点连进来的图像。"),
+            ParamDef(name="temp_target_title", editor=EDITOR_STRING, default="",
+                     label="临时目标·标题",
+                     help="图片来源=自己截ROI时生效。窗口标题子串匹配。支持 {var} 插值。"),
+            ParamDef(name="temp_target_exe", editor=EDITOR_STRING, default="",
+                     label="临时目标·程序名",
+                     help="图片来源=自己截ROI时生效。程序名子串匹配。支持 {var} 插值。"),
+            ParamDef(name="temp_target_class", editor=EDITOR_STRING, default="",
+                     label="临时目标·类名",
+                     help="图片来源=自己截ROI时生效。窗口类名精确匹配。支持 {var} 插值。"),
+            ParamDef(name="roi", editor=EDITOR_TUPLE4, default=(0, 0, 0, 0),
+                     label="ROI区域(x,y,w,h)",
+                     help="相对窗口/屏幕左上角的区域，全 0 = 识别整个范围。"),
+            ParamDef(name="roi_preview_b64", editor=EDITOR_STRING, default="",
+                     label="ROI缩略图(只读)",
+                     help="框选 ROI 时写入的缩略图，便于画布/面板预览，无需手填。"),
+            ParamDef(name="lang", editor=EDITOR_ENUM, default="ch",
+                     options=["ch", "en"],
+                     option_labels={"ch": "中文(含数字)", "en": "英文(含数字)"},
+                     label="识别语言",
+                     help="中文模型同时覆盖中文+数字；英文模型更快，适合纯数字/英文场景。"),
+            ParamDef(name="save_to_var", editor=EDITOR_STRING, default="ocr_text",
+                     label="整屏文本存到变量",
+                     help="识别出的整屏文本（多行换行连接）写入这个变量名。留空=不写变量。"),
+            ParamDef(name="first_to_var", editor=EDITOR_STRING, default="",
+                     label="第一条存到变量",
+                     help="识别出的第一条文字写入这个变量名（常用来存单个数字/词）。留空=不写。"),
+        ],
+        type_short_name="ocr_recognize",
+    ),
 }
 
 
@@ -1167,7 +1349,7 @@ def _parse_condition_value(s: str) -> Tuple[Any, str]:
 
 
 def _resolve_output_ports_default(node_type: str, params: Optional[Dict[str, Any]] = None) -> List[Port]:
-    """返回给定节点类型的默认输出端口列表（VarSwitch/Sequence后续动态扩展，当前先返回 NodeMeta.outputs 静态定义）。
+    """返回给定节点类型的默认输出端口列表（动态端口节点按参数生成）。
 
     供 Node.from_dict 反序列化时自动补默认端口，避免丢失连线。
     """
@@ -1182,14 +1364,28 @@ def _resolve_output_ports_default(node_type: str, params: Optional[Dict[str, Any
             Port(name="yes", type=PortType.EXEC, direction=PortDirection.OUT, label="满足"),
             Port(name="no", type=PortType.EXEC, direction=PortDirection.OUT, label="不满足"),
         ]
-    if node_type == "Sequence":
-        n = max(1, int(params.get("num_paths", 3) or 3))
-        outs: List[Port] = []
-        for i in range(1, n + 1):
-            outs.append(Port(name=str(i), type=PortType.EXEC, direction=PortDirection.OUT, label=f"#{i}"))
-        outs.append(Port(name="else", type=PortType.EXEC, direction=PortDirection.OUT, label="失败"))
-        outs.append(Port(name="out_done", type=PortType.EXEC, direction=PortDirection.OUT, label="完成"))
+    if node_type == "Start":
+        # 组件蓝图入参：out_exec 之后跟 num_params 个 param_0 / param_1 ... 数据输出
+        n = max(0, min(20, int(params.get("num_params", 0) or 0)))
+        outs: List[Port] = [Port(name="out_exec", type=PortType.EXEC, direction=PortDirection.OUT, label="▶")]
+        for i in range(n):
+            outs.append(Port(name=f"param_{i}", type=PortType.DATA, direction=PortDirection.OUT,
+                             data_type="any", label=f"入参{i+1}"))
         return outs
+    if node_type == "Component":
+        # 调用组件：out_done 执行出口 + num_outputs 个 out_0 / out_1 ... 数据输出（接收子蓝图返回值）
+        n = max(0, min(20, int(params.get("num_outputs", 0) or 0)))
+        outs: List[Port] = [Port(name="out_done", type=PortType.EXEC, direction=PortDirection.OUT, label="完成")]
+        for i in range(n):
+            outs.append(Port(name=f"out_{i}", type=PortType.DATA, direction=PortDirection.OUT,
+                             data_type="any", label=f"返回{i+1}"))
+        return outs
+    if node_type == "Parallel":
+        # 并行：完成/失败 两个执行出口（分支在子画布里，不体现在端口上）
+        return [
+            Port(name="out_done", type=PortType.EXEC, direction=PortDirection.OUT, label="完成"),
+            Port(name="err", type=PortType.EXEC, direction=PortDirection.OUT, label="失败"),
+        ]
     # -------- 默认：返回 NodeMeta 静态 outputs --------
     return list(meta.outputs)
 
@@ -1224,8 +1420,28 @@ def _resolve_input_ports_default(node_type: str, params: Optional[Dict[str, Any]
             ins.append(Port(name=f"in_{i}", type=PortType.DATA, direction=PortDirection.IN,
                             data_type="any", label=f"#{i+1} 输入"))
         return ins
-    if node_type == "Sequence":
-        # Sequence 输入固定，只有 in_exec
+    if node_type == "End":
+        # 组件蓝图返回值：in_exec 之后跟 num_returns 个 ret_0 / ret_1 ... 数据输入
+        n = max(0, min(20, int(params.get("num_returns", 0) or 0)))
+        ins: List[Port] = [
+            Port(name="in_exec", type=PortType.EXEC, direction=PortDirection.IN, label="▶"),
+        ]
+        for i in range(n):
+            ins.append(Port(name=f"ret_{i}", type=PortType.DATA, direction=PortDirection.IN,
+                            data_type="any", label=f"返回{i+1}"))
+        return ins
+    if node_type == "Component":
+        # 调用组件：in_exec 之后跟 num_inputs 个 in_0 / in_1 ... 数据输入（传给子蓝图入参）
+        n = max(0, min(20, int(params.get("num_inputs", 0) or 0)))
+        ins: List[Port] = [
+            Port(name="in_exec", type=PortType.EXEC, direction=PortDirection.IN, label="▶"),
+        ]
+        for i in range(n):
+            ins.append(Port(name=f"in_{i}", type=PortType.DATA, direction=PortDirection.IN,
+                            data_type="any", label=f"入参{i+1}"))
+        return ins
+    if node_type == "Parallel":
+        # Parallel 输入固定，只有 in_exec
         return [
             Port(name="in_exec", type=PortType.EXEC, direction=PortDirection.IN, label="▶"),
         ]

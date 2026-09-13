@@ -150,6 +150,37 @@ def get_window_rect(hwnd: int) -> Optional[Tuple[int, int, int, int]]:
         return None
 
 
+def get_window_rect_dwm(hwnd: int) -> Optional[Tuple[int, int, int, int]]:
+    """获取窗口可见矩形 (left, top, right, bottom)：DWM 扩展边界优先，GetWindowRect 兜底。
+
+    「编辑器 / 运行时口径一致」的关键落点之一：
+      - 编辑器侧框选 ROI / 拾取窗口的基准是 enumerate_valid_windows() 的 rect，
+        它走 DWMWA_EXTENDED_FRAME_BOUNDS（用户看得见的窗口边界）；
+      - Win10/11 的裸 GetWindowRect 比可见边界大——左右各含约 7px 不可见边框、
+        顶部含不可见边框，若运行时仍用它裁窗口，ROI 会整体偏移几个像素。
+    所以运行时裁窗口（OCR/Screenshot/Mouse 相对坐标/FindImage 搜索区）一律用本函数。
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        DWMWA_EXTENDED_FRAME_BOUNDS = 9
+        rect = wintypes.RECT()
+        dwmapi = ctypes.windll.dwmapi
+        if dwmapi.DwmGetWindowAttribute(
+            int(hwnd), DWMWA_EXTENDED_FRAME_BOUNDS,
+            ctypes.byref(rect), ctypes.sizeof(rect),
+        ) == 0:
+            return (rect.left, rect.top, rect.right, rect.bottom)
+    except Exception:
+        pass
+    try:
+        import win32gui
+        return tuple(win32gui.GetWindowRect(hwnd))
+    except Exception:
+        return None
+
+
 def find_hwnd_by_title_substring(
     title_sub: str,
     pid: Optional[int] = None,

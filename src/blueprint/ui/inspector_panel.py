@@ -483,6 +483,53 @@ class InspectorPanel(QWidget):
                 return
             self._action_host.hide()
             return
+        if node.type == "Screenshot":
+            btn_roi = QPushButton("🖱 框选ROI")
+            btn_roi.setStyleSheet(self._btn_style("#0e3a5c", "#1f8dd6"))
+            btn_roi.setToolTip("框选一个矩形区域作为截图 ROI\n若已设置「临时目标窗口」，框选范围将自动限定在该窗口内")
+            nid = node.id
+            btn_roi.clicked.connect(lambda _=False, n=nid: self.request_snip_for_node.emit(n, "screenshot_roi"))
+            self._add_action_btn(btn_roi)
+            # 仅 capture_mode=target 时显示临时目标窗口拾取按钮
+            if str(node.params.get("capture_mode", "target") or "target") == "target":
+                btn_pick = QPushButton("🎯 拾取临时窗口")
+                btn_pick.setStyleSheet(self._btn_style("#8957E5", "#BC8CFF"))
+                btn_pick.setToolTip("点击后用鼠标点击目标窗口，自动回填临时目标标题/程序名/类名")
+                btn_pick.clicked.connect(lambda _=False: self._pick_window_for_screenshot_temp())
+                self._add_action_btn(btn_pick)
+                btn_list = QPushButton("📋 从列表选择")
+                btn_list.setStyleSheet(self._btn_style("#238636", "#2EA043"))
+                btn_list.setToolTip("列出当前所有可见窗口供选择作为临时目标")
+                btn_list.clicked.connect(lambda _=False: self._list_windows_for_screenshot_temp())
+                self._add_action_btn(btn_list)
+            self._action_host.show()
+            return
+        if node.type == "OcrRecognize":
+            btn_roi = QPushButton("🖱 框选ROI")
+            btn_roi.setStyleSheet(self._btn_style("#0b3d61", "#29b6f6"))
+            btn_roi.setToolTip("框选一个矩形区域作为识别 ROI\n若已设置「临时目标窗口」，框选范围将自动限定在该窗口内")
+            nid = node.id
+            btn_roi.clicked.connect(lambda _=False, n=nid: self.request_snip_for_node.emit(n, "ocr_roi"))
+            self._add_action_btn(btn_roi)
+            btn_test = QPushButton("🔍 测试识别")
+            btn_test.setStyleSheet(self._btn_style("#0B3A5C", "#0F4A77"))
+            btn_test.setToolTip("按当前临时目标+ROI现场截一张图跑一次 OCR，显示识别结果（不运行蓝图）")
+            btn_test.clicked.connect(lambda _=False: self._ocr_test_recognize())
+            self._add_action_btn(btn_test)
+            # 仅 source_mode=roi 时显示临时目标窗口拾取按钮
+            if str(node.params.get("source_mode", "roi") or "roi") == "roi":
+                btn_pick = QPushButton("🎯 拾取临时窗口")
+                btn_pick.setStyleSheet(self._btn_style("#8957E5", "#BC8CFF"))
+                btn_pick.setToolTip("点击后用鼠标点击目标窗口，自动回填临时目标标题/程序名/类名")
+                btn_pick.clicked.connect(lambda _=False: self._pick_window_for_ocr_temp())
+                self._add_action_btn(btn_pick)
+                btn_list = QPushButton("📋 从列表选择")
+                btn_list.setStyleSheet(self._btn_style("#238636", "#2EA043"))
+                btn_list.setToolTip("列出当前所有可见窗口供选择作为临时目标")
+                btn_list.clicked.connect(lambda _=False: self._list_windows_for_ocr_temp())
+                self._add_action_btn(btn_list)
+            self._action_host.show()
+            return
         self._action_host.hide()
 
     def _list_windows_for_bind(self):
@@ -1420,12 +1467,37 @@ class InspectorPanel(QWidget):
             except Exception as e:
                 print(f"[Inspector] Loop UI 出错: {e}")
 
-        # 9) Sequence 专属：num_paths 改用 +/- 按钮调整，不要原生 SpinBox
+        # 9) Sequence 专属：隐藏 seq_body 只读字段，追加「双击进入子画布」提示
         if node.type == "Sequence":
             try:
-                self._replace_seq_num_paths_with_buttons()
+                self._hide_param_row("seq_body")
+                self._append_subgraph_hint("双击本节点进入「顺序体」子画布编辑串行动作")
             except Exception as e:
                 print(f"[Inspector] Sequence UI 出错: {e}")
+
+        # 9.5) Parallel 专属：隐藏 par_body 只读字段，追加「双击进入子画布」提示
+        #      （并行分支数由子画布里「分支入口」节点数量决定，属性面板不设数量参数）
+        if node.type == "Parallel":
+            try:
+                self._hide_param_row("par_body")
+                self._append_subgraph_hint("双击本节点进入「并行体」子画布编辑，放几个「分支入口」节点就有几条并行分支")
+            except Exception as e:
+                print(f"[Inspector] Parallel UI 出错: {e}")
+
+        # 9.6) Component 专属：blueprint_path 改成下拉列表（扫描 components/ 目录）
+        if node.type == "Component":
+            try:
+                self._replace_component_path_with_combobox()
+            except Exception as e:
+                print(f"[Inspector] Component UI 出错: {e}")
+
+        # 9.7) Screenshot / OcrRecognize 专属：隐藏 roi_preview_b64 文本框，追加 ROI 预览
+        if node.type in ("Screenshot", "OcrRecognize"):
+            try:
+                self._hide_param_row("roi_preview_b64")
+                self._append_snip_roi_preview(node.type)
+            except Exception as e:
+                print(f"[Inspector] {node.type} UI 出错: {e}")
 
         # 10) Clipboard 专属：根据 mode 隐藏不相关参数
         if node.type == "Clipboard":
@@ -2044,6 +2116,497 @@ class InspectorPanel(QWidget):
             "temp_target_exe": "",
             "temp_target_class": "",
         })
+
+    # ============================================================
+    # Screenshot / OcrRecognize 节点：临时窗口拾取 / 列表选择 / OCR 测试识别
+    # ============================================================
+    def _pick_window_for_screenshot_temp(self):
+        """智能拾取窗口 → 回填 Screenshot 节点 temp_target_*。"""
+        if self._current_node is None or self._current_node.type != "Screenshot":
+            return
+        self._pick_window_generic_temp("截图")
+
+    def _list_windows_for_screenshot_temp(self):
+        if self._current_node is None or self._current_node.type != "Screenshot":
+            return
+        self._list_windows_generic_temp("截图")
+
+    def _pick_window_for_ocr_temp(self):
+        if self._current_node is None or self._current_node.type != "OcrRecognize":
+            return
+        self._pick_window_generic_temp("文字识别")
+
+    def _list_windows_for_ocr_temp(self):
+        if self._current_node is None or self._current_node.type != "OcrRecognize":
+            return
+        self._list_windows_generic_temp("文字识别")
+
+    def _pick_window_generic_temp(self, node_title: str):
+        """通用：智能拾取窗口 → 回填当前节点的 temp_target_title/exe/class。"""
+        app_window = self.window()
+        from .window_picker_overlay import WindowPickerOverlay
+
+        def _on_result(res):
+            if not res:
+                return
+            self.apply_params_merge({
+                "temp_target_title": str(res.get("title", "") or ""),
+                "temp_target_exe": str(res.get("exe_name", "") or ""),
+                "temp_target_class": str(res.get("class_name", "") or ""),
+            })
+            from PySide6.QtCore import QTimer
+            def _show():
+                QMessageBox.information(self, "临时目标拾取成功",
+                    f"已设置临时目标窗口：\n标题：{res.get('title','')}\n程序：{res.get('exe_name','')}\n\n{node_title}将以该窗口为基准。")
+            QTimer.singleShot(250, _show)
+        try:
+            overlay = WindowPickerOverlay.prepare_and_run(app_window, delay_ms=300)
+            overlay.finished.connect(_on_result)
+        except Exception as e:
+            QMessageBox.warning(self, "拾取启动失败", f"无法启动窗口拾取：\n{e}")
+
+    def _list_windows_generic_temp(self, node_title: str):
+        """通用：从列表选择窗口 → 回填当前节点的 temp_target_title/exe/class。"""
+        try:
+            from .window_picker_overlay import enumerate_valid_windows
+            wins = enumerate_valid_windows()
+        except Exception as e:
+            QMessageBox.warning(self, "窗口枚举失败", f"无法枚举窗口：\n{e}")
+            return
+        if not wins:
+            QMessageBox.information(self, "提示", "未找到任何可见窗口。")
+            return
+        from PySide6.QtWidgets import (
+            QAbstractItemView, QHeaderView, QTableWidgetItem, QTableWidget,
+        )
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"选择{node_title}临时目标窗口")
+        dlg.resize(640, 460)
+        lay = QVBoxLayout(dlg)
+        tip = QLabel("双击一行选择窗口作为临时目标：")
+        tip.setStyleSheet("color: #8B949E; font-size: 10px;")
+        lay.addWidget(tip)
+        table = QTableWidget(len(wins), 4)
+        table.setHorizontalHeaderLabels(["窗口标题", "程序名", "类名", "PID"])
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SingleSelection)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.horizontalHeader().setStretchLastSection(False)
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        table.setColumnWidth(1, 130)
+        table.setColumnWidth(2, 130)
+        table.setColumnWidth(3, 60)
+        table.setStyleSheet(
+            "QTableWidget { background-color: #1C2128; color: #C9D1D9;"
+            "  border: 1px solid #2D333B; border-radius: 4px; gridline-color: #2D333B; }"
+            "QHeaderView::section { background-color: #22272E; color: #C9D1D9;"
+            "  padding: 4px; border: none; border-bottom: 1px solid #2D333B; }"
+            "QTableWidget::item:selected { background-color: #58A6FF; color: #FFFFFF; }"
+        )
+        for i, w in enumerate(wins):
+            table.setItem(i, 0, QTableWidgetItem(str(w.get("title", ""))))
+            table.setItem(i, 1, QTableWidgetItem(str(w.get("exe_name", ""))))
+            table.setItem(i, 2, QTableWidgetItem(str(w.get("class_name", ""))))
+            table.setItem(i, 3, QTableWidgetItem(str(w.get("pid", ""))))
+        table.doubleClicked.connect(lambda *_: dlg.accept())
+        lay.addWidget(table, 1)
+        btn_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btn_box.accepted.connect(dlg.accept)
+        btn_box.rejected.connect(dlg.reject)
+        lay.addWidget(btn_box)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        rows = table.selectionModel().selectedRows()
+        if not rows:
+            return
+        w = wins[rows[0].row()]
+        self.apply_params_merge({
+            "temp_target_title": str(w.get("title", "") or ""),
+            "temp_target_exe": str(w.get("exe_name", "") or ""),
+            "temp_target_class": str(w.get("class_name", "") or ""),
+        })
+
+    def _ocr_test_recognize(self):
+        """「测试识别」按钮：按当前临时目标+ROI 现场截图，交给**独立子进程**跑 OCR，弹窗显示结果。
+
+        OCR 引擎（paddle）必须跑在子进程里：在 GUI 主进程内 import/初始化 paddle
+        会与 PySide6 的原生 DLL 冲突直接崩溃（原生崩溃无法被 try/except 捕获，
+        整个编辑器进程消失——实测踩坑），且首次加载模型可达 1~2 分钟，主线程
+        等待会卡死界面。
+        流程：主进程截图+ROI裁剪+写临时PNG（快，安全）→ 恢复主窗口 → 子进程跑
+        OCR（结果写 JSON 文件）→ QTimer 轮询收结果弹窗。子进程崩溃不影响主程序。
+        """
+        if getattr(self, "_ocr_test_running", False):
+            return
+        self._ocr_test_running = True
+        node = self._current_node
+        if node is None:
+            self._ocr_test_running = False
+            return
+        p = dict(node.params or {})
+        lang = str(p.get("lang", "ch") or "ch")
+        if str(p.get("source_mode", "roi") or "roi") != "roi":
+            self._ocr_test_running = False
+            QMessageBox.information(self, "提示",
+                "当前「图片来源」为「用输入图像」，测试识别需要上游连线传入图像。\n"
+                "建议切到「自己截 ROI」模式后测试。")
+            return
+
+        main_win = self.window()
+        win_visible = bool(main_win.isVisible())
+        tmp_path = None
+        ocr_state = {"warn": None}  # 传给结果弹窗的告警（匹配失败原因等）
+        try:
+            from PySide6.QtCore import QCoreApplication
+            import time as _t
+
+            # 隐藏主窗口，避免遮挡目标
+            if win_visible:
+                main_win.hide()
+            for _ in range(5):
+                QCoreApplication.processEvents()
+            _t.sleep(0.3)
+
+            # 复用运行时截图 + ROI 裁剪逻辑（与 F5 运行时完全一致）
+            from src.blueprint.runtime.screen_capture import ScreenCapture
+            from src.blueprint.runtime.executor import _crop_roi
+
+            # 临时目标窗口解析 + 截图：
+            # ① 优先后台截窗 PrintWindow(PW_RENDERFULLCONTENT)——窗口被遮挡时
+            #    也能拿到实时画面，不前置、不抢焦点（与运行时同一实现）；
+            # ② 失败回退：走 _resolve_snip_limit（三维匹配→拉起/还原→DWM 矩形）
+            #    后全屏截取、按窗口矩形裁剪。
+            status = "none"
+            rect = None
+            img = None
+            find_fn = getattr(main_win, "_find_temp_target_window", None)
+            tt = None
+            if callable(find_fn):
+                tt, status = find_fn(node)
+            if status == "ok" and tt is not None:
+                try:
+                    from src.blueprint.runtime.screen_capture import capture_window_bgr
+                    img = capture_window_bgr(int(tt.get("hwnd") or 0))
+                except Exception:
+                    img = None
+
+            if img is None:
+                resolve_fn = getattr(main_win, "_resolve_snip_limit", None)
+                if callable(resolve_fn):
+                    rect, _label, status = resolve_fn(node)
+                if status == "ok":
+                    _t.sleep(0.15)  # 等待窗口置顶重绘完成再截图
+
+                full = ScreenCapture().capture_full_bgr()
+                if full is None:
+                    raise RuntimeError("截图失败")
+
+                img = full
+                if status == "ok" and rect:
+                    lx, ly, lw, lh = (int(v) for v in rect)
+                    H, W = full.shape[:2]
+                    l2, t2, r2, b2 = max(0, lx), max(0, ly), min(W, lx + lw), min(H, ly + lh)
+                    if r2 > l2 and b2 > t2:
+                        img = full[t2:b2, l2:r2]
+
+            if status == "notfound":
+                t_st = str(p.get("temp_target_title", "") or "")
+                e_st = str(p.get("temp_target_exe", "") or "")
+                c_st = str(p.get("temp_target_class", "") or "")
+                msg = (f"配置的临时目标窗口当前没有匹配到（标题={t_st!r} 程序={e_st!r} 类名={c_st!r}），"
+                       "本次按全屏截取。")
+                try:
+                    main_win._log.append_log(f"[OCR测试] {msg}", "WARN")
+                except Exception:
+                    pass
+                ocr_state["warn"] = (
+                    "⚠ " + msg + "\n"
+                    "常见原因：目标窗口未打开 / 最小化到托盘 / 标题内容已变化。\n"
+                    "若窗口标题会动态变化，建议清空标题维度，只保留「程序名」匹配。")
+            # status == "none"：未配置临时目标，按全屏截取（与运行时一致）
+            roi = p.get("roi", (0, 0, 0, 0))
+            img = _crop_roi(img, roi)
+
+            if img is None or getattr(img, "size", 0) == 0:
+                raise RuntimeError("ROI 区域为空，请先框选 ROI")
+
+            # 写临时 PNG（%TEMP% 下 ASCII 路径，子进程读取用）
+            import cv2 as _cv2
+            import tempfile as _tempfile
+            ok, buf = _cv2.imencode(".png", img)
+            if not ok:
+                raise RuntimeError("临时图像编码失败")
+            fd, tmp_path = _tempfile.mkstemp(prefix="bp_ocr_test_", suffix=".png")
+            with os.fdopen(fd, "wb") as f:
+                f.write(buf.tobytes())
+        except Exception as e:
+            self._ocr_test_running = False
+            try:
+                if win_visible:
+                    main_win.show()
+                    main_win.raise_()
+                    main_win.activateWindow()
+            except Exception:
+                pass
+            QMessageBox.warning(self, "测试识别失败", f"{e}")
+            return
+
+        # 恢复主窗口（OCR 已交给子进程，无需等待截图阶段结束）
+        try:
+            if win_visible:
+                main_win.show()
+                main_win.raise_()
+                main_win.activateWindow()
+        except Exception:
+            pass
+
+        # 启动 OCR 子进程
+        import subprocess
+        import sys as _sys
+        if getattr(_sys, "frozen", False):
+            # 发布版编辑器：主 exe 带 --bp-ocr-worker 参数进入 worker 模式（不启动 GUI）
+            cmd = [_sys.executable, "--bp-ocr-worker", tmp_path, lang]
+        else:
+            worker_py = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
+                    os.path.abspath(__file__))))),
+                "src", "blueprint", "runtime", "ocr_test_worker.py")
+            cmd = [_sys.executable, worker_py, tmp_path, lang]
+        result_path = tmp_path + ".result.json"
+        errlog_path = tmp_path + ".err.log"
+        try:
+            # stderr 落日志文件：paddle 日志量大，PIPE 不读会撑爆缓冲卡死子进程；
+            # 落文件以便子进程崩溃时把尾部内容带进报错弹窗
+            errlog_fh = open(errlog_path, "wb")
+            proc = subprocess.Popen(cmd + [result_path], stdout=subprocess.DEVNULL,
+                                    stderr=errlog_fh, creationflags=0x08000000)
+        except Exception as e:
+            self._ocr_test_running = False
+            for fp in (tmp_path,):
+                try:
+                    os.remove(fp)
+                except Exception:
+                    pass
+            QMessageBox.warning(self, "测试识别失败", f"无法启动 OCR 子进程：\n{e}")
+            return
+
+        from PySide6.QtCore import QTimer
+        self._ocr_test_cancelled = False
+        dlg = QProgressDialog(
+            "正在识别…首次使用需加载 OCR 模型，可能需要 1~2 分钟，请稍候。",
+            "取消", 0, 0, self)
+        dlg.setWindowTitle("测试识别")
+        dlg.setWindowModality(Qt.WindowModal)
+        dlg.setMinimumDuration(0)
+        dlg.show()
+
+        def _remove_tmp():
+            try:
+                errlog_fh.close()  # 先关句柄，否则 Windows 上文件被占用删不掉
+            except Exception:
+                pass
+            for fp in (tmp_path, result_path, errlog_path):
+                try:
+                    os.remove(fp)
+                except Exception:
+                    pass
+
+        def _on_cancel():
+            self._ocr_test_cancelled = True
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+        dlg.canceled.connect(_on_cancel)
+
+        def _read_errlog_tail(limit=800):
+            try:
+                with open(errlog_path, "rb") as f:
+                    data = f.read()
+                return data.decode("utf-8", errors="replace")[-limit:]
+            except Exception:
+                return ""
+
+        def _poll():
+            if proc.poll() is None:
+                return
+            timer.stop()
+            try:
+                dlg.canceled.disconnect(_on_cancel)
+            except Exception:
+                pass
+            dlg.close()
+            self._ocr_test_running = False
+            cancelled = bool(getattr(self, "_ocr_test_cancelled", False))
+            self._ocr_test_cancelled = False
+
+            # ⚠ 顺序：先读结果文件（含被识别的裁剪图，用于画标注框），读完才能清理临时文件
+            result = None
+            try:
+                with open(result_path, encoding="utf-8") as f:
+                    result = json.load(f)
+            except Exception:
+                result = None
+            img_bgr = None
+            try:
+                import numpy as _np
+                import cv2 as _cv2
+                _data = _np.fromfile(tmp_path, dtype=_np.uint8)
+                img_bgr = _cv2.imdecode(_data, _cv2.IMREAD_COLOR)
+            except Exception:
+                img_bgr = None
+            _remove_tmp()
+
+            if result is None:
+                if cancelled:
+                    return  # 用户主动取消，静默
+                err_tail = _read_errlog_tail()
+                if proc.returncode != 0:
+                    msg = (f"识别进程异常退出（退出码 {proc.returncode}）。\n"
+                           f"命令：{' '.join(cmd + [result_path])}\n")
+                    if err_tail.strip():
+                        msg += f"\n---- 子进程 stderr 尾部 ----\n{err_tail}"
+                    else:
+                        msg += "\n可能是 paddle 原生崩溃或 OCR 模型缺失，请检查 ocr_runtime/models 是否完整。"
+                    QMessageBox.warning(self, "OCR 子进程异常", msg)
+                else:
+                    msg = "识别进程未返回有效结果。\n" + " ".join(cmd + [result_path])
+                    if err_tail.strip():
+                        msg += f"\n---- 子进程 stderr 尾部 ----\n{err_tail}"
+                    QMessageBox.warning(self, "OCR 子进程异常", msg)
+                return
+            self._show_ocr_test_result(result, img_bgr, ocr_state.get("warn"))
+
+        timer = QTimer(self)
+        timer.timeout.connect(_poll)
+        timer.start(300)
+
+    def _show_ocr_test_result(self, result: dict, img_bgr=None, warn=None):
+        """弹窗显示 OCR 测试识别结果：标注图预览（红框+序号）+ 文字列表 + 一键复制。
+
+        items 字段为 {text, conf, box, index}，box 为 {x,y,w,h}（相对被识别的截取图）。
+        warn 非空时在顶部显示告警横幅（如临时目标窗口未匹配到、按全屏截取等）。
+        """
+        items = result.get("items") or []
+        if result.get("error"):
+            err = str(result["error"])
+            box = QMessageBox(QMessageBox.Warning, "识别异常",
+                              f"OCR 引擎返回异常：\n{err.splitlines()[0] if err else '(空)'}",
+                              QMessageBox.Ok, self)
+            # 完整错误（含 traceback）放进可展开的详细信息，便于定位
+            box.setDetailedText(err)
+            box.exec()
+            return
+        if not items and not warn:
+            QMessageBox.information(self, "识别结果", "未识别到任何文字/数字。")
+            return
+        if not items and warn:
+            # 截取区域不对（如全屏退回）时，警告本身就解释了为什么没识别到
+            QMessageBox.warning(self, "识别结果", warn + "\n\n本次未识别到任何文字/数字。")
+            return
+
+        from PySide6.QtGui import QImage, QPixmap, QFont
+        from PySide6.QtWidgets import QDialog, QVBoxLayout, QLabel, QPlainTextEdit, QHBoxLayout, QPushButton, QApplication
+        from PySide6.QtCore import Qt
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"OCR 识别结果（共 {len(items)} 条）")
+        dlg.setModal(True)
+        v = QVBoxLayout(dlg)
+
+        if warn:
+            lbl_warn = QLabel(str(warn).replace("\n", "<br>"))
+            lbl_warn.setWordWrap(True)
+            lbl_warn.setStyleSheet(
+                "background-color: #4d2a00; color: #ffb84d; border: 1px solid #b25e00;"
+                "border-radius: 4px; padding: 6px 8px; font-size: 11px;")
+            v.addWidget(lbl_warn)
+
+        # ---- 在裁剪图上画识别框（红框 + #序号），与下方列表一一对应 ----
+        pixmap = None
+        if img_bgr is not None and getattr(img_bgr, "size", 0) > 0:
+            try:
+                import cv2 as _cv2
+                vis = img_bgr.copy()
+                for it in items:
+                    b = it.get("box") or {}
+                    try:
+                        x, y = int(float(b.get("x", 0))), int(float(b.get("y", 0)))
+                        w, h = int(float(b.get("w", 0))), int(float(b.get("h", 0)))
+                    except Exception:
+                        continue
+                    if w <= 0 or h <= 0:
+                        continue
+                    _cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 0, 255), 2)
+                    label = f"#{int(it.get('index', 0)) + 1}"
+                    _cv2.putText(vis, label, (x, max(14, y - 4)),
+                                 _cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, _cv2.LINE_AA)
+                rgb = _cv2.cvtColor(vis, _cv2.COLOR_BGR2RGB)
+                h, w, ch = rgb.shape
+                qimg = QImage(rgb.tobytes(), w, h, ch * w, QImage.Format_RGB888)
+                pixmap = QPixmap.fromImage(qimg)
+            except Exception:
+                pixmap = None
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"OCR 识别结果（共 {len(items)} 条）")
+        dlg.setModal(True)
+        v = QVBoxLayout(dlg)
+
+        if pixmap is not None:
+            lbl = QLabel()
+            lbl.setAlignment(Qt.AlignCenter)
+            # 限制预览宽度，过大等比缩小
+            max_w = 620
+            if pixmap.width() > max_w:
+                pixmap = pixmap.scaledToWidth(max_w, Qt.SmoothTransformation)
+            lbl.setPixmap(pixmap)
+            v.addWidget(lbl)
+
+        # ---- 文字列表：#序号 + 内容 + 置信度 ----
+        lines = []
+        for it in items:
+            txt = str(it.get("text", ""))
+            conf = it.get("conf", -1)
+            try:
+                conf_s = f"{float(conf):.2f}"
+            except Exception:
+                conf_s = str(conf)
+            lines.append(f"#{int(it.get('index', 0)) + 1}  {txt}   （置信度 {conf_s}）")
+        full_text = str(result.get("text", "") or "")
+        show_txt = "\n".join(lines)
+        if full_text.strip():
+            show_txt += "\n\n---- 合并文本（可直接复制） ----\n" + full_text
+        txt = QPlainTextEdit()
+        txt.setReadOnly(True)
+        f = QFont("Consolas")
+        f.setStyleHint(QFont.Monospace)
+        txt.setFont(f)
+        txt.setPlainText(show_txt)
+        v.addWidget(txt, 1)
+
+        h = QHBoxLayout()
+        btn_copy = QPushButton("📋 复制全部文本")
+        btn_close = QPushButton("关闭")
+        h.addStretch(1)
+        h.addWidget(btn_copy)
+        h.addWidget(btn_close)
+        v.addLayout(h)
+
+        copy_text = full_text.strip() if full_text.strip() else "\n".join(
+            str(it.get("text", "")) for it in items)
+
+        def _copy():
+            QApplication.clipboard().setText(copy_text)
+            btn_copy.setText("✓ 已复制")
+            from PySide6.QtCore import QTimer as _QTimer
+            _QTimer.singleShot(1500, lambda: btn_copy.setText("📋 复制全部文本"))
+
+        btn_copy.clicked.connect(_copy)
+        btn_close.clicked.connect(dlg.accept)
+        dlg.resize(680, 560)
+        dlg.exec()
 
     def _ifimg_test_screen_match(self):
         """「测试当前屏幕匹配度」按钮：直接调用运行时 TemplateMatcher，保证测试=运行时预览。"""
@@ -3638,6 +4201,134 @@ class InspectorPanel(QWidget):
                         lab_item.widget().setVisible(not is_fixed)
                     fld_w.setVisible(not is_fixed)
                     break
+
+    def _append_subgraph_hint(self, text: str):
+        """子画布容器节点（Sequence/Parallel）专属：追加一个「双击进入子画布」提示条。"""
+        hint = QLabel(f"📂 {text}")
+        hint.setWordWrap(True)
+        hint.setStyleSheet(
+            "color:#2DD4BF; background:#0E6B5C22; padding:8px 10px;"
+            "border:1px dashed #0E6B5C; border-radius:4px; font-size:9px;"
+        )
+        self._form.addRow(hint)
+
+    def _replace_component_path_with_combobox(self):
+        """Component：blueprint_path 输入框替换为下拉列表（扫描工程 components/ 目录下的 .bp.json）。"""
+        if self._current_node is None or self._current_node.type != "Component":
+            return
+        w_bp = self._widgets.get("blueprint_path")
+        if w_bp is None:
+            return
+        target_row = -1
+        for row_i in range(self._form.rowCount()):
+            fld_item = self._form.itemAt(row_i, QFormLayout.FieldRole)
+            fld_w = fld_item.widget() if fld_item else None
+            if fld_w is w_bp:
+                target_row = row_i
+                break
+        if target_row < 0:
+            return
+        # 扫描 components/ 目录下的蓝图
+        components = self._scan_component_blueprints()
+        combo = _disable_wheel(QComboBox())
+        combo.setStyleSheet(self._edit_style())
+        current = str(self._current_node.params.get("blueprint_path", "") or "")
+        # 第一项：占位「未选择」
+        combo.addItem("（未选择组件）", "")
+        for rel, abs_path in components:
+            combo.addItem(rel, rel)
+        idx = combo.findData(current)
+        if idx < 0:
+            idx = 0
+        combo.setCurrentIndex(idx)
+        nid = self._current_node.id
+        combo.currentIndexChanged.connect(
+            lambda i, n=nid, c=combo: self.param_changed.emit(n, "blueprint_path", c.currentData() or "")
+        )
+        # 替换
+        self._form.removeRow(target_row)
+        new_label = QLabel("组件蓝图")
+        new_label.setStyleSheet("color: #C9D1D9; font-size: 9px;")
+        new_label.setToolTip("从工程 components/ 目录下选择要复用的蓝图")
+        self._form.insertRow(target_row, new_label, combo)
+        self._widgets["blueprint_path"] = combo
+        if not components:
+            combo.setToolTip("当前工程没有 components/ 目录或目录下没有 .bp.json 蓝图。\n"
+                             "请先把要复用的蓝图保存到工程 components/ 子目录下。")
+
+    def _scan_component_blueprints(self) -> List[tuple]:
+        """扫描当前工程 components/ 目录下的所有 .bp.json，返回 [(相对路径, 绝对路径)]。"""
+        results: List[tuple] = []
+        try:
+            from src.blueprint.project_manager import ProjectManager
+            pm = ProjectManager.instance()
+            if not pm.is_open() or not pm.project_root:
+                return results
+            comp_dir = os.path.join(pm.project_root, "components")
+            if not os.path.isdir(comp_dir):
+                return results
+            for root, _dirs, files in os.walk(comp_dir):
+                for f in files:
+                    if not f.endswith(".bp.json"):
+                        continue
+                    abs_path = os.path.join(root, f)
+                    try:
+                        rel = os.path.relpath(abs_path, pm.project_root).replace("\\", "/")
+                    except Exception:
+                        rel = f
+                    results.append((rel, abs_path))
+            results.sort(key=lambda x: x[0].lower())
+        except Exception:
+            pass
+        return results
+
+    def _append_snip_roi_preview(self, node_type: str):
+        """Screenshot/OcrRecognize：在 ROI 参数下追加一个 ROI 预览图（框选后显示）。"""
+        node = self._current_node
+        if node is None:
+            return
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet("color: #2D333B;")
+        self._form.addRow(sep)
+
+        roi = node.params.get("roi", (0, 0, 0, 0))
+        if isinstance(roi, str):
+            try:
+                roi = tuple(int(v) for v in json.loads(roi))
+            except Exception:
+                roi = (0, 0, 0, 0)
+        if not isinstance(roi, (list, tuple)) or len(roi) < 4:
+            roi = (0, 0, 0, 0)
+        x, y, w, h = (int(v) for v in roi[:4])
+        has_roi = (w > 0 and h > 0)
+
+        title = QLabel("🖼️ ROI 预览")
+        title.setStyleSheet("color:#29b6f6; font-weight:bold; font-size:10px;")
+        self._form.addRow(title)
+
+        info = QLabel(f"位置 ({x},{y})  ·  尺寸 {w}×{h}" + ("" if has_roi else "  （未框选）"))
+        info.setStyleSheet("color:#C9D1D9; font-size:9px;")
+        self._form.addRow(info)
+
+        b64 = node.params.get("roi_preview_b64", "")
+        pil = self._b64_to_pil(b64) if isinstance(b64, str) and b64 else None
+        if pil is None:
+            empty = QLabel("（无预览，点上方「🖱 框选ROI」）")
+            empty.setAlignment(Qt.AlignCenter)
+            empty.setStyleSheet(
+                "color:#8B949E; background:#1C2128; padding:12px;"
+                "border:1px dashed #2D333B; border-radius:4px; font-size:10px; min-height:60px;"
+            )
+            self._form.addRow(empty)
+            return
+        pix = self._pil_to_qpixmap(pil, size=200)
+        if pix is not None:
+            lbl = QLabel()
+            lbl.setAlignment(Qt.AlignCenter)
+            lbl.setPixmap(pix)
+            lbl.setStyleSheet("QLabel { background:#000; border:2px solid #29b6f6; border-radius:4px; padding:2px; }")
+            self._form.addRow(lbl)
 
     def _replace_seq_num_paths_with_buttons(self):
         """Sequence：num_paths 输入框替换为 +/- 按钮组合（必须用 +/- 控制，不能用原生 SpinBox 直接填）。"""

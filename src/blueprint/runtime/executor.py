@@ -58,7 +58,13 @@ def _apply_target_hwnd(ctx: ExecutionContext, hwnd, res_w=1920, res_h=1080):
     win_title = ""
     if hwnd:
         try:
-            l, t, r, b = win32gui.GetWindowRect(hwnd)
+            # DWM 可见边界优先（与编辑器拾取/框选口径一致），失败兜底 GetWindowRect
+            from src.tools.window_utils import get_window_rect_dwm
+            rect_dwm = get_window_rect_dwm(hwnd)
+            if rect_dwm is None:
+                import win32gui as _wg
+                rect_dwm = _wg.GetWindowRect(hwnd)
+            l, t, r, b = (int(v) for v in rect_dwm)
             win_rect = (l, t, r - l, b - t)
             win_title = win32gui.GetWindowText(hwnd) or ""
         except Exception:
@@ -137,11 +143,14 @@ def _apply_target_hwnd(ctx: ExecutionContext, hwnd, res_w=1920, res_h=1080):
 # ============================================================
 # 辅助：端口/连线 解析
 # ============================================================
-def _resolve_data_inputs(graph: BlueprintGraph, ctx: ExecutionContext, node: Node) -> Dict[str, Any]:
+def _resolve_data_inputs(graph: BlueprintGraph, ctx: ExecutionContext, node: Node, id_prefix: str = "") -> Dict[str, Any]:
     """
     解析节点所有 DATA 输入端口的值：
       - 若端口被连线：取上游 last_outputs（注意：同一INPUT端口多根线只会取遍历顺序第一条，其余静默忽略并打WARN）
       - 否则：取 node.params 同名值
+
+    id_prefix：子图内执行时传入子图输出前缀（"{sub_prefix}::"），使子图内 DATA 连线能取到上游值；
+    主图执行时不传（默认空），用原始节点 id 查找。
     """
     resolved: Dict[str, Any] = {}
     for p in node.inputs:
@@ -162,7 +171,7 @@ def _resolve_data_inputs(graph: BlueprintGraph, ctx: ExecutionContext, node: Nod
                     "WARN",
                 )
             found_edge = all_edges[0]
-            upstream = ctx.last_outputs.get(found_edge.from_node, {})
+            upstream = ctx.last_outputs.get(id_prefix + found_edge.from_node, {})
             resolved[p.name] = upstream.get(found_edge.from_port)
         else:
             resolved[p.name] = node.params.get(p.name)
@@ -325,23 +334,141 @@ def _auto_coerce(value: Any) -> Any:
 
 
 def execute_Start(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
-    return {}, ["out_exec"], "开始"
+    """蓝图起点。若本蓝图是「组件」被调用（有 num_params 入参端口），
+    从 ctx 变量 __arg_0... 读取调用方传入的值，输出到 param_0... 端口供下游连线取用。"""
+    outputs: Dict[str, Any] = {}
+    n = int(node.params.get("num_params", 0) or 0)
+    for i in range(n):
+        outputs[f"param_{i}"] = ctx.variables.get(f"__arg_{i}")
+    return outputs, ["out_exec"], "开始"
 
 
 def execute_End(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
-    """蓝图终点：到达此处视为分支结束，不再向下流转出节点。"""
+    """蓝图终点。若本蓝图是「组件」（有 num_returns 返回值端口），
+    把连到 ret_0... 端口的输入值写入 ctx 变量 __ret_0...，供调用方 Component 节点读回。"""
+    n = int(node.params.get("num_returns", 0) or 0)
+    for i in range(n):
+        ctx.variables[f"__ret_{i}"] = inputs.get(f"ret_{i}")
     return {}, [], "结束"
+
+
+def _subgraph_from_dict(sub: Dict[str, Any], name: str = "__subgraph__") -> "BlueprintGraph":
+    """把一个「子图 dict」包成临时 BlueprintGraph，复用 _resolve_data_inputs / _exec_out_edges / _walk_branch_until_end。
+
+    子图 dict 结构对齐 BlueprintGraph.to_dict()：{"nodes": {...}, "links": [...]}
+    """
+    d = {"nodes": sub.get("nodes", {}), "links": sub.get("links", []), "metadata": {"name": name}}
+    return BlueprintGraph.from_dict(d)
+
+
+def _run_subgraph_until_control(
+    ctx: ExecutionContext,
+    sub: "BlueprintGraph",
+    runner,
+    entry_node_id: str,
+) -> str:
+    """同步执行一张子图，从 entry_node_id 出发走完整条执行流，直到：
+      - 遇到 Continue 节点 → 返回 "continue"
+      - 遇到 Break 节点 → 返回 "break"
+      - 执行流自然走到终点（无下游）→ 返回 "end"
+      - 运行被停止 → 返回 "stop"
+
+    返回的控制信号供 execute_Loop 决定「继续下一轮 / 跳出循环 / 正常结束本轮」。
+
+    子图内节点 id 是子图内部命名空间（与父图隔离）；输出写进 ctx.last_outputs 时
+    加前缀 {sub_prefix}::{node_id} 避免与父图节点 id 撞车（子图节点 id 可能是纯数字，与父图同值）。
+    """
+    sub_prefix = getattr(sub, "_runtime_prefix", "__sub__")
+    # 注入 graph/runner 引用，供子图内 Sequence 等需要递归 walk 的节点使用
+    saved_graph = getattr(ctx, "_graph_ref", None)
+    saved_runner = getattr(ctx, "_runner_ref", None)
+    ctx._graph_ref = sub
+    ctx._runner_ref = runner
+    try:
+        curr_id = entry_node_id
+        safety = 50000
+        while safety > 0 and ctx.is_running:
+            safety -= 1
+            node = sub.nodes.get(curr_id)
+            if node is None:
+                return "end"
+
+            wait_if_paused(ctx)
+            # UI 高亮（子图节点）——尽量复用 runner 信号，失败则静默
+            try:
+                runner.highlight_node.emit(curr_id)
+                runner.progress_step.emit(ctx.step_counter + 1, node.type)
+            except Exception:
+                pass
+            try:
+                ctx.current_node_id = curr_id
+                runner.current_node_changed.emit(curr_id, node.type)
+            except Exception:
+                pass
+
+            inputs = _resolve_data_inputs(sub, ctx, node, id_prefix=f"{sub_prefix}::")
+            ctx.step_counter += 1
+            ctx.log(f"[Node▶] {node.type}  id={curr_id[:8]} [子图]", "INFO")
+            fn = EXECUTORS.get(node.type)
+            try:
+                if fn is None:
+                    outputs, next_ports, _note = {}, ["out_exec"], ""
+                else:
+                    outputs, next_ports, _note = fn(ctx, node, inputs)
+            except Exception as e:
+                tb = traceback.format_exc()
+                ctx.log(f"[Node] 子图内执行异常 {node.type}: {e}\n{tb}", "ERROR")
+                outputs, next_ports = {}, []
+
+            # 控制节点（Continue/Break）在 execute_* 里直接 return 控制信号——这里用 next_ports 空列表 + 特殊标记识别
+            # 更稳的方式：execute_Continue/Break 通过 ctx.runtime_attrs 传递信号
+            ctrl = ctx.runtime_attrs.pop(f"_sub_control::{sub_prefix}", None)
+            if ctrl is not None:
+                return ctrl
+
+            # 保存输出（带前缀，避免与父图撞车）
+            ctx.set_outputs(f"{sub_prefix}::{curr_id}", outputs or {})
+
+            if not ctx.is_running:
+                return "stop"
+
+            if not next_ports:
+                return "end"
+
+            pname = next_ports[0]
+            outs = _exec_out_edges(sub, curr_id, pname)
+            if not outs:
+                return "end"
+            curr_id, _curr_in = outs[0]
+
+        return "stop" if not ctx.is_running else "end"
+    finally:
+        # 恢复父图引用（若期间没有被其它递归层改写）
+        if saved_graph is not None:
+            ctx._graph_ref = saved_graph
+        else:
+            ctx._graph_ref = None
+        if saved_runner is not None:
+            ctx._runner_ref = saved_runner
+        else:
+            ctx._runner_ref = None
 
 
 def execute_Loop(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
     infinite = bool(node.params.get("infinite", False))
     max_it = int(node.params.get("max_iterations", 5) or 5)
     interval = float(node.params.get("interval_sec", 1.0) or 1.0)
-    counter = ctx.loop_counters.get(node.id, 0)
     if max_it <= 0:
         max_it = 5
+    counter = ctx.loop_counters.get(node.id, 0)
+
+    # ---------- 新模式：loop_body 子图容器（不靠拉线） ----------
+    loop_body = node.params.get("loop_body")
+    if isinstance(loop_body, dict) and loop_body.get("nodes"):
+        return _execute_loop_body_container(ctx, node, loop_body, infinite, max_it, interval, counter)
+
+    # ---------- 旧模式：loop_body 端口拉线（向后兼容，蓝图未用子图容器时） ----------
     if infinite:
-        # 无限循环：不受 max_iterations 限制
         ctx.loop_counters[node.id] = counter + 1
         if interval > 0 and ctx.is_running:
             t0 = time.time()
@@ -385,6 +512,111 @@ def execute_Loop(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
             ["out_exit"],
             "",
         )
+
+
+def _execute_loop_body_container(
+    ctx: ExecutionContext,
+    node: Node,
+    loop_body: Dict[str, Any],
+    infinite: bool,
+    max_it: int,
+    interval: float,
+    counter: int,
+):
+    """循环体子图容器：递归执行 loop_body 子图，直到 Break / 达到次数 / 自然结束。
+
+    - 每次进入子图前，把 ctx._graph_ref 临时切到子图（Sequence 等依赖它），执行完恢复。
+    - 子图内 Continue → 立即进入下一轮（不跑后续节点）。
+    - 子图内 Break → 立即退出整个循环，走 out_exit。
+    - 子图自然走到终点 → 计一次迭代，进入下一轮，直到 max_iterations。
+    """
+    graph = getattr(ctx, "_graph_ref", None)
+    runner = getattr(ctx, "_runner_ref", None)
+    if graph is None or runner is None:
+        msg = "[Loop] ctx 缺少 graph/runner 引用，无法执行循环体子图。"
+        ctx.log(msg, "ERROR")
+        annotate_step(ctx, node, "loop", note="FAIL: 缺少graph_ref/runner_ref")
+        return {}, ["out_exit"], msg
+
+    sub = _subgraph_from_dict(loop_body, name=f"{node.id}::loop_body")
+    sub._runtime_prefix = node.id
+
+    # 找子图里的起始节点：优先 Start，否则第一个节点
+    entry_id = None
+    for nid, n in sub.nodes.items():
+        if n.type == "Start":
+            entry_id = nid
+            break
+    if entry_id is None and sub.nodes:
+        entry_id = next(iter(sub.nodes.keys()))
+    if entry_id is None:
+        ctx.log(f"[Loop] {node.id[:6]} 循环体子图为空，直接退出。", "WARN")
+        return {}, ["out_exit"], ""
+
+    def _interval_wait():
+        if interval > 0 and ctx.is_running:
+            t0 = time.time()
+            while ctx.is_running and (time.time() - t0) < interval:
+                wait_if_paused(ctx)
+                time.sleep(0.05)
+
+    # 执行子图 Start 节点本身（Start 无输入，产出 out_exec）
+    start_node = sub.nodes.get(entry_id)
+    if start_node is not None and start_node.type == "Start":
+        # 直接找到 Start 的下游作为真正入口
+        outs = _exec_out_edges(sub, entry_id, "out_exec")
+        if outs:
+            entry_id, _ = outs[0]
+        else:
+            # Start 无下游，循环体只有 Start，直接判空结束
+            ctx.log(f"[Loop] {node.id[:6]} 循环体只有 Start 无内容。", "WARN")
+            return {}, ["out_exit"], ""
+
+    iteration = counter
+    while ctx.is_running:
+        if infinite:
+            ctx.loop_counters[node.id] = iteration + 1
+        else:
+            if iteration >= max_it:
+                ctx.log(f"[Loop] {node.id[:6]} 达到 max_iterations={max_it}，退出循环。", "WARN")
+                annotate_step(ctx, node, "loop", note=f"EXIT: hit max={max_it}")
+                ctx.loop_counters.pop(node.id, None)
+                return {"out_iteration": iteration, "out_max": max_it}, ["out_exit"], ""
+            ctx.loop_counters[node.id] = iteration + 1
+
+        _interval_wait()
+        wait_if_paused(ctx)
+        annotate_step(ctx, node, "loop", note=f"container i={iteration+1}" + ("/∞" if infinite else f"/{max_it}"))
+        ctx.log(f"[Loop] {node.id[:6]} 循环体子图 i={iteration+1} 开始", "DEBUG")
+
+        ctrl = _run_subgraph_until_control(ctx, sub, runner, entry_id)
+        if ctrl == "break":
+            ctx.log(f"[Loop] {node.id[:6]} 循环体内 Break → 跳出循环。", "INFO")
+            annotate_step(ctx, node, "loop", note="Break → out_exit")
+            ctx.loop_counters.pop(node.id, None)
+            return {"out_iteration": iteration + 1, "out_max": -1 if infinite else max_it}, ["out_exit"], ""
+        if ctrl == "stop":
+            return {"out_iteration": iteration + 1, "out_max": max_it}, [], "运行被停止"
+        # ctrl == "continue" 或 "end"：进入下一轮
+        iteration += 1
+
+    return {"out_iteration": iteration, "out_max": max_it}, [], ""
+
+
+def execute_Continue(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
+    """循环体子图专用：立即结束本轮、开始下一轮。"""
+    sub_prefix = getattr(getattr(ctx, "_graph_ref", None), "_runtime_prefix", "__sub__")
+    ctx.runtime_attrs[f"_sub_control::{sub_prefix}"] = "continue"
+    ctx.log(f"[Continue] {node.id[:6]} → 下一轮循环", "DEBUG")
+    return {}, [], ""
+
+
+def execute_Break(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
+    """循环体子图专用：立即结束整个循环。"""
+    sub_prefix = getattr(getattr(ctx, "_graph_ref", None), "_runtime_prefix", "__sub__")
+    ctx.runtime_attrs[f"_sub_control::{sub_prefix}"] = "break"
+    ctx.log(f"[Break] {node.id[:6]} → 跳出循环", "DEBUG")
+    return {}, [], ""
 
 
 def execute_Wait(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
@@ -1480,8 +1712,24 @@ def _resolve_temp_target_rect(ctx, params: Dict[str, Any]):
         if not hwnd:
             ctx.log(f"[Mouse] 临时目标窗口未找到: title={title!r} exe={exe_name!r} class={class_name!r}", "WARN")
             return None
-        import win32gui as _wg
-        rect = _wg.GetWindowRect(hwnd)  # (left, top, right, bottom)
+        # 窗口最小化时取到的 rect 是 (-32000,...) 垃圾值，先还原再取
+        try:
+            import win32gui as _wg2
+            if _wg2.IsIconic(hwnd):
+                _wg2.ShowWindow(hwnd, 9)  # SW_RESTORE
+                time.sleep(0.15)
+        except Exception:
+            pass
+        # 窗口矩形用 DWM 可见边界（与编辑器框选 ROI / 拾取窗口的基准一致），
+        # 裸 GetWindowRect 在 Win10/11 含不可见边框，会让 ROI 整体偏移几个像素
+        try:
+            from src.tools.window_utils import get_window_rect_dwm
+            rect = get_window_rect_dwm(hwnd)
+        except Exception:
+            rect = None
+        if rect is None:
+            import win32gui as _wg
+            rect = _wg.GetWindowRect(hwnd)  # (left, top, right, bottom)
         ctx.log(f"[Mouse] 使用临时目标窗口 hwnd={hwnd} rect={rect} title={title!r}", "DEBUG")
         return (hwnd, rect)
     except Exception as e:
@@ -2567,116 +2815,326 @@ def execute_VarSwitch(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any])
 
 
 def execute_Sequence(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
-    num_paths = max(1, int(node.params.get("num_paths", 3) or 3))
-    interval = float(node.params.get("interval_sec", 1.0) or 1.0)
-    mode = str(node.params.get("mode", "short_circuit") or "short_circuit")
+    """顺序执行：纯串行队列。执行 seq_body 子画布（子图容器），从子图 Start 出发
+    一条线串行跑到终点，不做任何条件判断。跑完走 out_done。
 
-    graph = getattr(ctx, "_graph_ref", None)
+    与 Loop 循环体一致：seq_body 是塞在 node.params 里的子图 dict，双击节点进入编辑。
+    """
+    seq_body = node.params.get("seq_body")
+    if not (isinstance(seq_body, dict) and seq_body.get("nodes")):
+        ctx.log(f"[Sequence] {node.id[:6]} 顺序体子画布为空，直接走完成。", "WARN")
+        annotate_step(ctx, node, "seq", note="空顺序体→out_done")
+        return {}, ["out_done"], ""
+
     runner = getattr(ctx, "_runner_ref", None)
-    if graph is None or runner is None:
-        msg = "[Sequence] ctx 缺少 graph/runner 引用，无法同步walk分支（请检查BlueprintRunner入口是否注入）。"
+    if runner is None:
+        msg = "[Sequence] ctx 缺少 runner 引用，无法执行顺序体子画布。"
         ctx.log(msg, "ERROR")
-        annotate_step(ctx, node, "seq", note="FAIL: 缺少graph_ref/runner_ref")
-        return {"out_done_path": None, "out_num_paths": num_paths}, ["else"], msg
+        annotate_step(ctx, node, "seq", note="FAIL: 缺少runner_ref")
+        return {}, ["out_done"], msg
 
-    if mode == "complete":
-        # 完全求值模式：所有分支都跑完，全部成功才走 out_done，任一失败走 else
-        all_success = True
-        last_reason = ""
-        for path_i in range(1, num_paths + 1):
-            if not ctx.is_running:
-                break
-            if path_i > 1 and interval > 0 and ctx.is_running:
-                t0 = time.time()
-                while ctx.is_running and (time.time() - t0) < interval:
-                    wait_if_paused(ctx)
-                    time.sleep(0.05)
-            port_name = str(path_i)
-            ctx.log(f"[Sequence] {node.id[:6]} 完全模式 尝试路径 #{path_i}/{num_paths}", "DEBUG")
-            annotate_step(ctx, node, "seq", note=f"complete #{path_i}/{num_paths}")
-            success, reason = _walk_branch_until_end(ctx, graph, runner, node.id, port_name)
-            last_reason = reason
-            if not success:
-                all_success = False
-                ctx.log(f"[Sequence] 路径#{path_i} 失败：{reason}，完全模式继续跑剩余分支", "DEBUG")
-            else:
-                ctx.log(f"[Sequence] 路径#{path_i} 成功：{reason}，完全模式继续跑剩余分支", "DEBUG")
-        if all_success and ctx.is_running:
-            note = f"完全模式：全部 {num_paths} 条路径成功 → out_done"
-            ctx.log(f"[Sequence] {node.id[:6]} {note}", "INFO")
-            annotate_step(ctx, node, "seq", note=f"✓完全{num_paths}→out_done")
-            return {"out_done_path": num_paths, "out_num_paths": num_paths}, ["out_done"], ""
+    sub = _subgraph_from_dict(seq_body, name=f"{node.id}::seq_body")
+    sub._runtime_prefix = node.id
+
+    # 找子图入口：优先 Start，否则第一个节点
+    entry_id = None
+    for nid, n in sub.nodes.items():
+        if n.type == "Start":
+            entry_id = nid
+            break
+    if entry_id is None and sub.nodes:
+        entry_id = next(iter(sub.nodes.keys()))
+    if entry_id is None:
+        ctx.log(f"[Sequence] {node.id[:6]} 顺序体为空，直接走完成。", "WARN")
+        return {}, ["out_done"], ""
+
+    # Start 无 in_exec，直接跳到它的下游作为真正入口
+    start_node = sub.nodes.get(entry_id)
+    if start_node is not None and start_node.type == "Start":
+        outs = _exec_out_edges(sub, entry_id, "out_exec")
+        if outs:
+            entry_id, _ = outs[0]
         else:
-            note = f"完全模式：路径失败 → else；原因：{last_reason}"
-            ctx.log(f"[Sequence] {node.id[:6]} {note}", "WARN")
-            annotate_step(ctx, node, "seq", note=f"✗完全失败→else；{last_reason[:40]}")
-            return {"out_done_path": None, "out_num_paths": num_paths}, ["else"], ""
-    elif mode == "or_true":
-        # 一真即真（逻辑或）模式：任一分支成功即立即结束并返回成功
-        path_ok: Optional[int] = None
-        last_reason = ""
-        for path_i in range(1, num_paths + 1):
-            if not ctx.is_running:
-                break
-            if path_i > 1 and interval > 0 and ctx.is_running:
-                t0 = time.time()
-                while ctx.is_running and (time.time() - t0) < interval:
-                    wait_if_paused(ctx)
-                    time.sleep(0.05)
-            port_name = str(path_i)
-            ctx.log(f"[Sequence] {node.id[:6]} 一真即真(OR) 尝试路径 #{path_i}/{num_paths}", "DEBUG")
-            annotate_step(ctx, node, "seq", note=f"OR #{path_i}/{num_paths}")
-            success, reason = _walk_branch_until_end(ctx, graph, runner, node.id, port_name)
-            last_reason = reason
-            if success:
-                path_ok = path_i
-                ctx.log(f"[Sequence] 一真即真：路径#{path_i} 成功：{reason} → 立即结束→out_done", "DEBUG")
-                break
+            ctx.log(f"[Sequence] {node.id[:6]} 顺序体只有 Start 无内容。", "WARN")
+            return {}, ["out_done"], ""
+
+    annotate_step(ctx, node, "seq", note="进入顺序体子画布")
+    ctx.log(f"[Sequence] {node.id[:6]} 串行执行顺序体子画布", "DEBUG")
+
+    ctrl = _run_subgraph_until_control(ctx, sub, runner, entry_id)
+    # 顺序体里不应有 Continue/Break（那是循环体专用），出现则视为结束
+    if ctrl in ("break", "continue"):
+        ctrl = "end"
+    if ctrl == "stop":
+        return {}, [], "运行被停止"
+    annotate_step(ctx, node, "seq", note="顺序体执行完成")
+    ctx.log(f"[Sequence] {node.id[:6]} 顺序体执行完成 → out_done", "INFO")
+    return {}, ["out_done"], ""
+
+
+def execute_Branch(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
+    """并行分支入口：仅出现在并行体子画布内，作为一条并行分支的起点。"""
+    return {}, ["out_exec"], ""
+
+
+def execute_Parallel(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
+    """并行执行：多分支并发。执行 par_body 子画布里的所有「分支入口(Branch)」节点，
+    每条分支用线程并发 walk，各跑各的互不等待。
+
+    - 全部分支跑完 → out_done；任一条分支失败（终结于失败语义端口）→ err。
+    - 不中断其它分支：一条失败不影响其它分支继续跑完。
+    """
+    par_body = node.params.get("par_body")
+    if not (isinstance(par_body, dict) and par_body.get("nodes")):
+        ctx.log(f"[Parallel] {node.id[:6]} 并行体子画布为空，直接走完成。", "WARN")
+        annotate_step(ctx, node, "parallel", note="空并行体→out_done")
+        return {}, ["out_done"], ""
+
+    runner = getattr(ctx, "_runner_ref", None)
+    if runner is None:
+        msg = "[Parallel] ctx 缺少 runner 引用，无法执行并行体子画布。"
+        ctx.log(msg, "ERROR")
+        annotate_step(ctx, node, "parallel", note="FAIL: 缺少runner_ref")
+        return {}, ["err"], msg
+
+    sub = _subgraph_from_dict(par_body, name=f"{node.id}::par_body")
+    sub._runtime_prefix = node.id
+
+    # 收集所有 Branch 分支入口
+    branches = [n for n in sub.nodes.values() if n.type == "Branch"]
+    if not branches:
+        ctx.log(f"[Parallel] {node.id[:6]} 并行体没有「分支入口」节点，直接走完成。", "WARN")
+        annotate_step(ctx, node, "parallel", note="无分支入口→out_done")
+        return {}, ["out_done"], ""
+
+    annotate_step(ctx, node, "parallel", note=f"进入并行体子画布（{len(branches)} 分支）")
+    ctx.log(f"[Parallel] {node.id[:6]} 并行执行 {len(branches)} 条分支", "INFO")
+
+    # 每条分支在独立线程里并发 walk（从 Branch 的 out_exec 下游开始）
+    import concurrent.futures as _cf
+
+    results: Dict[str, Tuple[bool, str]] = {}
+    with _cf.ThreadPoolExecutor(max_workers=len(branches)) as pool:
+        futures = {}
+        for b in branches:
+            fut = pool.submit(_run_parallel_branch, ctx, sub, runner, b.id)
+            futures[fut] = b
+        for fut in _cf.as_completed(futures):
+            b = futures[fut]
+            try:
+                ok, reason = fut.result()
+            except Exception as e:
+                ok, reason = False, f"分支执行异常: {type(e).__name__}: {e}"
+            results[b.id] = (ok, reason)
+
+    failed = [(bid, r) for bid, (ok, r) in results.items() if not ok]
+    if failed:
+        note = f"并行体有 {len(failed)} 条分支失败：{failed[0][1][:60]}"
+        ctx.log(f"[Parallel] {node.id[:6]} {note}", "WARN")
+        annotate_step(ctx, node, "parallel", note=f"✗{len(failed)}分支失败→err")
+        return {}, ["err"], ""
+    ctx.log(f"[Parallel] {node.id[:6]} 全部 {len(branches)} 条分支完成 → out_done", "INFO")
+    annotate_step(ctx, node, "parallel", note=f"✓{len(branches)}分支→out_done")
+    return {}, ["out_done"], ""
+
+
+def _run_parallel_branch(ctx: ExecutionContext, sub: "BlueprintGraph", runner, branch_id: str) -> Tuple[bool, str]:
+    """在独立线程里串行 walk 一条并行分支（从 Branch 节点的 out_exec 下游开始），
+    返回 (success, reason)。终结于失败语义端口（无下游）→ 失败。
+
+    与主执行流不同：这里不切换 ctx._graph_ref（避免与其它分支线程互相覆盖），
+    直接操作 sub 图；对共享 ctx 的写操作（log / variables / 计数）用锁保护。
+    """
+    sub_prefix = getattr(sub, "_runtime_prefix", "__sub__")
+    edges = _exec_out_edges(sub, branch_id, "out_exec")
+    if not edges:
+        return False, f"分支入口 {branch_id[:8]} 无下游连线"
+
+    lock = _parallel_ctx_lock()
+    curr_id, _curr_in = edges[0]
+    safety = 50000
+    while safety > 0 and ctx.is_running:
+        safety -= 1
+        node = sub.nodes.get(curr_id)
+        if node is None:
+            return False, f"分支节点不存在 id={curr_id[:8]}"
+
+        wait_if_paused(ctx)
+
+        with lock:
+            try:
+                runner.highlight_node.emit(curr_id)
+                runner.progress_step.emit(ctx.step_counter + 1, node.type)
+            except Exception:
+                pass
+            try:
+                ctx.current_node_id = curr_id
+                runner.current_node_changed.emit(curr_id, node.type)
+            except Exception:
+                pass
+            inputs = _resolve_data_inputs(sub, ctx, node, id_prefix=f"{sub_prefix}::")
+            ctx.step_counter += 1
+            ctx.log(f"[Node▶] {node.type}  id={curr_id[:8]} [并行分支]", "INFO")
+
+        fn = EXECUTORS.get(node.type)
+        try:
+            if fn is None:
+                outputs, next_ports, _note = {}, ["out_exec"], ""
             else:
-                ctx.log(f"[Sequence] 路径#{path_i} 失败：{reason}，继续尝试下一条。", "DEBUG")
-        if path_ok is not None:
-            note = f"一真即真(OR)：路径#{path_ok}/{num_paths} 命中 → out_done；原因：{last_reason}"
-            ctx.log(f"[Sequence] {node.id[:6]} {note}", "INFO")
-            annotate_step(ctx, node, "seq", note=f"✓OR#{path_ok}→out_done")
-            return {"out_done_path": path_ok, "out_num_paths": num_paths}, ["out_done"], ""
-        else:
-            note = f"一真即真(OR)：全部{num_paths}条路径无命中 → else；最后原因：{last_reason}"
-            ctx.log(f"[Sequence] {node.id[:6]} {note}", "WARN")
-            annotate_step(ctx, node, "seq", note=f"✗OR全失败→else；{last_reason[:40]}")
-            return {"out_done_path": None, "out_num_paths": num_paths}, ["else"], ""
+                outputs, next_ports, _note = fn(ctx, node, inputs)
+        except Exception as e:
+            tb = traceback.format_exc()
+            with lock:
+                ctx.log(f"[Node] 并行分支内执行异常 {node.type}: {e}\n{tb}", "ERROR")
+            return False, f"节点 {node.type} 执行异常: {e}"
+
+        if not ctx.is_running:
+            return False, "运行被用户停止"
+
+        sub_prefix = getattr(sub, "_runtime_prefix", "__sub__")
+        with lock:
+            ctx.set_outputs(f"{sub_prefix}::{curr_id}", outputs or {})
+            ctx.last_progress_ts = time.time()
+
+        if not next_ports:
+            return True, f"分支 {branch_id[:8]} 到达终点"
+        pname = next_ports[0]
+        outs = _exec_out_edges(sub, curr_id, pname)
+        if not outs:
+            if pname in FAIL_SEMANTIC:
+                return False, f"节点 {node.type} 终结于失败端口 {pname}"
+            return True, f"分支 {branch_id[:8]} 到达终点"
+        curr_id, _curr_in = outs[0]
+
+    if not ctx.is_running:
+        return False, "运行被用户停止"
+    return False, "分支执行超过安全步数（疑似死循环）"
+
+
+_parallel_lock = None
+
+
+def _parallel_ctx_lock():
+    """并行分支共享 ctx 的线程锁（模块级单例）。"""
+    global _parallel_lock
+    if _parallel_lock is None:
+        import threading
+        _parallel_lock = threading.Lock()
+    return _parallel_lock
+
+
+def _resolve_component_path(ctx: ExecutionContext, node: Node) -> Optional[str]:
+    """解析 Component 节点的 blueprint_path（相对当前工程根）。
+
+    优先从 ctx.runtime_attrs 拿工程根（BlueprintRunner 注入），拿不到则回退 ProjectManager。
+    """
+    raw = str(node.params.get("blueprint_path", "") or "").strip()
+    if not raw:
+        return None
+    if os.path.isabs(raw):
+        return raw if os.path.isfile(raw) else None
+    # 相对路径：基于工程根
+    proj_root = None
+    try:
+        proj_root = ctx.runtime_attrs.get("project_root")
+    except Exception:
+        proj_root = None
+    if not proj_root:
+        try:
+            from src.blueprint.project_manager import ProjectManager
+            pm = ProjectManager.instance()
+            proj_root = pm.project_root
+        except Exception:
+            proj_root = None
+    if not proj_root:
+        return None
+    cand = os.path.join(proj_root, raw)
+    return cand if os.path.isfile(cand) else None
+
+
+def execute_Component(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
+    """调用组件：加载一张子蓝图（预制体），递归执行它，跑完返回 out_done。
+
+    - 显式传参：输入端口 in_0... 的值写入 ctx 变量 __arg_0...，子蓝图 Start 的
+      param_0... 端口（execute_Start）会读取这些变量输出；子蓝图 End 的 ret_0...
+      端口值写入 __ret_0...，本函数读回作为 out_0... 输出。
+    - 变量全局共享：子蓝图和父蓝图用同一个 ctx.variables。
+    - 子蓝图入口 = 它的 Start 节点；结束 = 它的 End 节点或执行流自然走到终点。
+    - 找不到蓝图文件 / 加载失败 → 走 out_done（视为空操作）并打 WARN，不中断父流程。
+    """
+    path = _resolve_component_path(ctx, node)
+    if path is None:
+        raw = str(node.params.get("blueprint_path", "") or "").strip()
+        note = f"组件蓝图未找到或路径为空: {raw or '(空)'}"
+        ctx.log(f"[Component] {node.id[:6]} {note}", "WARN")
+        annotate_step(ctx, node, "component", note=f"FAIL: {note[:40]}")
+        return _empty_component_outputs(node), ["out_done"], ""
+
+    from src.blueprint.core.graph_store import BlueprintStore
+    sub = BlueprintStore.load(path)
+    if sub is None:
+        note = f"组件蓝图加载失败: {path}"
+        ctx.log(f"[Component] {node.id[:6]} {note}", "WARN")
+        annotate_step(ctx, node, "component", note=f"FAIL: {note[:40]}")
+        return _empty_component_outputs(node), ["out_done"], ""
+
+    runner = getattr(ctx, "_runner_ref", None)
+    if runner is None:
+        note = "缺少 runner 引用，无法递归执行组件。"
+        ctx.log(f"[Component] {node.id[:6]} {note}", "ERROR")
+        annotate_step(ctx, node, "component", note="FAIL: 缺少runner_ref")
+        return _empty_component_outputs(node), ["out_done"], ""
+
+    # 找子蓝图入口（Start 的下游作为真正起点）
+    start_node = sub.find_start_node()
+    if start_node is None:
+        ctx.log(f"[Component] {node.id[:6]} 子蓝图没有 Start 节点，跳过。", "WARN")
+        return _empty_component_outputs(node), ["out_done"], ""
+    entry_id = start_node.id
+    outs = _exec_out_edges(sub, entry_id, "out_exec")
+    if outs:
+        entry_id, _ = outs[0]
     else:
-        # 短路模式（AND短路）：任一分支失败即立即退出，全部成功才走 out_done
-        path_fail: Optional[int] = None
-        last_reason = ""
-        for path_i in range(1, num_paths + 1):
-            if not ctx.is_running:
-                break
-            if path_i > 1 and interval > 0 and ctx.is_running:
-                t0 = time.time()
-                while ctx.is_running and (time.time() - t0) < interval:
-                    wait_if_paused(ctx)
-                    time.sleep(0.05)
-            port_name = str(path_i)
-            ctx.log(f"[Sequence] {node.id[:6]} 短路(AND) 尝试路径 #{path_i}/{num_paths}  (出口端口={port_name})", "DEBUG")
-            annotate_step(ctx, node, "seq", note=f"短路AND #{path_i}/{num_paths} -> {port_name}")
-            success, reason = _walk_branch_until_end(ctx, graph, runner, node.id, port_name)
-            last_reason = reason
-            if success:
-                ctx.log(f"[Sequence] 短路(AND)：路径#{path_i} 成功，继续下一条。", "DEBUG")
-            else:
-                path_fail = path_i
-                ctx.log(f"[Sequence] 短路(AND)：路径#{path_i} 失败：{reason} → 立即退出→else", "DEBUG")
-                break
-        if path_fail is None:
-            note = f"短路(AND)成功：全部{num_paths}条路径通过 → out_done；末因：{last_reason}"
-            ctx.log(f"[Sequence] {node.id[:6]} {note}", "INFO")
-            annotate_step(ctx, node, "seq", note=f"✓短路AND全{num_paths}→out_done")
-            return {"out_done_path": num_paths, "out_num_paths": num_paths}, ["out_done"], ""
-        else:
-            note = f"短路(AND)：路径#{path_fail} 失败 → else；原因：{last_reason}"
-            ctx.log(f"[Sequence] {node.id[:6]} {note}", "WARN")
-            annotate_step(ctx, node, "seq", note=f"✗短路AND#{path_fail}→else；{last_reason[:40]}")
-            return {"out_done_path": None, "out_num_paths": num_paths}, ["else"], ""
+        ctx.log(f"[Component] {node.id[:6]} 子蓝图只有 Start 无内容，视为空组件。", "WARN")
+        return _empty_component_outputs(node), ["out_done"], ""
+
+    sub._runtime_prefix = node.id
+    annotate_step(ctx, node, "component", note=f"进入组件 {os.path.basename(path)}")
+    ctx.log(f"[Component] {node.id[:6]} 执行子蓝图 {os.path.basename(path)}", "INFO")
+
+    # ---------- 传参：输入端口 in_0... → ctx 变量 __arg_0... ----------
+    num_in = int(node.params.get("num_inputs", 0) or 0)
+    for i in range(num_in):
+        ctx.variables[f"__arg_{i}"] = inputs.get(f"in_{i}")
+
+    # ---------- 执行子蓝图 Start 节点，把入参输出到 param_0... 端口（供子图内连线取用）----------
+    # Start 无 in_exec，这里手动执行一次，让它的 param_0... 输出写入 last_outputs（带前缀）
+    try:
+        start_outputs, _, _ = execute_Start(ctx, start_node, {})
+        ctx.set_outputs(f"{node.id}::{start_node.id}", start_outputs or {})
+    except Exception as e:
+        ctx.log(f"[Component] 执行子蓝图 Start 异常: {e}", "WARN")
+
+    ctrl = _run_subgraph_until_control(ctx, sub, runner, entry_id)
+    # 组件内不应有 Continue/Break（那是循环体专用），若出现按正常结束处理
+    if ctrl in ("break", "continue"):
+        ctrl = "end"
+    if ctrl == "stop":
+        return {}, [], "运行被停止"
+    annotate_step(ctx, node, "component", note=f"组件完成 {os.path.basename(path)}")
+
+    # ---------- 回传：ctx 变量 __ret_0... → 输出端口 out_0... ----------
+    num_out = int(node.params.get("num_outputs", 0) or 0)
+    out_vals: Dict[str, Any] = {}
+    for i in range(num_out):
+        out_vals[f"out_{i}"] = ctx.variables.get(f"__ret_{i}")
+    return out_vals, ["out_done"], ""
+
+
+def _empty_component_outputs(node: Node) -> Dict[str, Any]:
+    """组件未执行成功时，输出端口 out_0... 统一给 None。"""
+    num_out = int(node.params.get("num_outputs", 0) or 0)
+    return {f"out_{i}": None for i in range(num_out)}
 
 
 def _win32_popup(title: str, message: str, level: str) -> int:
@@ -3372,9 +3830,12 @@ EXECUTORS = {
     "Start": execute_Start,
     "End": execute_End,
     "Loop": execute_Loop,
+    "Continue": execute_Continue,
+    "Break": execute_Break,
+    "Sequence": execute_Sequence,
+    "Component": execute_Component,
     "Wait": execute_Wait,
     "VarSwitch": execute_VarSwitch,
-    "Sequence": execute_Sequence,
     "Notify": execute_Notify,
     "OpenApp": execute_OpenApp,
     "BindWindow": execute_BindWindow,
@@ -3390,6 +3851,266 @@ EXECUTORS = {
     "WebBrowser": execute_WebBrowser,
     "HttpRequest": execute_HttpRequest,
 }
+
+
+# ============================================================
+# 截图节点
+# ============================================================
+def _crop_roi(img_bgr, roi):
+    """按 (x, y, w, h) 裁剪；全 0 或非法则返回原图。坐标越界自动 clamp。"""
+    if img_bgr is None:
+        return None
+    try:
+        x, y, w, h = (int(v) for v in roi)
+    except Exception:
+        return img_bgr
+    if w <= 0 or h <= 0:
+        return img_bgr
+    H, W = img_bgr.shape[:2]
+    x2 = min(W, x + w)
+    y2 = min(H, y + h)
+    x = max(0, x)
+    y = max(0, y)
+    if x2 <= x or y2 <= y:
+        return None
+    return img_bgr[y:y2, x:x2]
+
+
+def execute_Screenshot(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
+    """截图节点：截目标窗口/全屏的 ROI，输出图像（BGR / PNG 字节 / 可选落盘路径）。"""
+    import cv2
+
+    wait_if_paused(ctx)
+    p = dict(node.params or {})
+    capture_mode = str(p.get("capture_mode", "target") or "target")
+    roi = p.get("roi", (0, 0, 0, 0))
+    save_path = str(p.get("save_path", "") or "")
+
+    try:
+        from src.blueprint.core.variable_engine import VariableEngine
+        engine = getattr(ctx, "var_engine", None) or VariableEngine(ctx.variables)
+    except Exception:
+        engine = None
+
+    # 解析 ROI（支持变量插值）
+    if isinstance(roi, str) and engine is not None and engine.has_any_marker(roi):
+        roi = engine.interpolate(roi)
+    if not isinstance(roi, (tuple, list)) or len(roi) != 4:
+        roi = (0, 0, 0, 0)
+    try:
+        roi = tuple(int(v) for v in roi)
+    except Exception:
+        roi = (0, 0, 0, 0)
+
+    # 解析保存路径（支持变量插值）
+    if save_path and engine is not None and engine.has_any_marker(save_path):
+        save_path = str(engine.interpolate(save_path))
+
+    # 临时目标窗口解析（会还原最小化窗口并取 DWM 可见边界矩形）
+    temp = _resolve_temp_target_rect(ctx, p) if capture_mode == "target" else None
+
+    img = None
+    if capture_mode == "target" and temp is not None:
+        # ① 优先后台截窗：PrintWindow(PW_RENDERFULLCONTENT)，
+        #    窗口被遮挡时也能拿到实时画面，不前置、不抢焦点、不闪窗
+        try:
+            from src.blueprint.runtime.screen_capture import capture_window_bgr
+            img = capture_window_bgr(temp[0])
+        except Exception:
+            img = None
+
+    if img is None:
+        # ② 回退：还原+置顶目标窗口后全屏截取、按窗口矩形裁剪
+        if capture_mode == "target":
+            if temp is not None:
+                _bring_window_to_front_safe(ctx, temp[0])
+                time.sleep(0.15)  # 等待窗口前置与重绘完成
+            else:
+                ctx.log("[Screenshot] 未找到临时目标窗口（或未配置），退化为全屏", "WARN")
+
+        # 截取
+        full = ScreenCapture().capture_full_bgr()
+        if full is None:
+            err = "全屏截图失败"
+            ctx.log(f"[Screenshot] {err}", "ERROR")
+            return {"image_bgr": None, "image_png_bytes": b"", "image_path": ""}, ["err"], err
+
+        img = full
+        if capture_mode == "target" and temp is not None:
+            # 用临时目标窗口限定截图范围
+            rect = temp[1]  # (left, top, right, bottom)
+            l, t, r, b = (int(v) for v in rect)
+            H, W = full.shape[:2]
+            l = max(0, l)
+            t = max(0, t)
+            r = min(W, r)
+            b = min(H, b)
+            if r > l and b > t:
+                img = full[t:b, l:r]
+            else:
+                ctx.log("[Screenshot] 目标窗口矩形无效，退化为全屏", "WARN")
+
+    # 应用 ROI
+    img = _crop_roi(img, roi)
+    if img is None:
+        err = "ROI 区域裁剪结果为空"
+        ctx.log(f"[Screenshot] {err}", "ERROR")
+        return {"image_bgr": None, "image_png_bytes": b"", "image_path": ""}, ["err"], err
+
+    # 编码 PNG 字节
+    ok, buf = cv2.imencode(".png", img)
+    png_bytes = buf.tobytes() if ok else b""
+
+    # 可选落盘
+    saved_path = ""
+    if save_path:
+        try:
+            d = os.path.dirname(save_path)
+            if d:
+                os.makedirs(d, exist_ok=True)
+            if ok:
+                buf.tofile(save_path)
+                saved_path = save_path
+            else:
+                cv2.imwrite(save_path, img)
+                saved_path = save_path
+        except Exception as e:
+            ctx.log(f"[Screenshot] 保存 PNG 失败: {e}", "WARN")
+
+    H, W = img.shape[:2]
+    note = f"{capture_mode} {W}x{H}" + (f" -> {saved_path}" if saved_path else "")
+    annotate_step(ctx, node, "screenshot", note=note)
+    ctx.log(f"[Screenshot] {note}", "SUCCESS")
+    return {
+        "image_bgr": img,
+        "image_png_bytes": png_bytes,
+        "image_path": saved_path or "",
+    }, ["out_done"], ""
+
+
+# ============================================================
+# 文字/数字识别节点
+# ============================================================
+def execute_OcrRecognize(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
+    """OCR 识别节点：识别图像文字/数字，结果输出为变量 + 端口。"""
+    wait_if_paused(ctx)
+    p = dict(node.params or {})
+    source_mode = str(p.get("source_mode", "roi") or "roi")
+    lang = str(p.get("lang", "ch") or "ch")
+    roi = p.get("roi", (0, 0, 0, 0))
+    save_to_var = str(p.get("save_to_var", "ocr_text") or "").strip()
+    first_to_var = str(p.get("first_to_var", "") or "").strip()
+
+    try:
+        from src.blueprint.core.variable_engine import VariableEngine
+        engine = getattr(ctx, "var_engine", None) or VariableEngine(ctx.variables)
+    except Exception:
+        engine = None
+
+    # 取图像
+    img = None
+    if source_mode == "input_image":
+        img = inputs.get("in_image")
+        if img is None:
+            err = "未收到输入图像（in_image 端口未连线或无值）"
+            ctx.log(f"[OCR] {err}", "ERROR")
+            return {"text": "", "items": [], "first_text": "", "count": 0}, ["err"], err
+    else:
+        # 自己截 ROI
+        if isinstance(roi, str) and engine is not None and engine.has_any_marker(roi):
+            roi = engine.interpolate(roi)
+        if not isinstance(roi, (tuple, list)) or len(roi) != 4:
+            roi = (0, 0, 0, 0)
+        try:
+            roi = tuple(int(v) for v in roi)
+        except Exception:
+            roi = (0, 0, 0, 0)
+        # 临时目标窗口解析（会还原最小化窗口并取 DWM 可见边界矩形）
+        temp = _resolve_temp_target_rect(ctx, p)
+        img = None
+        if temp is not None:
+            # ① 优先后台截窗：窗口被遮挡时也能拿到实时画面，不前置、不抢焦点
+            try:
+                from src.blueprint.runtime.screen_capture import capture_window_bgr
+                img = capture_window_bgr(temp[0])
+            except Exception:
+                img = None
+        if img is None:
+            # ② 回退：还原+置顶目标窗口后全屏截取、按窗口矩形裁剪
+            if temp is not None:
+                _bring_window_to_front_safe(ctx, temp[0])
+                time.sleep(0.15)  # 等待窗口前置与重绘完成
+            full = ScreenCapture().capture_full_bgr()
+            if full is None:
+                err = "截图失败"
+                ctx.log(f"[OCR] {err}", "ERROR")
+                return {"text": "", "items": [], "first_text": "", "count": 0}, ["err"], err
+            img = full
+            if temp is not None:
+                rect = temp[1]
+                l, t, r, b = (int(v) for v in rect)
+                H, W = full.shape[:2]
+                l = max(0, l)
+                t = max(0, t)
+                r = min(W, r)
+                b = min(H, b)
+                if r > l and b > t:
+                    img = full[t:b, l:r]
+        img = _crop_roi(img, roi)
+
+    if img is None or getattr(img, "size", 0) == 0:
+        err = "待识别图像为空"
+        ctx.log(f"[OCR] {err}", "ERROR")
+        return {"text": "", "items": [], "first_text": "", "count": 0}, ["err"], err
+
+    # 识别（懒加载引擎，首次较慢，之后复用）
+    try:
+        from .ocr_engine import recognize as ocr_recognize
+        result = ocr_recognize(img, lang=lang)
+    except Exception as e:
+        err = f"OCR 识别失败: {type(e).__name__}: {e}"
+        ctx.log(f"[OCR] {err}", "ERROR")
+        annotate_step(ctx, node, "ocr", note="ERROR: " + err[:80])
+        return {"text": "", "items": [], "first_text": "", "count": 0}, ["err"], err
+
+    items = result.get("items") or []
+    text = result.get("text") or ""
+    if result.get("error"):
+        ctx.log(f"[OCR] 引擎返回异常: {result['error']}", "WARN")
+
+    first_text = items[0]["text"] if items else ""
+
+    # 写变量
+    if save_to_var:
+        ctx.set_var(save_to_var, text)
+        if engine is not None:
+            engine.set(save_to_var, text)
+    if first_to_var:
+        ctx.set_var(first_to_var, first_text)
+        if engine is not None:
+            engine.set(first_to_var, first_text)
+
+    note = f"lang={lang} items={len(items)} text={text[:30]!r}"
+    annotate_step(ctx, node, "ocr", note=note)
+    ctx.log(f"[OCR] {note}", "SUCCESS")
+
+    if not items:
+        return {"text": "", "items": [], "first_text": "", "count": 0}, ["err"], "无文字"
+
+    return {
+        "text": text,
+        "items": items,
+        "first_text": first_text,
+        "count": len(items),
+    }, ["out_done"], ""
+
+
+# 截图 / OCR 节点的执行函数定义在 EXECUTORS 之后，这里补注册
+EXECUTORS["Screenshot"] = execute_Screenshot
+EXECUTORS["OcrRecognize"] = execute_OcrRecognize
+# 并行节点（Parallel / Branch）定义在 EXECUTORS 之后，这里补注册
+EXECUTORS["Parallel"] = execute_Parallel
+EXECUTORS["Branch"] = execute_Branch
 
 
 # ============================================================
