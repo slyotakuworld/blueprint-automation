@@ -180,17 +180,12 @@ class ShortcutRecorder(QPushButton):
 class SettingsDialog(QDialog):
     """设置窗口（快捷键 Tab + 预留通用 Tab）。保存后 result_settings=新配置，changed_shortcuts={key:(old_pyn,new_pyn)}"""
 
-    hotkey_changed = Signal(str)  # 保留：旧代码可能只监听 capture_target
-
-    def __init__(self, parent: Optional[QWidget] = None, initial_pynput_hotkey: Optional[str] = None):
+    def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self.setWindowTitle("⚙ 设置")
         self.resize(640, 560)
 
         self._settings: Dict[str, Any] = read_user_settings()
-        # 外部传 initial_pynput_hotkey 就临时把 capture_target 改成这个显示
-        if initial_pynput_hotkey:
-            set_shortcut(self._settings, "capture_target", initial_pynput_hotkey)
         # 保存一份"打开设置时的原始值"，保存时用来算 diff
         self._original_pynputs: Dict[str, str] = {
             k: get_shortcut(k, self._settings) for k in all_shortcut_keys()
@@ -308,13 +303,6 @@ class SettingsDialog(QDialog):
             out[k] = normalize_pynput_hotkey(raw)
         return out
 
-    def currentHotkeyPynput(self) -> str:
-        """返回 capture_target 的当前值"""
-        return get_shortcut("capture_target", self._settings)
-
-    def currentHotkeyQt(self) -> str:
-        return pynput_to_qkeysequence(self.currentHotkeyPynput())
-
     # ---------------- 保存 ----------------
     def _on_save(self):
         current = self._collect_current_values()
@@ -356,7 +344,4 @@ class SettingsDialog(QDialog):
         self.changed_shortcuts = changed
         self.result_settings = self._settings
 
-        # 如果 capture_target 改了就发旧信号
-        if "capture_target" in changed:
-            self.hotkey_changed.emit(changed["capture_target"][1])
         self.accept()

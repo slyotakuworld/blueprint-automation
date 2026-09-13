@@ -10,11 +10,13 @@
     2. 解包到 %LOCALAPPDATA%/BlueprintRuntime/<载荷指纹>/，把它当成"伪工程根"，
        注册给 app_paths，使 templates/screenshots/cache/debug 等目录可用
     3. 把蓝图 JSON 里的 @@BPASSET:n@@ 记号还原成解包目录下的真实图片路径
-    4. 起一个控制面板窗口 + 全局热键（F8 优雅停止 / F6 紧急退出），开始执行蓝图
+    4. 弹出控制面板窗口：**默认不自动运行**，由用户点「▶ 开始」或按 F5 启动；
+       全局热键 F5 开始 / F6 暂停继续 / F7 停止 / F12 紧急退出。
 """
 
 import os
 import sys
+import json
 import hashlib
 import traceback
 
@@ -33,6 +35,7 @@ if not getattr(sys, "frozen", False) and _PROJECT_ROOT not in sys.path:
 if os.name == "nt":
     try:
         import ctypes
+
         try:
             ctypes.windll.shcore.SetProcessDpiAwareness(2)
         except Exception:
@@ -44,7 +47,7 @@ if os.name == "nt":
         pass
 
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor, QBrush, QAction
 from PySide6.QtWidgets import (
     QApplication,
@@ -54,6 +57,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QPlainTextEdit,
     QPushButton,
+    QCheckBox,
     QMessageBox,
     QSystemTrayIcon,
     QMenu,
@@ -68,8 +72,54 @@ from src.config import app_paths
 
 APP_TITLE = "蓝图独立运行"
 ENV_PAYLOAD = "BP_RUNTIME_PAYLOAD"
+PREFS_FILE = "runtime_prefs.json"
 
 _SUB_DIRS = ("templates", "screenshots", "cache", "debug", "assets")
+
+# 状态色（浅色主题）
+_C_READY = "#57606A"
+_C_RUNNING = "#1F883D"
+_C_PAUSED = "#9A6700"
+_C_ERROR = "#CF222E"
+
+_STYLE = """
+QWidget#RuntimeRoot { background: #F6F8FA; }
+QLabel { color: #24292F; font-size: 12px; }
+QLabel#NameLabel { color: #57606A; font-size: 12px; }
+QLabel#StatusLabel { font-size: 13px; font-weight: 500; }
+QLabel#HintLabel { color: #6E7781; font-size: 11px; }
+QPlainTextEdit {
+    background: #FFFFFF; color: #24292F;
+    border: 1px solid #D0D7DE; border-radius: 6px;
+    font-family: Consolas, "Courier New", monospace; font-size: 11px;
+    padding: 6px;
+}
+QCheckBox { color: #24292F; font-size: 12px; spacing: 6px; }
+QPushButton {
+    background: #FFFFFF; color: #24292F;
+    border: 1px solid #D0D7DE; border-radius: 6px;
+    padding: 6px 14px; font-size: 13px;
+}
+QPushButton:hover:enabled { background: #F3F4F6; border-color: #B6BEC7; }
+QPushButton:pressed:enabled { background: #E0E5EA; border-color: #9AA4AE; }
+QPushButton:disabled { background: #F0F2F4; color: #9BA3AC; border-color: #E4E8EC; }
+QPushButton[kind="primary"] {
+    background: #1F883D; color: #FFFFFF; border-color: #1A7F37;
+}
+QPushButton[kind="primary"]:hover:enabled { background: #1A7F37; border-color: #166B2E; }
+QPushButton[kind="primary"]:pressed:enabled { background: #166B2E; border-color: #125C27; }
+QPushButton[kind="primary"]:disabled {
+    background: #94D3A2; color: #F0FBF3; border-color: #94D3A2;
+}
+QPushButton[kind="danger"] {
+    background: #CF222E; color: #FFFFFF; border-color: #B81E29;
+}
+QPushButton[kind="danger"]:hover:enabled { background: #B81E29; border-color: #A11A24; }
+QPushButton[kind="danger"]:pressed:enabled { background: #A11A24; border-color: #8C1620; }
+QPushButton[kind="danger"]:disabled {
+    background: #E9A2A8; color: #FDF2F3; border-color: #E9A2A8;
+}
+"""
 
 
 # ============================================================
@@ -106,8 +156,24 @@ def _work_dir(payload: bytes) -> str:
     return os.path.join(base, "BlueprintRuntime", digest)
 
 
+def _make_graph_loader(work_dir: str, manifest: dict, bp_path: str):
+    """返回一个「重新构造蓝图对象」的工厂。
+
+    每次「开始 / 重新开始」都从磁盘重新加载一次，保证拿到的是**全新的图**，
+    不会带上上一轮运行残留的节点内部状态。
+    """
+
+    def load() -> BlueprintGraph:
+        with open(bp_path, "r", encoding="utf-8") as f:
+            bp_text = f.read()
+        data = restore_blueprint_dict(bp_text, work_dir, manifest)
+        return BlueprintGraph.from_dict(data)
+
+    return load
+
+
 def _prepare(payload: bytes):
-    """解包载荷 → 注册伪工程根 → 加载蓝图。返回 (graph, manifest, work_dir, name)。"""
+    """解包载荷 → 注册伪工程根 → 返回 (loader, manifest, work_dir, name)。"""
     work_dir = _work_dir(payload)
     os.makedirs(work_dir, exist_ok=True)
     for sub in _SUB_DIRS:
@@ -117,7 +183,12 @@ def _prepare(payload: bytes):
 
     # 伪工程根：app_paths 不认识"工程"，这里用一个固定目录冒充，保证四个子目录可用
     def _provider(key: str):
-        mapping = {"screenshot": "screenshots", "template": "templates", "cache": "cache", "debug": "debug"}
+        mapping = {
+            "screenshot": "screenshots",
+            "template": "templates",
+            "cache": "cache",
+            "debug": "debug",
+        }
         sub = mapping.get(key)
         if not sub:
             return None
@@ -128,15 +199,16 @@ def _prepare(payload: bytes):
 
     bp_file = str(manifest.get("blueprint_file") or "blueprint.bp.json")
     bp_path = os.path.join(work_dir, bp_file)
-    with open(bp_path, "r", encoding="utf-8") as f:
-        bp_text = f.read()
 
-    # 关键一步：把 @@BPASSET:n@@ 还原成解包目录下的真实图片路径
-    data = restore_blueprint_dict(bp_text, work_dir, manifest)
-    graph = BlueprintGraph.from_dict(data)
+    loader = _make_graph_loader(work_dir, manifest, bp_path)
+    graph = loader()  # 启动即校验一次，蓝图有问题在这里就报出来
 
-    name = str(manifest.get("blueprint_name") or data.get("metadata", {}).get("name") or "未命名蓝图")
-    return graph, manifest, work_dir, name
+    name = str(
+        manifest.get("blueprint_name")
+        or getattr(graph, "name", "")
+        or "未命名蓝图"
+    )
+    return loader, manifest, work_dir, name
 
 
 def _make_icon() -> QIcon:
@@ -160,62 +232,136 @@ def _make_icon() -> QIcon:
 # 控制面板窗口
 # ============================================================
 class RuntimeWindow(QWidget):
-    def __init__(self, graph: BlueprintGraph, manifest: dict, work_dir: str, name: str):
+    # 跨线程信号：pynput 监听线程 → Qt 主线程
+    sig_log = Signal(str, str)
+    sig_hotkey = Signal(str)
+
+    IDLE = "idle"
+    RUNNING = "running"
+    PAUSED = "paused"
+    FINISHED = "finished"
+
+    def __init__(self, loader, manifest: dict, work_dir: str, name: str):
         super().__init__()
-        self._graph = graph
+        self._loader = loader
         self._manifest = manifest
         self._work_dir = work_dir
         self._name = name
+
         self._runner = None
-        self._pause_btn = None
-        self._stop_btn = None
-        self._status = None
-        self._log = None
-        self._tray = None
+        self._run_seq = 0
+        self._state = self.IDLE
+        self._pending_restart = False
+
+        self._hotkeys = HotkeyManager(
+            dispatch=lambda hid: self.sig_hotkey.emit(hid),
+            log_fn=lambda m, l="INFO": self.sig_log.emit(m, l),
+        )
+
+        self._prefs = self._load_prefs()
 
         self._build_ui()
+        self._apply_state()
+
+        self.sig_log.connect(self._append, Qt.QueuedConnection)
+        self.sig_hotkey.connect(self._on_hotkey, Qt.QueuedConnection)
+
+        # 热键在窗口建好后立刻注册：这样还没点「开始」时 F5 也能启动
+        self._hotkeys.start()
+
+    # ---------------- 偏好（记住"启动后自动运行"） ----------------
+    def _prefs_path(self) -> str:
+        return os.path.join(self._work_dir, PREFS_FILE)
+
+    def _load_prefs(self) -> dict:
+        try:
+            with open(self._prefs_path(), "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_prefs(self):
+        try:
+            with open(self._prefs_path(), "w", encoding="utf-8") as f:
+                json.dump(
+                    {"auto_start": bool(self._chk_auto.isChecked())},
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+        except Exception:
+            pass
 
     # ---------------- UI ----------------
+    def _mk_btn(self, text: str, slot, kind: str = "") -> QPushButton:
+        b = QPushButton(text)
+        b.setCursor(Qt.PointingHandCursor)
+        b.setMinimumHeight(34)
+        b.setMinimumWidth(96)
+        if kind:
+            b.setProperty("kind", kind)
+        b.clicked.connect(slot)
+        return b
+
     def _build_ui(self):
+        self.setObjectName("RuntimeRoot")
         self.setWindowTitle(f"{self._name} · {APP_TITLE}")
         self.setWindowIcon(_make_icon())
-        self.resize(560, 360)
+        self.resize(640, 430)
 
         root = QVBoxLayout(self)
+        root.setContentsMargins(14, 12, 14, 12)
+        root.setSpacing(8)
 
         head = QHBoxLayout()
-        self._status = QLabel("准备中…")
-        self._status.setStyleSheet("font-size:13px; font-weight:600; color:#1F6FEB;")
+        head.setSpacing(8)
+        self._status = QLabel("就绪")
+        self._status.setObjectName("StatusLabel")
         head.addWidget(self._status)
         head.addStretch(1)
+        name_lbl = QLabel(self._name)
+        name_lbl.setObjectName("NameLabel")
+        head.addWidget(name_lbl)
         root.addLayout(head)
 
-        hint = QLabel("F8 = 优雅停止（跑完当前节点后退出）　F6 = 紧急退出")
-        hint.setStyleSheet("color:#8B949E; font-size:11px;")
+        hint = QLabel("快捷键：" + "　·　".join(self._hotkeys.labels))
+        hint.setObjectName("HintLabel")
+        hint.setWordWrap(True)
         root.addWidget(hint)
 
         self._log = QPlainTextEdit()
         self._log.setReadOnly(True)
         self._log.setMaximumBlockCount(2000)
-        self._log.setStyleSheet("font-family:Consolas,monospace; font-size:11px;")
         root.addWidget(self._log, 1)
 
         bar = QHBoxLayout()
-        self._pause_btn = QPushButton("⏸ 暂停")
-        self._pause_btn.clicked.connect(self._on_toggle_pause)
-        self._pause_btn.setEnabled(False)
-        bar.addWidget(self._pause_btn)
-
-        self._stop_btn = QPushButton("⏹ 停止")
-        self._stop_btn.clicked.connect(self._on_stop)
-        self._stop_btn.setEnabled(False)
-        bar.addWidget(self._stop_btn)
-
+        bar.setSpacing(8)
+        self._btn_start = self._mk_btn("▶ 开始", self._on_start_clicked, "primary")
+        self._btn_pause = self._mk_btn("⏸ 暂停", self._on_toggle_pause)
+        self._btn_stop = self._mk_btn("⏹ 停止", self._on_stop_clicked, "danger")
+        self._btn_restart = self._mk_btn("🔄 重新开始", self._on_restart_clicked)
+        for b in (self._btn_start, self._btn_pause, self._btn_stop, self._btn_restart):
+            bar.addWidget(b)
         bar.addStretch(1)
-        hide_btn = QPushButton("最小化到托盘")
-        hide_btn.clicked.connect(self._hide_to_tray)
-        bar.addWidget(hide_btn)
         root.addLayout(bar)
+
+        bar2 = QHBoxLayout()
+        bar2.setSpacing(8)
+        self._chk_auto = QCheckBox("启动后自动运行")
+        self._chk_auto.setChecked(bool(self._prefs.get("auto_start")))
+        self._chk_auto.setToolTip(
+            "勾选后，双击这个程序会直接开始跑（适合挂机）。\n"
+            "取消勾选则停在就绪状态，等你点「▶ 开始」或按 F5。"
+        )
+        self._chk_auto.toggled.connect(lambda _=False: self._save_prefs())
+        bar2.addWidget(self._chk_auto)
+        bar2.addStretch(1)
+        bar2.addWidget(self._mk_btn("最小化到托盘", self._hide_to_tray))
+        root.addLayout(bar2)
+
+        # 样式最后设，确保 [kind="..."] 属性选择器在 polish 时可见
+        self.setStyleSheet(_STYLE)
 
         self._setup_tray()
 
@@ -228,8 +374,15 @@ class RuntimeWindow(QWidget):
             act_show = QAction("显示控制面板", self)
             act_show.triggered.connect(self._show_from_tray)
             menu.addAction(act_show)
-            act_stop = QAction("停止运行", self)
-            act_stop.triggered.connect(self._on_stop)
+            menu.addSeparator()
+            act_start = QAction("▶ 开始", self)
+            act_start.triggered.connect(self._on_start_clicked)
+            menu.addAction(act_start)
+            act_pause = QAction("⏸ 暂停 / ▶ 继续", self)
+            act_pause.triggered.connect(self._on_toggle_pause)
+            menu.addAction(act_pause)
+            act_stop = QAction("⏹ 停止", self)
+            act_stop.triggered.connect(self._on_stop_clicked)
             menu.addAction(act_stop)
             menu.addSeparator()
             act_quit = QAction("退出程序", self)
@@ -255,74 +408,185 @@ class RuntimeWindow(QWidget):
         if self._tray is not None:
             self.hide()
             try:
-                self._tray.showMessage(APP_TITLE, "已最小化到托盘，蓝图继续运行中。", QSystemTrayIcon.Information, 3000)
+                self._tray.showMessage(
+                    APP_TITLE,
+                    "已最小化到托盘，蓝图继续运行中。",
+                    QSystemTrayIcon.Information,
+                    3000,
+                )
             except Exception:
                 pass
         else:
             self.showMinimized()
 
-    # ---------------- 运行控制 ----------------
-    def autostart(self):
-        QTimer.singleShot(300, self._start_run)
+    # ---------------- 状态机 ----------------
+    def _apply_state(self):
+        running = self._state in (self.RUNNING, self.PAUSED)
+        self._btn_start.setEnabled(self._state in (self.IDLE, self.FINISHED))
+        self._btn_pause.setEnabled(running)
+        self._btn_pause.setText("▶ 继续" if self._state == self.PAUSED else "⏸ 暂停")
+        self._btn_stop.setEnabled(running)
+        self._btn_restart.setEnabled(self._state in (self.RUNNING, self.PAUSED, self.FINISHED))
 
+    def _set_status(self, text: str, color: str):
+        self._status.setText(text)
+        self._status.setStyleSheet(f"color:{color}; font-size:13px; font-weight:500;")
+
+    # ---------------- 启动后自动运行 ----------------
+    def maybe_autostart(self):
+        if self._chk_auto.isChecked():
+            QTimer.singleShot(400, self._on_start_clicked)
+
+    # ---------------- 运行控制 ----------------
     def _start_run(self):
-        self._append(f"▶ 开始运行蓝图：{self._name}", "INFO")
-        self._append(f"  解包目录：{self._work_dir}", "INFO")
-        runner = BlueprintRunner(self._graph, self, initial_hwnd=None)
+        if self._runner is not None and self._runner.isRunning():
+            self._append("已有蓝图在运行，忽略本次「开始」。", "WARN")
+            return
+
+        try:
+            graph = self._loader()
+        except Exception as e:
+            self._append(f"❌ 加载蓝图失败：{e}", "ERROR")
+            self._set_status("加载失败", _C_ERROR)
+            QMessageBox.critical(self, APP_TITLE, f"无法加载蓝图：\n{e}")
+            return
+
+        self._run_seq += 1
+        token = self._run_seq
+        self._pending_restart = False
+
+        runner = BlueprintRunner(graph, self, initial_hwnd=None)
         runner.log_message.connect(self._append)
-        runner.progress_step.connect(
-            lambda step, ntype: self._status.setText(f"运行中 · Step {step} · {ntype}")
-        )
-        runner.finished_ok.connect(self._on_finished_ok)
-        runner.finished_err.connect(self._on_finished_err)
-        runner.finished.connect(self._on_finished)
-        runner.pause_changed.connect(self._on_pause_changed)
+        runner.progress_step.connect(lambda step, ntype, t=token: self._on_progress(t, step, ntype))
+        runner.finished_ok.connect(lambda t=token: self._on_finished_ok(t))
+        runner.finished_err.connect(lambda err, t=token: self._on_finished_err(t, err))
+        runner.finished.connect(lambda t=token: self._on_runner_finished(t))
+        runner.pause_changed.connect(lambda paused, t=token: self._on_pause_changed(t, paused))
         self._runner = runner
-        self._status.setText("运行中…")
-        self._pause_btn.setEnabled(True)
-        self._stop_btn.setEnabled(True)
+
+        self._state = self.RUNNING
+        self._apply_state()
+        self._set_status("运行中 · 启动…", _C_RUNNING)
+
+        self._append(f"▶ 开始运行蓝图：{self._name}", "INFO")
+        self._append(f"  工作目录：{self._work_dir}", "INFO")
         runner.start()
 
-        # 全局热键：F8 优雅停止 / F6 紧急退出
-        self._hotkeys = HotkeyManager(on_stop=self._on_stop, log_fn=self._append)
-        self._hotkeys.start()
+    def _on_start_clicked(self):
+        if self._runner is not None and self._runner.isRunning():
+            self._append("已有蓝图在运行，忽略本次「开始」。", "WARN")
+            return
+        self._start_run()
 
     def _on_toggle_pause(self):
-        if self._runner is None:
+        r = self._runner
+        if r is None or not r.isRunning():
+            self._append("当前没有运行中的蓝图，无法暂停 / 继续。", "WARN")
             return
-        paused = self._runner.toggle_pause()
-        self._pause_btn.setText("▶ 继续" if paused else "⏸ 暂停")
+        paused = r.toggle_pause()
+        self._state = self.PAUSED if paused else self.RUNNING
+        self._apply_state()
+        if paused:
+            self._set_status("已暂停 · 按 F6 继续", _C_PAUSED)
+            self._append("⏸ 已暂停（不丢状态）。", "WARN")
+        else:
+            self._set_status("运行中…", _C_RUNNING)
+            self._append("▶ 已继续。", "INFO")
 
-    def _on_stop(self):
-        if self._runner is None:
+    def _on_stop_clicked(self):
+        r = self._runner
+        if r is None or not r.isRunning():
+            self._append("当前没有运行中的蓝图。", "INFO")
             return
-        self._append("⏹ 请求停止…", "WARN")
+        self._append("⏹ 请求停止，等待当前节点跑完…", "WARN")
+        self._set_status("正在停止…", _C_PAUSED)
+        self._btn_stop.setEnabled(False)
+        self._btn_pause.setEnabled(False)
+        self._btn_restart.setEnabled(False)
         try:
-            self._runner.request_stop()
+            r.request_stop()
         except Exception:
             pass
 
-    def _on_pause_changed(self, paused: bool):
-        if self._pause_btn is not None:
-            self._pause_btn.setText("▶ 继续" if paused else "⏸ 暂停")
+    def _on_restart_clicked(self):
+        r = self._runner
+        if r is not None and r.isRunning():
+            self._pending_restart = True
+            self._append("🔄 重新开始：先停止当前运行，随后从头开始…", "WARN")
+            self._set_status("正在停止（随后重新开始）…", _C_PAUSED)
+            self._btn_restart.setEnabled(False)
+            try:
+                r.request_stop()
+            except Exception:
+                pass
+            QTimer.singleShot(6000, self._restart_guard)
+            return
+        self._start_run()
 
-    def _on_finished_ok(self):
+    def _restart_guard(self):
+        """重新开始等太久时的兜底提示（不强制杀线程，只告诉用户怎么办）。"""
+        if self._pending_restart and self._runner is not None and self._runner.isRunning():
+            self._append("⚠ 当前节点迟迟没有结束，重新开始被挂起；可点「⏹ 停止」或按 F12 紧急退出。", "WARN")
+
+    def _on_runner_finished(self, token: int):
+        if token != self._run_seq:
+            return
+        old = self._runner
+        self._runner = None
+        if old is not None:
+            try:
+                old.deleteLater()
+            except Exception:
+                pass
+
+        if self._pending_restart:
+            self._pending_restart = False
+            self._state = self.IDLE
+            self._apply_state()
+            self._append("🔄 已停止，即将重新开始…", "INFO")
+            QTimer.singleShot(300, self._start_run)
+            return
+
+        self._state = self.FINISHED
+        self._apply_state()
+        self._set_status("已结束 · 可点「▶ 开始」或按 F5 再跑一次", _C_READY)
+
+    # ---------------- 信号回调 ----------------
+    def _on_hotkey(self, hotkey_id: str):
+        if hotkey_id == "start":
+            self._on_start_clicked()
+        elif hotkey_id == "pause":
+            self._on_toggle_pause()
+        elif hotkey_id == "stop":
+            self._on_stop_clicked()
+
+    def _on_progress(self, token: int, step: int, ntype: str):
+        if token != self._run_seq:
+            return
+        if self._state == self.PAUSED:
+            return
+        self._set_status(f"运行中 · Step {step} · {ntype}", _C_RUNNING)
+
+    def _on_pause_changed(self, token: int, paused: bool):
+        if token != self._run_seq:
+            return
+        self._state = self.PAUSED if paused else self.RUNNING
+        self._apply_state()
+        if paused:
+            self._set_status("已暂停 · 按 F6 继续", _C_PAUSED)
+        else:
+            self._set_status("运行中…", _C_RUNNING)
+
+    def _on_finished_ok(self, token: int):
+        if token != self._run_seq:
+            return
         self._append("✅ 蓝图执行完成。", "SUCCESS")
 
-    def _on_finished_err(self, err: str):
+    def _on_finished_err(self, token: int, err: str):
+        if token != self._run_seq:
+            return
         self._append(f"❌ 蓝图执行异常：{err}", "ERROR")
-
-    def _on_finished(self):
-        self._status.setText("已停止")
-        if self._pause_btn is not None:
-            self._pause_btn.setEnabled(False)
-        if self._stop_btn is not None:
-            self._stop_btn.setEnabled(False)
-        try:
-            if getattr(self, "_hotkeys", None) is not None:
-                self._hotkeys.stop()
-        except Exception:
-            pass
+        self._set_status("执行异常", _C_ERROR)
 
     def _append(self, msg: str, level: str = "INFO"):
         try:
@@ -332,9 +596,14 @@ class RuntimeWindow(QWidget):
 
     def _quit(self):
         try:
-            if self._runner is not None and self._runner.isRunning():
-                self._runner.request_stop()
-                self._runner.wait(2000)
+            self._hotkeys.stop()
+        except Exception:
+            pass
+        r = self._runner
+        try:
+            if r is not None and r.isRunning():
+                r.request_stop()
+                r.wait(3000)
         except Exception:
             pass
         QApplication.quit()
@@ -362,6 +631,10 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("BlueprintRuntime")
     app.setQuitOnLastWindowClosed(False)
+    try:
+        app.setStyle("Fusion")  # 统一控件外观，保证按钮 hover/pressed 反馈一致
+    except Exception:
+        pass
 
     payload = _read_payload()
     if not payload:
@@ -374,7 +647,7 @@ def main() -> int:
         return 2
 
     try:
-        graph, manifest, work_dir, name = _prepare(payload)
+        loader, manifest, work_dir, name = _prepare(payload)
     except Exception as e:
         QMessageBox.critical(
             None,
@@ -383,9 +656,9 @@ def main() -> int:
         )
         return 3
 
-    win = RuntimeWindow(graph, manifest, work_dir, name)
+    win = RuntimeWindow(loader, manifest, work_dir, name)
     win.show()
-    win.autostart()
+    win.maybe_autostart()
     return app.exec()
 
 

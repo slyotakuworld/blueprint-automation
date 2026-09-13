@@ -70,6 +70,8 @@ echo [BUILD] Building BlueprintRuntime.exe (--onefile) ...
   --hidden-import pyautogui ^
   --hidden-import pyperclip ^
   --hidden-import pydirectinput ^
+  --hidden-import pynput ^
+  --hidden-import pynput.keyboard ^
   --hidden-import soundcard ^
   --hidden-import pyaudio ^
   --hidden-import cv2 ^

@@ -47,7 +47,7 @@ def _get_window_rect_dwm(hwnd: int) -> Optional[tuple]:
     return None
 
 
-def _get_exe_name(pid: int) -> str:
+def get_exe_name_by_pid(pid: int) -> str:
     """通过 Toolhelp32 进程快照获取 exe 名。"""
     if not pid:
         return ""
@@ -147,7 +147,7 @@ def _get_window_info(hwnd: int) -> Optional[Dict[str, Any]]:
         "hwnd": int(hwnd),
         "title": title,
         "class_name": cls_buff.value,
-        "exe_name": _get_exe_name(pid.value),
+        "exe_name": get_exe_name_by_pid(pid.value),
         "pid": int(pid.value),
         "rect": (int(rect[0]), int(rect[1]), int(rect[2]), int(rect[3])),
     }

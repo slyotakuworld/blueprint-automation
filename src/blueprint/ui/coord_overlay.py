@@ -49,9 +49,12 @@ class CoordOverlay(FullscreenOverlayBase):
                 self._bound_rect = QRect(int(l), int(t), int(r - l), int(b - t))
                 if not self._exe_name:
                     try:
-                        from src.tools.window_utils import get_exe_name_by_hwnd
+                        import win32process
 
-                        self._exe_name = get_exe_name_by_hwnd(self._hwnd) or ""
+                        from .window_picker_overlay import get_exe_name_by_pid
+
+                        _, _pid = win32process.GetWindowThreadProcessId(self._hwnd)
+                        self._exe_name = get_exe_name_by_pid(int(_pid)) or ""
                     except Exception:
                         pass
             except Exception:

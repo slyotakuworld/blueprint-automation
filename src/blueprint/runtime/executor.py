@@ -3646,7 +3646,7 @@ class BlueprintRunner(QThread):
         # 初始化目标窗口（initial_hwnd；None=全屏）
         #   注意：编辑器内运行与导出的独立 EXE 都传 None。
         #   运行时目标窗口统一由蓝图自身决定（BindWindow 节点 / 各节点「临时目标」），
-        #   不再接受主界面「🎯 截图目标」下拉的选择，保证两条运行路径行为一致。
+        #   保证「编辑器内点▶运行」与「导出后的独立 EXE」两条运行路径行为一致。
         init_hwnd = getattr(self, "_initial_hwnd", None)
         try:
             if init_hwnd:

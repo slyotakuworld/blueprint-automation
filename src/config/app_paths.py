@@ -252,7 +252,6 @@ def _default_user_config_content() -> Dict[str, Any]:
     except Exception:
         base = {
             "hotkeys": {
-                "capture_target": "<f8>",
                 "run_blueprint": "<f5>",
                 "pause_blueprint": "<f6>",
                 "stop_blueprint": "<f7>",

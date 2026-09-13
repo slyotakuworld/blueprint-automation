@@ -16,7 +16,6 @@ class ProjectManager(QObject):
             │   ├── autocap_autosave/      #   目标窗口自动抓帧保存的PNG
             │   └── imported_images/       #   从外部磁盘导入的图片拷贝（缓存）
             ├── templates/                 # 裁剪为模板的小PNG（FindAnyImage 用）
-            ├── split_elements_<ts>/       # ElementSplitDialog自动生成的碎图目录（每帧切一次一个）
             ├── cache/                     # 模板匹配缓存/其它运行期缓存
             └── debug/                     # 运行期debug截图/标注输出
       - 启动时必须先新建或打开一个工程（否则所有写资源操作都被拦截）。
@@ -136,10 +135,6 @@ class ProjectManager(QObject):
 
     def screenshot_imported_dir(self) -> Optional[str]:
         return self._sub("screenshots", "imported_images")
-
-    def split_root_dir(self) -> Optional[str]:
-        """切图产生的 split_elements_* 目录的父目录（即 screenshots/，与之前保持同级语义）"""
-        return self._sub("screenshots")
 
     def template_dir(self) -> Optional[str]:
         return self._sub("templates")

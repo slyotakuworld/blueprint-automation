@@ -4248,7 +4248,7 @@ class InspectorPanel(QWidget):
             f"QPushButton:hover {{ background-color: {hover}; }}"
         )
 
-    # ============= 工具方法（供截图/切图工具对话框回填参数）=============
+    # ============= 工具方法（供截图工具回填参数）=============
     def get_current_node_info(self):
         """返回 (node_id or None, node_type or None)"""
         if self._current_node is None:

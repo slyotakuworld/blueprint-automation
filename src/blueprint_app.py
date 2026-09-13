@@ -34,7 +34,6 @@ from PySide6.QtCore import Qt, QPointF, QSize, QTimer
 from PySide6.QtGui import QAction, QKeySequence, QIcon, QPixmap, QPainter, QColor
 from PySide6.QtWidgets import (
     QApplication,
-    QComboBox,
     QDialog,
     QDockWidget,
     QFileDialog,
@@ -73,7 +72,6 @@ from src.blueprint.runtime.validator import (
     has_errors,
     format_issues,
 )
-from src.blueprint.ui.element_split_dialog import ElementSplitDialog
 from src.blueprint.ui.graphics_scene import NodeScene, NodeView
 from src.blueprint.ui.inspector_panel import InspectorPanel
 from src.blueprint.ui.log_panel import LogPanel
@@ -94,26 +92,6 @@ from src.config.user_settings import (
     _DEFAULT_BY_KEY,
     SHORTCUT_REGISTRY,
 )
-from src.tools.window_utils import list_visible_windows
-
-
-# ============================================================
-# 辅助：禁用滚轮误切换的 ComboBox
-#   - 下拉收起时：悬停滚轮 -> 忽略（防误切）
-#   - 下拉弹出时：滚轮照常滚动选项列表
-# ============================================================
-class NoWheelComboBox(QComboBox):
-    def wheelEvent(self, event):
-        try:
-            view = self.view()
-            if view is not None and view.isVisible():
-                # 下拉列表打开时，允许滚轮翻列表
-                super().wheelEvent(event)
-                return
-        except Exception:
-            pass
-        event.ignore()
-
 
 # ============================================================
 # 通知节点：主窗口右上角非阻塞 Toast 浮层
@@ -236,15 +214,11 @@ class BlueprintMainWindow(QMainWindow):
         self._graph: Optional[BlueprintGraph] = None
         self._last_saved_graph_hash: Optional[str] = None  # 上一次保存/加载时的蓝图哈希，None=从未落盘
         self._runner: Optional[BlueprintRunner] = None
-        self._active_hwnd: Optional[int] = None
-        self._active_hwnd_title_key: Optional[str] = None
         # 工程系统
         self._pm: ProjectManager = ProjectManager.instance()
-        # 热键/切分相关
+        # 热键相关
         self._user_settings: Dict[str, Any] = read_user_settings()
         self._hotkey_mgr = GlobalHotkeyManager(qt_parent=self)
-        self._split_dialog_ref: Optional[ElementSplitDialog] = None
-        self._last_capture_png: Optional[str] = None
         # 剪贴板 + 撤销/重做栈（硬编码标准快捷键：Ctrl+C/V/Z/Y，不在设置界面暴露）
         self._clipboard_nodes: list = []
         self._undo_stack: list = []
@@ -262,7 +236,6 @@ class BlueprintMainWindow(QMainWindow):
         # 绑定：全局热键 ID -> 回调（统一 QTimer.singleShot 立即到主线程，避免重入）
         for hid, cb in self._global_hotkey_id_to_callback().items():
             self._hotkey_mgr.set_callback(hid, lambda c=cb: QTimer.singleShot(0, c))
-        self._reload_target_windows()
 
         # 启动：如果当前已经有打开的工程（main里弹过ProjectStartupDialog设置过），
         # 就加载该工程下的 <工程名>.bp.json；否则创建一张未保存的空白图（理论不会走到这，main会强制先选工程）
@@ -296,7 +269,7 @@ class BlueprintMainWindow(QMainWindow):
     # ==================== 工程系统辅助 ====================
     def _ensure_project_open(self, action_desc: str = "该操作") -> bool:
         """
-        所有「写资源」的操作（截图、切图、运行蓝图、保存模板）前必须调用：
+        所有「写资源」的操作（截图、运行蓝图、保存模板）前必须调用：
         没工程就弹警告 + 返回 False；有工程返回 True。
         """
         if self._pm.is_open():
@@ -826,7 +799,7 @@ class BlueprintMainWindow(QMainWindow):
         self._btn_step = add_toolbtn(self._act_step, bg="#0D2957", color="#58A6FF", hover_bg="#1158C8", hover_border="#1F6FEB")
         tb.addSeparator()
 
-        # --------------- 缩放 / 视图工具 / 切图工具组（BP特有切图引擎 双入口） ---------------
+        # --------------- 缩放 / 视图工具组 ---------------
         self._act_fit = mk_act("#8B949E", "缩放适应", self._view.zoom_fit)
         self._act_zoom_1 = mk_act("#8B949E", "重置100%", self._view.reset_zoom)
         # 【2026-07-03 用户明确：只保留4个标准快捷键 Ctrl+S/Z/C/V；其他缩放快捷键移除，按钮仍可点击】
@@ -834,11 +807,8 @@ class BlueprintMainWindow(QMainWindow):
         self._act_zoom_1.setShortcut(QKeySequence())
         add_toolbtn(self._act_fit)
         add_toolbtn(self._act_zoom_1)
-        tb.addSeparator()
-        self._act_split = mk_act("#7C3AED", "✂ 切分UI元素", self._on_open_split_dialog)
-        add_toolbtn(self._act_split, bg="#2A1B4F", color="#A371F7", hover_bg="#381E6F", hover_border="#7C3AED")
 
-        # --------------- 右侧: 文档攻略 + 截图目标 全局选择器 ---------------
+        # --------------- 右侧: 导出 EXE + 文档攻略 ---------------
         tb.addSeparator()
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
@@ -871,78 +841,9 @@ class BlueprintMainWindow(QMainWindow):
         btn_doc.setToolTip("打开蓝图自动化使用手册（软件怎么用、功能说明、所有节点的属性与参数详解）")
         btn_doc.clicked.connect(self._on_doc_guide_clicked)
         tb.addWidget(btn_doc)
-        # 视觉分隔：和截图目标下拉之间留点空间
-        sep2 = QLabel("  ·  ")
-        sep2.setStyleSheet("color:#30363D;")
-        tb.addWidget(sep2)
-
-        target_hint = QLabel("🎯 截图目标:")
-        target_hint.setStyleSheet("color:#C9D1D9; padding: 0 4px 0 8px;")
-        tb.addWidget(target_hint)
-
-        self._target_combo = NoWheelComboBox()
-        self._target_combo.setMinimumWidth(280)
-        self._target_combo.setMaximumWidth(280)
-        self._target_combo.setStyleSheet("QComboBox { background:#161B22; color:#C9D1D9; padding:3px 8px; border:1px solid #30363D; border-radius:4px; } QComboBox:hover { border-color:#484F58; } QComboBox::drop-down { border:none; width:20px; } QComboBox QAbstractItemView { min-width: 480px; }")
-        self._target_combo.setToolTip(
-            "仅用于编辑器内的「截图取素材」：\n"
-            "  · 全局热键截图（默认 F8）截的就是这个窗口\n"
-            "  · Mouse 节点「📍 坐标拾取」的相对坐标基准\n"
-            "不影响蓝图运行——蓝图跑哪个窗口由蓝图自身的 BindWindow 节点 / 各节点「临时目标」决定，\n"
-            "与导出后的独立 EXE 行为一致。"
-        )
-        self._target_combo.currentIndexChanged.connect(self._on_target_window_changed)
-        tb.addWidget(self._target_combo)
-
-        btn_refresh = QPushButton("↻ 刷新")
-        btn_refresh.setStyleSheet("QPushButton { background:#21262D; color:#C9D1D9; border:1px solid #30363D; border-radius:4px; padding:3px 10px; } QPushButton:hover { background:#30363D; }")
-        btn_refresh.clicked.connect(self._reload_target_windows)
-        tb.addWidget(btn_refresh)
 
         # 【构建完菜单后】先填一次"最近工程"子菜单内容
         self._refresh_recent_projects_menu()
-
-    # ---------------- 截图目标选择器（仅服务编辑器内截图取素材，不影响蓝图运行） ----------------
-    def get_active_hwnd(self) -> Optional[int]:
-        """返回当前选中的截图目标窗口 HWND（None=全屏）。仅供热键截图 / 坐标拾取使用。"""
-        return self._active_hwnd
-
-    def _reload_target_windows(self):
-        c = self._target_combo
-        c.blockSignals(True)
-        prev_id = c.currentData()
-        c.clear()
-        c.addItem("🖥 全屏（所有屏幕）", None)
-        wins = list_visible_windows()
-        wins_sorted = sorted(wins, key=lambda w: w["title"].lower())
-        for w in wins_sorted:
-            title = w["title"].strip() or "(无标题)"
-            if len(title) > 70:
-                title = title[:67] + "..."
-            label = f"[{w['hwnd']:08X}] {title}"
-            c.addItem(label, int(w["hwnd"]))
-        # 恢复之前选中的
-        match = prev_id and c.findData(prev_id) >= 0
-        if match:
-            c.setCurrentIndex(c.findData(prev_id))
-        else:
-            c.setCurrentIndex(0)
-        self._active_hwnd = c.currentData()
-        c.blockSignals(False)
-        self._status_lbl.setText(f"截图目标列表已刷新，共 {len(wins_sorted)} 个窗口" + (f"，当前：HWND={self._active_hwnd:08X}" if self._active_hwnd else "，当前：全屏"))
-
-    def _on_target_window_changed(self, idx: int):
-        self._active_hwnd = self._target_combo.currentData()
-        if self._active_hwnd:
-            # 记录下拉框标题文本，用于后续HWND失效自动重新匹配
-            txt = self._target_combo.currentText() or ""
-            title_only = txt.split("] ", 1)[1] if "] " in txt else txt
-            self._active_hwnd_title_key = title_only
-            self._status_lbl.setText(f"已选定截图目标窗口 HWND={self._active_hwnd:08X}")
-            self._log.append_log(f"[Target] 截图目标窗口已选定：HWND={self._active_hwnd:08X}  → {self._target_combo.currentText()}", "INFO")
-        else:
-            self._active_hwnd_title_key = None
-            self._status_lbl.setText("截图目标未指定：热键截图/坐标拾取将使用全屏")
 
     # ---------------- 工程 ▾：最近工程菜单 ----------------
     def _refresh_recent_projects_menu(self):
@@ -1741,30 +1642,30 @@ class BlueprintMainWindow(QMainWindow):
             self._log.append_log(f"裁图失败: {e}", "ERROR")
             traceback.print_exc()
 
-    # ---------- 截图范围：把「临时目标窗口」解析成屏幕矩形 ----------
-    def _resolve_snip_limit(self, node):
-        """解析节点的「临时目标窗口」，用于把框选范围限定在该窗口内。
+    # ---------- 临时目标窗口解析（Inspector 框选范围 / Mouse 坐标拾取 共用） ----------
+    def _find_temp_target_window(self, node):
+        """按节点「临时目标」参数找窗口，返回 (window_dict, status)。
 
-        返回 (rect, label, status)：
-          status = "none"     未配置临时目标 → 按原逻辑全屏框选
-                 = "ok"       已找到窗口，rect=(x, y, w, h) 为该窗口屏幕矩形
-                 = "notfound" 配置了但当前找不到该窗口 → 回退全屏并告警
+        status = "none"      未配置临时目标
+               = "ok"        已找到（window_dict 含 hwnd/title/exe_name/class_name/rect）
+               = "notfound"  配置了但当前找不到
 
         匹配口径与运行时 _find_window_3d 保持一致：title 子串 / exe 子串 /
         class 全等，命中一个维度 +10，配置了却没命中 -1000（直接淘汰）。
+        这是「编辑器 / 运行时口径一致」原则的落点，改这里必须同步 executor 那边。
         """
         params = getattr(node, "params", None) or {}
         title = str(params.get("temp_target_title", "") or "").strip()
         exe = str(params.get("temp_target_exe", "") or "").strip()
         cls = str(params.get("temp_target_class", "") or "").strip()
         if not (title or exe or cls):
-            return None, "", "none"
+            return None, "none"
         try:
             from src.blueprint.ui.window_picker_overlay import enumerate_valid_windows
             wins = enumerate_valid_windows()
         except Exception as e:
-            self._log.append_log(f"[Snip] 窗口枚举失败: {e}", "WARN")
-            return None, "", "notfound"
+            self._log.append_log(f"[Target] 窗口枚举失败: {e}", "WARN")
+            return None, "notfound"
         best = None
         best_score = -(10 ** 9)
         for w in wins:
@@ -1782,7 +1683,20 @@ class BlueprintMainWindow(QMainWindow):
             if s > best_score:
                 best, best_score = w, s
         if best is None or best_score <= 0:
-            return None, "", "notfound"
+            return None, "notfound"
+        return best, "ok"
+
+    def _resolve_snip_limit(self, node):
+        """解析节点的「临时目标窗口」，用于把框选范围限定在该窗口内。
+
+        返回 (rect, label, status)：
+          status = "none"     未配置临时目标 → 按原逻辑全屏框选
+                 = "ok"       已找到窗口，rect=(x, y, w, h) 为该窗口屏幕矩形
+                 = "notfound" 配置了但当前找不到该窗口 → 回退全屏并告警
+        """
+        best, status = self._find_temp_target_window(node)
+        if status != "ok" or best is None:
+            return None, "", status
         # 把临时目标窗口提到最前，避免截到盖在它上面的其它窗口
         try:
             hwnd = int(best.get("hwnd") or 0)
@@ -1791,13 +1705,15 @@ class BlueprintMainWindow(QMainWindow):
                 bring_window_to_front(hwnd)
         except Exception:
             pass
-        rect = best.get("rect")
         try:
-            lx, ly, lw, lh = (int(v) for v in rect)
+            lx, ly, lw, lh = (int(v) for v in best.get("rect"))
         except Exception:
             return None, "", "notfound"
         if lw < 5 or lh < 5:
             return None, "", "notfound"
+        params = getattr(node, "params", None) or {}
+        exe = str(params.get("temp_target_exe", "") or "").strip()
+        cls = str(params.get("temp_target_class", "") or "").strip()
         name = str(best.get("title", "") or "") or exe or cls
         return (lx, ly, lw, lh), f"临时目标窗口：{name}", "ok"
 
@@ -2034,27 +1950,43 @@ class BlueprintMainWindow(QMainWindow):
 
         coord_mode = str(node.params.get("coord_mode", "relative") or "relative")
 
-        # 尝试获取当前绑定窗口 hwnd + rect（用于相对坐标模式）
-        hwnd = self.get_active_hwnd()
+        # 相对坐标的基准窗口 = 节点自身的「临时目标」参数，
+        # 与运行时 _resolve_temp_target_rect 同口径（title子串 / exe子串 / class全等），
+        # 解析不到就退绝对坐标模式 —— 不再读主界面那个已删除的全局下拉。
+        hwnd = None
         window_rect = None
         exe_name = ""
-        if hwnd:
-            try:
-                import win32gui
-                l, t, r, b = win32gui.GetWindowRect(hwnd)
-                window_rect = (int(l), int(t), int(r - l), int(b - t))
+        if coord_mode == "relative":
+            best, status = self._find_temp_target_window(node)
+            lx = ly = lw = lh = 0
+            if status == "ok" and best is not None:
                 try:
-                    from src.tools.window_utils import get_exe_name_by_hwnd
-                    exe_name = get_exe_name_by_hwnd(hwnd) or ""
+                    lx, ly, lw, lh = (int(v) for v in best.get("rect"))
                 except Exception:
-                    pass
-            except Exception:
-                hwnd = None
-
-        # 若 coord_mode=absolute，强制不传 hwnd（让 overlay 走绝对模式）
-        if coord_mode == "absolute":
-            hwnd = None
-            window_rect = None
+                    lx = ly = lw = lh = 0
+                if lw >= 5 and lh >= 5:
+                    window_rect = (lx, ly, lw, lh)
+                    hwnd = int(best.get("hwnd") or 0) or None
+                    exe_name = str(best.get("exe_name", "") or "")
+                    # 把基准窗口提到最前，否则全屏遮罩盖着它，用户点不到
+                    if hwnd:
+                        try:
+                            from src.tools.window_utils import bring_window_to_front
+                            bring_window_to_front(hwnd)
+                        except Exception:
+                            pass
+                else:
+                    self._log.append_log(
+                        f"[📍] 临时目标窗口尺寸异常({lw}x{lh})，本次按绝对坐标拾取", "WARN"
+                    )
+            elif status == "notfound":
+                self._log.append_log(
+                    "[📍] 节点已配置临时目标，但当前找不到该窗口 → 本次按绝对坐标拾取", "WARN"
+                )
+            else:
+                self._log.append_log(
+                    "[📍] 节点未配置「临时目标」→ 本次按绝对屏幕坐标拾取", "INFO"
+                )
 
         try:
             from src.blueprint.ui.coord_overlay import CoordOverlay
@@ -2311,8 +2243,7 @@ class BlueprintMainWindow(QMainWindow):
                 self._log.append_log("静态校验提示：\n" + msg, "WARN")
         # 2. 启动 runner（QThread 硬约束 §4）
         # ⚠ 这里刻意不传 initial_hwnd：
-        #   主界面「🎯 截图目标」下拉只服务截图取素材，不再影响蓝图运行。
-        #   蓝图跑哪个窗口 100% 由蓝图自身决定（BindWindow 节点 / 各节点临时目标），
+        #   蓝图跑哪个窗口 100% 由蓝图自身决定（BindWindow 节点 / 各节点「临时目标」），
         #   这样「编辑器内点▶运行」与「导出后的挂机 EXE」行为完全一致，
         #   避免出现「编辑器里能跑、导出后找不到图」的口径偏差。
         runner = BlueprintRunner(self._graph, self, initial_hwnd=None)
@@ -2563,26 +2494,6 @@ class BlueprintMainWindow(QMainWindow):
         p.drawRoundedRect(1, 1, 14, 14, 3, 3)
         p.end()
         return QIcon(pix)
-
-    # ==================== 截图 / 切分工具 (S3 / S4 hooks) ====================
-    def _build_tool_hooks(self) -> dict:
-        # 只暴露切图工具真正会消费的回调（ElementSplitDialog 只用到 create_find_image_node）。
-        # 原先这里还注册过 "get_active_hwnd"，但消费方从未调用（_resolve_hook 全项目零调用点），已移除。
-        return {
-            "create_find_image_node": self._hook_create_find_image_node,
-        }
-
-    def _on_open_split_dialog(self):
-        if self._scene is None:
-            return
-        if not self._ensure_project_open("切分UI元素（结果要保存到工程 screenshots/"):
-            return
-        # 用户手动点按钮/菜单打开切图界面：不强制传 initial_hwnd（避免"我没选图就自动切了一张不知道哪来的图 + 找不到图在哪"）
-        dlg = ElementSplitDialog(
-            hooks=self._build_tool_hooks(), parent=self,
-            initial_hwnd=None,
-        )
-        dlg.exec()
 
     # ============================================================
     # 标准快捷键实现（硬编码，不在设置暴露）：Ctrl+C 复制 / Ctrl+V 粘贴 / Ctrl+Z 撤销
@@ -3004,44 +2915,7 @@ class BlueprintMainWindow(QMainWindow):
             self._applying_undo_redo = False
         self._scene.graph_changed.emit()
 
-    # ---------- Hooks implementation ----------
-    def _hook_create_find_image_node(self, template_path, region_tuple4_or_None, template_b64_or_None=None):
-        """切分工具/截图工具回调：在画布中央新增一个 FindImage 节点，并预填参数。
-
-        参数：
-          template_path        - 已保存到磁盘的模板 PNG 绝对路径（必填）。
-          region_tuple4_or_None - (x, y, w, h) 源图上的相对矩形，用于 FindImage 的 region（可选）。
-          template_b64_or_None - 模板的 base64 PNG 缩略图（可选，<=220px），用于 inspector 直接显示预览。
-
-        返回：成功=返回 node.id（非空字符串）；失败=返回 None。
-        """
-        try:
-            from PySide6.QtCore import QPointF
-            scene_center = self._view.mapToScene(
-                self._view.viewport().rect().center()
-            )
-            if scene_center is None:
-                scene_center = QPointF(500, 300)
-            node = self._scene.add_node_by_type("FindImage", scene_center)
-            if node is None:
-                return None
-            node.params["template"] = template_path
-            node.params["threshold"] = float(node.params.get("threshold", 0.75) or 0.75)
-            if isinstance(template_b64_or_None, str) and template_b64_or_None:
-                node.params["template_b64"] = template_b64_or_None
-            if region_tuple4_or_None is not None and len(region_tuple4_or_None) == 4:
-                rx, ry, rw, rh = region_tuple4_or_None
-                node.params["region"] = (int(rx), int(ry), int(rw), int(rh))
-            self._scene.select_node_id(node.id)
-            self._inspector.set_node(node)
-            # 同样：撤销栈不能重复 push node_created
-            self._scene.graph_changed.emit()
-            return node.id
-        except Exception as e:
-            self._log.append_log(f"[Hook] create_find_image_node 失败: {e}", "ERROR")
-            return None
-
-    # ==================== 全局热键 & 游戏内无弹窗截图 ====================
+    # ==================== 全局热键 ====================
     def closeEvent(self, event):
         """关闭窗口时：先检查蓝图是否有未保存修改 → 再释放 pynput 全局钩子，避免进程残留。"""
         # 1) 先检查并询问蓝图保存（用户明确要求：关程序前必须检测保存状态）
@@ -3070,14 +2944,6 @@ class BlueprintMainWindow(QMainWindow):
             self._hotkey_mgr.unregister()
         except Exception:
             pass
-        try:
-            if self._split_dialog_ref is not None:
-                try:
-                    self._split_dialog_ref.close()
-                except Exception:
-                    pass
-        except Exception:
-            pass
         # 3) 同步用户设置到磁盘（保证设置对话框里改过的热键等下次启动还在）
         # 只把 hotkeys/ui 等主窗口管理的字段合并到磁盘最新内容上，避免覆盖磁盘上的其他设置。
         try:
@@ -3094,9 +2960,8 @@ class BlueprintMainWindow(QMainWindow):
         super().closeEvent(event)
 
     def _global_hotkey_id_to_callback(self) -> Dict[str, Any]:
-        """全局热键ID -> 回调（1-param 0参函数）。对应 user_settings SHORTCUT_REGISTRY 里 scope=global 的4项。"""
+        """全局热键ID -> 回调（1-param 0参函数）。对应 user_settings SHORTCUT_REGISTRY 里 scope=global 的项。"""
         return {
-            "capture_target":     self._hotkey_capture_target,
             "run_blueprint":      self._on_run_clicked,
             "pause_blueprint":    self._on_toggle_pause,
             "stop_blueprint":     self._on_stop_clicked,
@@ -3114,15 +2979,11 @@ class BlueprintMainWindow(QMainWindow):
         return {}
 
     def _refresh_hotkey_status_hint(self):
-        """刷新状态栏：显示所有4个全局热键的Qt格式显示。"""
+        """刷新状态栏：按固定顺序显示所有全局热键的 Qt 格式。"""
         parts = []
         gmap = self._global_hotkey_id_to_callback()
-        for key_id in sorted(gmap.keys(), key=lambda k: (
-            0 if k == "capture_target" else
-            1 if k == "run_blueprint" else
-            2 if k == "pause_blueprint" else
-            3
-        )):
+        order = {"run_blueprint": 0, "pause_blueprint": 1, "stop_blueprint": 2}
+        for key_id in sorted(gmap.keys(), key=lambda k: (order.get(k, 9), k)):
             pyn = get_shortcut(key_id, self._user_settings)
             qt = pynput_to_qkeysequence(pyn) or "(?)"
             parts.append(f"{qt}={shortcut_label(key_id).split('（',1)[0].strip()}")
@@ -3245,7 +3106,6 @@ class BlueprintMainWindow(QMainWindow):
         热键绑定到了 F5，录制时按 F5 就把蓝图停了）。设置窗口关闭后（无论点确定还是取消）
         再恢复监听。
         """
-        # 用当前内存里的 user_settings 初始化（SettingsDialog会自己read_user_settings，但保持capture_target行为）
         dlg = SettingsDialog(parent=self)
         # 临时屏蔽所有 pynput 全局热键（listener 停止，但 _hotkeys map 完整保留，resume 时直接用）
         try:
@@ -3283,218 +3143,6 @@ class BlueprintMainWindow(QMainWindow):
         else:
             self._log.append_log("[设置] 已保存（快捷键与之前一致，无需重新绑定）。", "INFO")
         self._refresh_hotkey_status_hint()
-
-    def _hotkey_capture_target(self):
-        if not self._ensure_project_open("截图保存到工程 screenshots/"):
-            # 没工程：把警告当用户打日志也写警告到状态栏且不往下执行（因为写资源要先建工程）
-            return
-        """
-        按主界面「🎯截图目标」下拉选中的 HWND 直接截图：
-          1. 不弹窗、不抢焦点（所以游戏不会被切到暂停界面）
-          2. 默认 BitBlt 前台帧（D3D/Vulkan 游戏不黑屏）
-          3. 保存 PNG 到 screenshots/（裁剪为模板小图单独点「裁图为模板」才写 templates/）
-          4. 非模态显示 ElementSplitDialog（但不激活），加载并自动切分
-          5. 最后 SetForegroundWindow 把焦点还给游戏窗口
-        """
-        from src.tools.window_utils import capture_hwnd_bgr, write_png_cn
-        from src.config.app_paths import screenshot_dir
-        import numpy as np
-
-        hwnd = self._active_hwnd
-        if not hwnd:
-            msg = "[热键] 请先在主界面「🎯截图目标」下拉里选好要截的窗口！（按 ↻ 刷新后选）"
-            self._log.append_log(msg, "WARN")
-            self._status_lbl.setText(msg.replace("[热键] ", ""))
-            return
-
-        # ========== 预校验 & 自动恢复 ==========
-        #   1. IsWindow 失效 → 说明用户关掉/重启过截图目标窗口，旧HWND句柄已被系统回收
-        #      → 自动刷新目标列表 + 按上次选中的"标题文本"尝试重新匹配同程序窗口
-        #   2. IsIconic 最小化 → 提前警告用户用 PrintWindow 兜底（可能D3D游戏是黑的）
-        try:
-            import win32gui
-            is_valid = bool(win32gui.IsWindow(hwnd))
-            is_minimized = bool(is_valid and win32gui.IsIconic(hwnd))
-        except Exception:
-            is_valid = False
-            is_minimized = False
-
-        if not is_valid:
-            old_hwnd = hwnd
-            old_title = self._active_hwnd_title_key
-            self._log.append_log(
-                f"[热键] 目标 HWND={old_hwnd:#X} 已失效（窗口已关闭/重启过，旧句柄不再可用），"
-                f"正在自动刷新目标列表并尝试按标题匹配新窗口...",
-                "WARN",
-            )
-            self._reload_target_windows()
-            # 刷新后再按 old_title 精确/模糊匹配
-            match_idx = -1
-            c = self._target_combo
-            if old_title:
-                for i in range(c.count()):
-                    it_txt = c.itemText(i) or ""
-                    title = it_txt.split("] ", 1)[1] if "] " in it_txt else it_txt
-                    if title == old_title:
-                        match_idx = i
-                        break
-                if match_idx < 0:
-                    for i in range(c.count()):
-                        it_txt = c.itemText(i) or ""
-                        title = it_txt.split("] ", 1)[1] if "] " in it_txt else it_txt
-                        if (title and old_title and
-                            (old_title in title or title in old_title)):
-                            match_idx = i
-                            break
-            if match_idx >= 0:
-                c.setCurrentIndex(match_idx)
-                # _on_target_window_changed 内部会刷新 self._active_hwnd 和标题key
-                hwnd = self._active_hwnd
-                if hwnd:
-                    self._log.append_log(
-                        f"[热键] ✅ 已自动重新匹配到同名窗口：HWND={hwnd:#X} → {c.currentText()}，继续截图。",
-                        "SUCCESS",
-                    )
-                else:
-                    msg = (
-                        f"[热键] ❌ 原目标窗口已关闭/重启（旧HWND={old_hwnd:#X}），"
-                        f"已自动刷新下拉框但未匹配到同名窗口，请在主界面「🎯截图目标」下拉中重新选择。"
-                    )
-                    self._log.append_log(msg, "ERROR")
-                    self._status_lbl.setText(msg.replace("[热键] ", ""))
-                    return
-            else:
-                self._active_hwnd = None
-                self._active_hwnd_title_key = None
-                msg = (
-                    f"[热键] ❌ 原目标窗口已关闭/重启（旧HWND={old_hwnd:#X}），"
-                    f"已自动刷新截图目标下拉框，但未找到同名窗口。"
-                    f"请在主界面「🎯截图目标」下拉中重新选择要截的窗口。"
-                )
-                self._log.append_log(msg, "ERROR")
-                self._status_lbl.setText(msg.replace("[热键] ", ""))
-                return
-        elif is_minimized:
-            self._log.append_log(
-                f"[热键] ⚠️ 目标 HWND={hwnd:#X} 当前最小化，尝试后台PrintWindow策略兜底。"
-                f"如截出来是黑图，请先Alt+Tab把目标窗口还原到前台，再按热键截图。",
-                "WARN",
-            )
-
-        # 1. 截图（默认：优先前台 BitBlt，后台回退 PrintWindow）
-        res = capture_hwnd_bgr(hwnd, prefer_front=True)
-        if res is None:
-            msg = f"[热键] 截图失败：HWND={hwnd:#x} 窗口不存在或被最小化。"
-            self._log.append_log(msg, "ERROR")
-            self._status_lbl.setText(msg.replace("[热键] ", ""))
-            return
-        bgr, pil_img, (w, h) = res
-        if w <= 0 or h <= 0:
-            msg = f"[热键] 截图失败：HWND={hwnd:#x} 返回空尺寸 {w}x{h}。"
-            self._log.append_log(msg, "ERROR")
-            return
-
-        # 2. 生成文件名：HWND十六进制 + 时间戳
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-        fname = f"hotkey_HWND{hwnd:08X}_{ts}.png"
-        shots_dir = screenshot_dir()
-        os.makedirs(shots_dir, exist_ok=True)
-        shot_path = os.path.join(shots_dir, fname)
-
-        # 3. 截图只存 screenshots/ 一份；templates/ 目录放的是用「裁剪为模板」按钮裁出来的小图
-        #    不再把同一张全量截图重复写入 templates/，避免：
-        #      a) screenshots/ 与 templates/ 重复浪费磁盘
-        #      b) templates/ 混进大量非模板级的全屏大图，导致 FindImage 搜索域混乱
-        ok1 = write_png_cn(shot_path, bgr[:, :, ::-1])
-        self._last_capture_png = shot_path if ok1 else None
-
-        strategy = "FRONT_BITBLT"
-        try:
-            import win32gui
-            if win32gui.GetForegroundWindow() != hwnd:
-                strategy = "BACK_PRINTWINDOW"
-        except Exception:
-            pass
-
-        msg = (
-            f"[Ctrl+Shift+A] 截图 OK：HWND={hwnd:#X}  {w}x{h}  策略={strategy}"
-            f"  saved→{shot_path}"
-        )
-        self._log.append_log(msg, "SUCCESS")
-        self._status_lbl.setText(
-            f"🎯 已截目标窗口 {w}x{h}，策略={strategy}，已打开切分工具但未抢焦点（切回编辑器可看到元素列表）"
-        )
-
-        # 4. 非模态打开 ElementSplitDialog，自动加载刚截的图并切分
-        try:
-            dlg = self._get_or_create_split_dialog()
-            dlg.load_and_split_bgr(bgr, source_path_hint=shot_path)
-        except Exception as e:
-            self._log.append_log(f"[热键] 切分工具加载失败：{e}", "WARN")
-
-        # 5. ⚠️ 还焦点给游戏！（关键：任何游戏一切后台就暂停，所以我们截完、做完切分后，
-        #    必须把前台窗口恢复成目标游戏窗口，这样用户感觉不到被切过。
-        try:
-            import win32gui
-            if hwnd and win32gui.IsWindow(hwnd):
-                # 轻微延时一下：确保切分工具的 show() 已经发出去但不会跟抢焦点冲突
-                def _restore_fg():
-                    try:
-                        # 允许最小化的情况：先恢复
-                        try:
-                            placement = win32gui.GetWindowPlacement(hwnd)
-                            if placement and len(placement) >= 2 and placement[1] == 2:
-                                # SW_SHOWNORMAL = 1 还原最小化
-                                win32gui.ShowWindow(hwnd, 1)
-                        except Exception:
-                            pass
-                        win32gui.SetForegroundWindow(hwnd)
-                    except Exception:
-                        pass
-                QTimer.singleShot(80, _restore_fg)
-        except Exception:
-            pass
-
-    def _get_or_create_split_dialog(self) -> ElementSplitDialog:
-        """
-        单例非模态切分工具窗口：
-          - show()而非exec_()（不阻塞、不强制前台）
-          - WA_ShowWithoutActivating：打开但不抢焦点
-        """
-        if self._split_dialog_ref is not None:
-            try:
-                if not self._split_dialog_ref.isVisible():
-                    self._split_dialog_ref.setAttribute(Qt.WA_ShowWithoutActivating, True)
-                    self._split_dialog_ref.show()
-                    self._split_dialog_ref.raise_()
-                return self._split_dialog_ref
-            except Exception:
-                self._split_dialog_ref = None
-
-        hooks = self._build_tool_hooks()
-        # 注意：这里不传 initial_hwnd！
-        # 热键路径已经自己调用 capture_hwnd_bgr 抓好了，直接 dlg.load_and_split_bgr(bgr) 即可。
-        # 如果传了 initial_hwnd，ElementSplitDialog.__init__ 会再抓一次 + 自动切一次，
-        # 然后我们再 load_and_split_bgr 会第二次切，导致元素列表被第二次的结果覆盖。
-        dlg = ElementSplitDialog(parent=self, hooks=hooks, initial_hwnd=None)
-        dlg.setWindowTitle("✂ 切分UI元素（Ctrl+Shift+A 游戏内直接切到这里）")
-        dlg.setAttribute(Qt.WA_ShowWithoutActivating, True)
-        # 非模态 show()，用户不切回编辑器时，这个窗口在任务栏上但不激活，不会影响游戏
-        dlg.show()
-        dlg.raise_()
-        self._split_dialog_ref = dlg
-        # 关闭时自动清引用
-        try:
-            dlg.destroyed.connect(lambda *_: self._clear_split_dialog_ref())
-        except Exception:
-            pass
-        return dlg
-
-    def _clear_split_dialog_ref(self):
-        try:
-            self._split_dialog_ref = None
-        except Exception:
-            pass
 
     # ==================== 导出为独立 EXE ====================
     def _on_export_clicked(self):

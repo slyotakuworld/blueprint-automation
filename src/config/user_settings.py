@@ -20,22 +20,21 @@ from .app_paths import USER_CONFIG_FILE
 # ============================================================
 
 # ---------- 默认热键（pynput 格式）----------
-# CAPTURE 是之前已有的全局截图热键
-DEFAULT_HOTKEY_CAPTURE_PYNPUT: str = "<f8>"              # 全局：截目标窗口（F8=截图 是用户一直以来的肌肉记忆）
-DEFAULT_GLOBAL_CAPTURE_HOTKEY: str = DEFAULT_HOTKEY_CAPTURE_PYNPUT
+# 兜底值：只在「读取/规范化一个尚未注册的 key」时用到，正常路径不会走到
+DEFAULT_HOTKEY_FALLBACK: str = "<f8>"
 
 # 全部快捷键：有序注册 → 用于设置页面逐行显示 / 主窗口统一绑定
 # 结构: ( key_id, 中文说明, 默认pynput值, scope: "global"|"local" )
 # 【2026-07-03 按用户最新要求：
 #   1) 标准快捷键只保留 4 个硬编码：Ctrl+S 保存 / Ctrl+Z 撤销 / Ctrl+C 复制 / Ctrl+V 粘贴
 #      （其它 Ctrl+N / O / Shift+S / 0 / 1 等仍然硬编码可用，但不在设置界面展示了）
-#   2) 全局热键只保留 4 项：F8截图 / F5运行 / F6暂停 / F7停止
-#      → 删除 2 项：✂ 切分UI元素独立快捷键(Ctrl+Shift+X) / ⚠ 紧急杀进程(F6原绑定)
-#      → 新增 1 项：⏸ 暂停/继续全局(F6)，复用顶栏按钮的切换逻辑
+#   2) 全局热键只保留 3 项：F5运行 / F6暂停 / F7停止
+#      → 已删除：✂ 切分UI元素独立快捷键(Ctrl+Shift+X) / ⚠ 紧急杀进程(F6原绑定)
+#      → 2026-09-13 再删：F8「截屏 + 打开切分」——切图工具已独立到
+#        G:\work\ui_element_splitter（GUI + 命令行），本项目不再内嵌切图界面
 #   3) 设置界面「🎛 通用」改为开发者介绍文案。】
 SHORTCUT_REGISTRY: tuple = (
-    # ---- 全局热键（跨窗口，游戏前台也能按到）—— 顺序=优先级（冲突修复时越靠前越优先保留，现在4项没冲突） ----
-    ("capture_target",      "截屏 + 打开切分",              "<f8>",                 "global"),
+    # ---- 全局热键（跨窗口，游戏前台也能按到）—— 顺序=优先级（冲突修复时越靠前越优先保留） ----
     ("run_blueprint",       "运行蓝图",                     "<f5>",                 "global"),
     ("pause_blueprint",     "暂停 / 继续蓝图",               "<f6>",                "global"),
     ("stop_blueprint",      "停止蓝图",                     "<f7>",                 "global"),
@@ -209,16 +208,6 @@ def _save_user_settings_impl(settings: Dict[str, Any], preserve_recent: bool) ->
         return False
 
 
-def get_hotkey_capture_target(settings: Optional[Dict[str, Any]] = None) -> str:
-    s = settings if settings is not None else read_user_settings()
-    return get_shortcut("capture_target", s)
-
-
-def set_hotkey_capture_target(settings: Dict[str, Any], pynput_hotkey: str) -> str:
-    """设置并规范化后返回（不自动save，由调用方决定时机）。"""
-    return set_shortcut(settings, "capture_target", pynput_hotkey)
-
-
 def get_shortcut(key_id: str, settings: Optional[Dict[str, Any]] = None) -> str:
     """通用：统一读快捷键（取不到时用 SHORTCUT_REGISTRY 对应默认值，并过一次 normalize_pynput_hotkey 保证格式一致。"""
     s = settings if settings is not None else read_user_settings()
@@ -226,14 +215,14 @@ def get_shortcut(key_id: str, settings: Optional[Dict[str, Any]] = None) -> str:
         v = s["hotkeys"][key_id]
     except Exception:
         v = None
-    default = _DEFAULT_BY_KEY.get(key_id) or DEFAULT_GLOBAL_CAPTURE_HOTKEY
+    default = _DEFAULT_BY_KEY.get(key_id) or DEFAULT_HOTKEY_FALLBACK
     hk = v if isinstance(v, str) and v.strip() else default
     return normalize_pynput_hotkey(hk)
 
 
 def set_shortcut(settings: Dict[str, Any], key_id: str, pynput_hotkey: str) -> str:
     """统一设置快捷键并规范化，返回规范化后的 pynput 热键字符串。"""
-    default = _DEFAULT_BY_KEY.get(key_id) or DEFAULT_GLOBAL_CAPTURE_HOTKEY
+    default = _DEFAULT_BY_KEY.get(key_id) or DEFAULT_HOTKEY_FALLBACK
     if not (isinstance(pynput_hotkey, str) and pynput_hotkey.strip()):
         pynput_hotkey = default
     hk = normalize_pynput_hotkey(pynput_hotkey)
@@ -301,7 +290,7 @@ def normalize_pynput_hotkey(hk: str) -> str:
       - 功能键（F1..F12 / print_screen / space 等）加 <>
     """
     if not isinstance(hk, str) or not hk.strip():
-        return DEFAULT_GLOBAL_CAPTURE_HOTKEY
+        return DEFAULT_HOTKEY_FALLBACK
     raw_in = hk.strip()
 
     # ---- 阶段1：把 "<xxx><yyy>F8" 这种无分隔符形式 先切 成 "<xxx>+<yyy>+F8" ----
@@ -350,7 +339,7 @@ def normalize_pynput_hotkey(hk: str) -> str:
             key_tok = tt
 
     if not key_tok:
-        return DEFAULT_GLOBAL_CAPTURE_HOTKEY
+        return DEFAULT_HOTKEY_FALLBACK
 
     # ---- 阶段3：最后一个键 是否需要 <> ----
     # 长度1=字母数字 -> 不加
