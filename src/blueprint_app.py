@@ -41,6 +41,8 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QInputDialog,
     QLabel,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -72,6 +74,7 @@ from src.blueprint.runtime.validator import (
     has_errors,
     format_issues,
 )
+from src.blueprint.ui.asset_panel import AssetPanel
 from src.blueprint.ui.graphics_scene import NodeScene, NodeView
 from src.blueprint.ui.inspector_panel import InspectorPanel
 from src.blueprint.ui.log_panel import LogPanel
@@ -246,6 +249,8 @@ class BlueprintMainWindow(QMainWindow):
         # 启动：如果当前已经有打开的工程（main里弹过ProjectStartupDialog设置过），
         # 就加载该工程下的 <工程名>.bp.json；否则创建一张未保存的空白图（理论不会走到这，main会强制先选工程）
         self._load_or_new_graph_for_current_project()
+        # 启动时把左侧「🗂 工程资源」树按当前工程填好（这条启动路径不走 _finalize_project_switch）
+        self._refresh_assets()
 
         # 最后：把 settings 中所有快捷键应用（global 注册到 _hotkey_mgr + local 到 QAction）
         self._apply_shortcuts_from_settings(changed_keys=None, log_success=True)
@@ -315,9 +320,13 @@ class BlueprintMainWindow(QMainWindow):
                     pass
         except Exception:
             pass
-        # 3) 刷新最近工程菜单 + 标题/状态栏
+        # 3) 刷新最近工程菜单 + 标题/状态栏 + 左侧资源树（换工程后必须重建）
         try:
             self._refresh_recent_projects_menu()
+        except Exception:
+            pass
+        try:
+            self._refresh_assets()
         except Exception:
             pass
         try:
@@ -498,7 +507,7 @@ class BlueprintMainWindow(QMainWindow):
             self._last_saved_graph_hash = None  # 空新图，hash 置空=从未保存
             self._bind_new_graph(g, zoom_fit=False)  # 空图无需缩放
             self._log.append_log(
-                f"当前工程内暂未创建任何蓝图文件，请点左上角『工程 ▾』→ 新建蓝图（或 Ctrl+S 保存为.bp.json）手动创建。",
+                f"当前工程内暂未创建任何蓝图文件，请在左侧『🗂 工程资源』面板点「＋蓝图」新建（或 Ctrl+S 保存为 .bp.json）。",
                 "INFO"
             )
             self._update_title()
@@ -558,6 +567,21 @@ class BlueprintMainWindow(QMainWindow):
         self._finalize_project_switch()
 
     # ==================== UI 构建 ====================
+    @staticmethod
+    def _menu_qss() -> str:
+        """深色主题的 QMenu 样式。
+
+        默认 QMenu 在深色底上「选中态」几乎不可见，用户反馈"鼠标放上去没效果、
+        不知道当前选中哪一项"；这里统一给菜单/菜单项加 hover 高亮与分隔线样式。
+        """
+        return (
+            "QMenu { background:#161B22; color:#C9D1D9; border:1px solid #30363D; padding:4px; }"
+            "QMenu::item { padding:6px 22px 6px 14px; border-radius:3px; }"
+            "QMenu::item:selected { background:#1F6FEB; color:#FFFFFF; }"
+            "QMenu::item:disabled { color:#6E7681; }"
+            "QMenu::separator { height:1px; background:#30363D; margin:4px 6px; }"
+        )
+
     def _build_central(self):
         root = QWidget(self)
         self.setCentralWidget(root)
@@ -600,6 +624,20 @@ class BlueprintMainWindow(QMainWindow):
             "QDockWidget::close-button, QDockWidget::float-button { background: transparent; padding: 2px; }"
         )
 
+        # 左：🗂 工程资源（资源管理器，位于节点库左边）
+        self._assets = AssetPanel()
+        dock_assets = QDockWidget("🗂 工程资源", self)
+        dock_assets.setObjectName("dockAssets")
+        dock_assets.setWidget(self._assets)
+        dock_assets.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
+        dock_assets.setFeatures(QDockWidget.DockWidgetMovable)
+        dock_assets.setMinimumWidth(230)
+        dock_assets.setMaximumWidth(340)
+        self.addDockWidget(Qt.LeftDockWidgetArea, dock_assets)
+        dock_assets.setStyleSheet(_dock_stylesheet)
+        dock_assets.show()
+        self._dock_assets = dock_assets
+
         # 左：📚节点库（固定最小宽度220，不可调节宽度）
         self._palette = NodePalette()
         dock_left = QDockWidget("📚 节点库", self)
@@ -614,6 +652,8 @@ class BlueprintMainWindow(QMainWindow):
         dock_left.setStyleSheet(_dock_stylesheet)
         dock_left.show()
         self._dock_palette = dock_left
+        # 【关键】把资源面板挪到节点库左边（Cocos 式布局：资源 | 节点库 | 画布 | 属性）
+        self.splitDockWidget(dock_assets, dock_left, Qt.Horizontal)
 
         # 右：🎛 属性面板（固定最大宽度460，不可调节宽度）
         self._inspector = InspectorPanel()
@@ -660,7 +700,6 @@ class BlueprintMainWindow(QMainWindow):
             a.triggered.connect(slot)
             a.setIcon(self._make_icon(icon_color))
             return a
-
         def add_toolbtn(action, bg="#1F242C", color="#C9D1D9", hover_bg="#2D333B", hover_border="#3A3F4B", wmin=None):
             btn = QToolButton()
             btn.setDefaultAction(action)
@@ -686,12 +725,7 @@ class BlueprintMainWindow(QMainWindow):
         # 【前置：工程/蓝图级 QAction 先定义完毕】
         #  蓝图按钮快捷键按用户要求：全部移除，一个不留（全局 Ctrl+S/Ctrl+Z/Ctrl+C/Ctrl+V 另有独立 QAction 绑）
         # ============================================================
-        self._act_save_as = mk_act("#8250DF", "另存蓝图…", self._on_save_as)
-
-        # 蓝图级 4 个操作 + 删除（无快捷键、无顶栏按钮、只在「工程 ▾」下拉里出现）
-        self._act_new = mk_act("#238636", "新建蓝图", self._on_new)
-        self._act_open = mk_act("#0969DA", "加载蓝图…", self._on_open)
-        self._act_delete = mk_act("#DA3633", "删除蓝图…", self._on_delete_blueprint)
+        # 蓝图级操作中只剩「保存」留在菜单里（其余新建/打开/另存/删除/重命名都在左侧资源面板）
         self._act_save = mk_act("#0969DA", "保存蓝图", self._on_save)
 
         # 工程级 2 个操作
@@ -699,38 +733,34 @@ class BlueprintMainWindow(QMainWindow):
         self._act_open_project = mk_act("#7C3AED", "打开工程…", self._on_open_project)
 
         # === 构建：工程 ▾ 顶层菜单 ===
+        # 【2026-09-13 定稿】蓝图级操作（新建/保存/另存/加载/删除）全部移出本菜单，
+        # 改由左侧「🗂 工程资源」资源管理器承担（Cocos 式资源面板）。
+        # 本菜单只保留工程级操作：新建工程 / 打开工程 / 最近工程。
         self._menu_proj_saveas = QMenu(self)
+        # 【关键】菜单 hover 高亮：默认 QMenu 在深色主题下选中态几乎不可见，
+        # 用户"鼠标放上去连效果都没有、不知道选中谁"。统一套用深色高亮样式。
+        self._menu_proj_saveas.setStyleSheet(self._menu_qss())
+        self._menu_proj_saveas.setToolTipsVisible(True)
 
-        # ---------- 第 1 组：📦 工程级（按用户要求：打开工程 与 最近工程 同级，最近工程放在打开工程下面） ----------
+        # ---------- 第 1 组：📦 工程级（打开工程 与 最近工程 同级，最近工程放在打开工程下面） ----------
         self._menu_proj_saveas.addAction(self._act_new_project)
         self._menu_proj_saveas.addAction(self._act_open_project)
-        # 🗂  最近工程：直接作为顶层子菜单挂在 工程▾ 下，与「打开工程…」同级（不是它的子节点）
+        # 🗂  最近工程：直接作为顶层子菜单挂在 工程▾ 下，与「打开工程…」同级
         self._menu_recent_projects = QMenu("最近工程", self)
         self._menu_recent_projects.setToolTipsVisible(True)
+        self._menu_recent_projects.setStyleSheet(self._menu_qss())
         self._menu_proj_saveas.addMenu(self._menu_recent_projects)
 
-        # ---------- 分隔符：工程级 / 蓝图级 ----------
+        # ---------- 第 2 组：🗂 蓝图级（已精简为仅「保存蓝图」） ----------
+        # 保存仍留一个入口（Ctrl+S 也能用）；新建/另存/加载/删除请看左侧资源面板
         self._menu_proj_saveas.addSeparator()
-
-        # ---------- 第 2 组：🗺  蓝图级（无分组标题、描述极简化、一个快捷键都不留） ----------
-        self._menu_proj_saveas.addAction(self._act_new)
         self._menu_proj_saveas.addAction(self._act_save)
-        self._menu_proj_saveas.addAction(self._act_save_as)
-        # 🗂  加载蓝图：直接作为顶层子菜单挂在工程▾下，与「新建/保存/另存/删除」同级（类似最近工程的下拉结构）
-        # 第 1 项永远是『从文件浏览打开…』（保留原入口），后续是当前工程所有 .bp.json 按修改时间倒序，方便快速切换
-        self._menu_load_blueprint = QMenu("加载蓝图", self)
-        self._menu_load_blueprint.setToolTipsVisible(True)
-        # 【关键】aboutToShow：每次展开子菜单时重新扫描工程目录，保证蓝图列表/修改时间 100% 实时
-        # （不是启动时扫一次，避免外部创建蓝图、修改文件时间后列表不刷新）
-        self._menu_load_blueprint.aboutToShow.connect(self._refresh_load_blueprint_menu)
-        self._menu_proj_saveas.addMenu(self._menu_load_blueprint)
-        self._menu_proj_saveas.addAction(self._act_delete)
 
         # === 把构建好的菜单挂到 ToolButton ===
         tb.addSeparator()
         self._btn_proj_menu = QToolButton()
         self._btn_proj_menu.setText("工程 ▾")
-        self._btn_proj_menu.setToolTip("新建/打开工程、管理工程内蓝图文件")
+        self._btn_proj_menu.setToolTip("新建/打开工程、切换最近工程\n（蓝图的 新建/打开/重命名/删除 请看左侧「🗂 工程资源」面板）")
         self._btn_proj_menu.setMenu(self._menu_proj_saveas)
         self._btn_proj_menu.setPopupMode(QToolButton.InstantPopup)
         self._btn_proj_menu.setCursor(Qt.PointingHandCursor)
@@ -915,131 +945,6 @@ class BlueprintMainWindow(QMainWindow):
             QMessageBox.critical(self, "打开失败", f"打开最近工程时出错：\n{e}")
 
     # ---------------- 工程 ▾：加载蓝图子菜单（所有工程蓝图按修改时间倒序） ----------------
-    def _list_project_blueprints(self, proj_root: str):
-        """【扫描辅助】递归工程根目录下所有真正的蓝图文件（.bp.json），并过滤掉备份/临时文件。
-        返回 list[(abs_path, rel_to_project, mtime_secs)]，已排除备份。"""
-        if not proj_root or not os.path.isdir(proj_root):
-            return []
-        result = []
-        for dirpath, dirnames, filenames in os.walk(proj_root):
-            # 跳过隐藏目录（.bp、.git 等），避免把工程元数据当蓝图列出来
-            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
-            for fn in filenames:
-                # 必须是蓝图扩展名
-                if not fn.lower().endswith(BlueprintStore.EXT.lower()):
-                    continue
-                # 过滤备份：name.bp.backup_xxx.json → stem 里含 .backup_ → 跳过
-                # BlueprintStore.save 生成的备份形如：<stem>.bp.backup_YYYYMMDD_HHMMSS.json
-                if ".backup_" in fn:
-                    continue
-                # 过滤临时文件（~xxx.bp.json、xxx.bp.json.tmp 这种）
-                if fn.startswith("~") or fn.lower().endswith(".tmp"):
-                    continue
-                abs_path = os.path.join(dirpath, fn)
-                try:
-                    st = os.stat(abs_path)
-                    mtime = int(st.st_mtime)
-                except OSError:
-                    continue
-                # 相对于工程根目录显示，方便知道蓝图在哪个子目录
-                rel = os.path.relpath(abs_path, proj_root)
-                # Windows 上 os.walk 返回反斜杠，统一成正斜杠（显示更清爽）
-                rel = rel.replace("\\", "/")
-                result.append((abs_path, rel, mtime))
-        # 按 mtime 倒序（最近修改的排最前面）
-        result.sort(key=lambda t: t[2], reverse=True)
-        return result
-
-    def _refresh_load_blueprint_menu(self):
-        """『加载蓝图』子菜单 aboutToShow 时调用：
-        每次展开都重新扫描一次，100% 实时（外部创建/删除/改了修改时间都会变）。
-        结构：
-          第1项. 📁 从文件浏览打开…（永远保留，用户要求）
-          -------
-          没工程：    （请先打开工程，才能列出工程下所有蓝图）
-          有工程无蓝图：（工程目录下暂无蓝图，点上方「新建蓝图」创建）
-          有工程有蓝图：按修改时间新→旧，当前已打开的蓝图前加 📌 视觉标记"""
-        try:
-            menu = getattr(self, "_menu_load_blueprint", None)
-            if menu is None:
-                return
-            menu.clear()
-            # ============== 第 1 项（永远在）：从文件浏览打开… ==============
-            act_browse = QAction("📁 从文件浏览打开…", menu)
-            act_browse.setToolTip("使用系统文件浏览器选择任意位置的蓝图文件（原入口）")
-            # 点这个直接走原 _on_open，会弹 QFileDialog
-            act_browse.triggered.connect(lambda _checked=False: self._on_open())
-            menu.addAction(act_browse)
-            # ============== 分隔符 ==============
-            menu.addSeparator()
-            # ============== 后续：工程下所有蓝图 ==============
-            pm = self._pm
-            proj_root = pm.project_root if pm and pm.is_open() else None
-            if not proj_root:
-                # 没工程 → 给禁用的提示项（用户选「从文件浏览打开」仍可跨工程打开任意蓝图）
-                act_hint = QAction("（请先打开工程，才能列出工程下所有蓝图）", menu)
-                act_hint.setEnabled(False)
-                menu.addAction(act_hint)
-                return
-            all_bps = self._list_project_blueprints(proj_root)
-            if not all_bps:
-                act_empty = QAction("（工程目录下暂无蓝图，点「新建蓝图」创建）", menu)
-                act_empty.setEnabled(False)
-                menu.addAction(act_empty)
-                return
-            # 当前正在打开的蓝图路径 → 如果在列表里，加一个 📌 标记（用户一眼识别"当前在哪"）
-            current_path_norm = None
-            if self._current_path:
-                try:
-                    current_path_norm = os.path.normcase(os.path.abspath(self._current_path))
-                except Exception:
-                    current_path_norm = None
-            # 格式化时间：YYYY-MM-DD HH:MM（本地时区，用户看着习惯）
-            from datetime import datetime
-            shown = 0
-            for (abs_path, rel_display, mtime_secs) in all_bps:
-                try:
-                    dt_str = datetime.fromtimestamp(mtime_secs).strftime("%Y-%m-%d %H:%M")
-                except Exception:
-                    dt_str = ""
-                # 显示：(📌) 相对路径（子目录/蓝图A.bp.json） + 右侧小字是修改时间
-                # （PySide6 QAction 不支持富文本/两列，所以统一拼到 text 里，用 8 个空格隔开时间列，视觉上有间隔感）
-                time_suffix = f"        [{dt_str}]" if dt_str else ""
-                is_current = False
-                if current_path_norm:
-                    try:
-                        is_current = current_path_norm == os.path.normcase(os.path.abspath(abs_path))
-                    except Exception:
-                        is_current = False
-                prefix = "📌 " if is_current else "     "
-                # &1. 这种数字前缀给用户可以按 1/2/3 快速选择（和最近工程一样）
-                idx_prefix = f"&{shown+1}. " if shown < 9 else "    "
-                text = f"{idx_prefix}{prefix}{rel_display}{time_suffix}"
-                act = QAction(text, menu)
-                act.setToolTip(f"完整路径: {abs_path}\n最近修改: {dt_str}")
-                act.setData(abs_path)
-                # 点菜单项 → 先 confirm_discard → 是 → 直接加载（用抽出来的公共函数）
-                act.triggered.connect(lambda _checked=False, p=abs_path: self._on_open_blueprint_from_menu(p))
-                menu.addAction(act)
-                shown += 1
-        except Exception as e:
-            try:
-                self._log.append_log(f"[Blueprint] 加载蓝图菜单刷新失败：{e}", "WARN")
-            except Exception:
-                pass
-
-    def _on_open_blueprint_from_menu(self, path: str):
-        """点加载蓝图子菜单里的具体蓝图项 → 切换过去。"""
-        if not path:
-            return
-        if not os.path.isfile(path):
-            QMessageBox.warning(self, "打开失败", f"蓝图文件已不存在（可能被外部删除）：\n{path}")
-            return
-        # 先问是否丢弃当前未保存的修改（和 _on_open / _on_new 保持一致）
-        if not self._confirm_discard():
-            return
-        self._open_blueprint_path(path)
-
     # ==================== 子图导航（循环体子画布 / 组件子图） ====================
     def _build_breadcrumb_bar(self):
         """顶部面包屑导航条：进入子图时显示「返回」按钮 + 当前层级路径。"""
@@ -1105,6 +1010,64 @@ class BlueprintMainWindow(QMainWindow):
             else:
                 self._create_empty_subgraph(node, body_key, kind)
                 self._enter_subgraph(node, body_key, kind)
+            return
+        # 组件节点：双击 → 跳到它调用的那张组件蓝图（跳转前问是否保存当前修改）
+        if node.type == "Component":
+            self._jump_to_component_blueprint(node)
+            return
+
+    def _jump_to_component_blueprint(self, node):
+        """双击 Component 节点 → 打开它引用的组件蓝图（相对工程根路径）。"""
+        ref = str((node.params or {}).get("blueprint_path", "") or "").strip()
+        if not ref:
+            QMessageBox.information(
+                self, "未选择组件",
+                "这个组件节点还没有选择要调用的蓝图。\n\n请在右侧属性面板的「组件蓝图」下拉里选一张 components/ 目录下的蓝图；"
+                "若还没有组件，可在左侧「🗂 工程资源」面板点「＋组件」新建。",
+            )
+            return
+        self._open_component_ref(ref, node=node)
+
+    def _on_inspector_open_component(self, ref: str):
+        """属性面板「↗ 打开这个组件」按钮 → 跳转到组件蓝图。"""
+        self._open_component_ref(str(ref or "").strip(), node=None)
+
+    def _on_scene_open_component(self, node_id: str):
+        """画布上组件节点右键「🧩 打开引用的组件」。"""
+        if self._graph is None or node_id not in self._graph.nodes:
+            return
+        node = self._graph.nodes[node_id]
+        self._jump_to_component_blueprint(node)
+
+    def _open_component_ref(self, ref: str, node=None):
+        """公共入口：把「组件相对路径」解析成绝对路径并跳转过去编辑。"""
+        if not ref:
+            return
+        root = self._pm.project_root if (self._pm and self._pm.is_open()) else None
+        abs_path = os.path.normpath(os.path.join(root, ref)) if (root and not os.path.isabs(ref)) else os.path.normpath(ref)
+        if not os.path.isfile(abs_path):
+            r = QMessageBox.warning(
+                self, "组件不存在",
+                f"引用的组件文件不存在：\n\n  {ref}\n（解析为：{abs_path}）\n\n"
+                f"可能已被删除或重命名。是否清空该节点的组件引用？"
+                if node is not None else
+                f"引用的组件文件不存在：\n\n  {ref}\n（解析为：{abs_path}）\n\n可能已被删除或重命名。",
+                (QMessageBox.Yes | QMessageBox.No) if node is not None else QMessageBox.Ok,
+                QMessageBox.No if node is not None else QMessageBox.Ok,
+            )
+            if node is not None and r == QMessageBox.Yes:
+                # 走统一参数修改入口（进撤销栈 + 刷新画布/属性面板）
+                try:
+                    self._on_param_changed(node.id, "blueprint_path", "")
+                except Exception:
+                    node.params["blueprint_path"] = ""
+                    self._scene.update()
+            return
+        # 跳到组件前先处理未保存修改（与切换蓝图一致）
+        if not self._confirm_discard():
+            return
+        self._open_blueprint_path(abs_path)
+        self._log.append_log(f"[Component] 已跳转到组件蓝图：{os.path.basename(abs_path)}", "SUCCESS")
 
     def _create_empty_subgraph(self, host_node, body_key: str, kind: str):
         """给子画布容器节点创建一个空的子图（含一个起始节点）。
@@ -1205,11 +1168,28 @@ class BlueprintMainWindow(QMainWindow):
         self._scene.node_selected.connect(self._on_scene_node_selected)
         self._scene.graph_changed.connect(self._update_title)
         self._scene.node_double_clicked.connect(self._on_node_double_clicked)
+        self._scene.node_find_in_log.connect(self._on_node_find_in_log)
+        self._scene.node_open_component.connect(self._on_scene_open_component)
+        self._scene.asset_dropped.connect(self._on_asset_dropped)
         self._inspector.param_changed.connect(self._on_param_changed)
         self._inspector.request_pick_template.connect(self._on_pick_template)
         self._inspector.request_snip_for_node.connect(self._on_snip_for_node)
         self._inspector.request_pick_coord.connect(self._on_pick_coord)
+        self._inspector.request_open_component.connect(self._on_inspector_open_component)
+        self._inspector.component_chosen.connect(self._on_component_chosen)
         self._palette.info_message.connect(lambda m, l: self._log.append_log(m, l))
+        # 📋 日志面板：双击日志行 → 定位到画布节点（日志 ↔ 节点 双向定位）
+        self._log.node_activated.connect(self._on_log_line_activated)
+        # 🗂 工程资源面板：所有文件写操作都回调到主窗口执行（面板只发意图）
+        self._assets.open_blueprint.connect(self._on_asset_open_blueprint)
+        self._assets.request_new.connect(self._on_asset_new)
+        self._assets.request_rename.connect(self._on_asset_rename)
+        self._assets.request_delete.connect(self._on_asset_delete)
+        self._assets.save_current.connect(self._on_save)
+        self._assets.save_as_component.connect(self._on_save_as_component)
+        self._assets.open_from_disk.connect(self._on_open)
+        self._assets.reveal_path.connect(self._on_asset_reveal)
+        self._assets.request_reverse_deps.connect(self._on_asset_reverse_deps)
         # 注意：全局热键已由 GlobalHotkeyManager.set_callback 直接绑定到主线程 QTimer.singleShot，
         # 无需额外 bridge.connect
 
@@ -1248,7 +1228,15 @@ class BlueprintMainWindow(QMainWindow):
         self._undo_stack.clear()
         self._redo_stack.clear()
         # 3) 按要求缩放视图
-        if zoom_fit and self._view is not None:
+        #    优先恢复「这张蓝图上次的缩放/位置」（离上次编辑不远，接着看很顺手）；
+        #    没有记录时再按 zoom_fit 参数走默认行为。
+        _restored = False
+        try:
+            if self._current_path:
+                _restored = self._restore_view_state(self._current_path)
+        except Exception:
+            _restored = False
+        if (not _restored) and zoom_fit and self._view is not None:
             try:
                 self._view.zoom_fit()
             except Exception:
@@ -1260,6 +1248,84 @@ class BlueprintMainWindow(QMainWindow):
                 self._view._refresh_breakpoint_label()
             except Exception:
                 pass
+        # 5) 左侧资源树：高亮当前蓝图（打开/新建/启动装载都会走到这里）
+        try:
+            if getattr(self, "_assets", None) is not None:
+                self._assets.set_current_path(self._current_path)
+        except Exception:
+            pass
+
+    # ==================== 编辑器视图记忆（下次启动接着看） ====================
+    @staticmethod
+    def _editor_prefs_path() -> str:
+        try:
+            from src.config.app_paths import get_app_dir
+            return os.path.join(get_app_dir(), "editor_prefs.json")
+        except Exception:
+            return ""
+
+    def _read_editor_prefs(self) -> dict:
+        p = self._editor_prefs_path()
+        if not p or not os.path.isfile(p):
+            return {}
+        try:
+            d = json.load(open(p, encoding="utf-8"))
+            return d if isinstance(d, dict) else {}
+        except Exception:
+            return {}
+
+    def _persist_view_state(self):
+        """关闭窗口时记录：视图缩放/中心（按蓝图分别记），供下次打开接着看。"""
+        p = self._editor_prefs_path()
+        if not p:
+            return
+        data = self._read_editor_prefs()
+        try:
+            view = self._view
+            if view is not None and self._current_path:
+                t = view.transform()
+                c = view.mapToScene(view.viewport().rect().center())
+                key = "view::" + os.path.normcase(os.path.abspath(self._current_path))
+                data[key] = {"scale": float(t.m11()), "cx": float(c.x()), "cy": float(c.y())}
+        except Exception:
+            pass
+        # 裁剪：只保留最近 20 个视图记录，防止文件无限膨胀
+        try:
+            vkeys = [k for k in data if k.startswith("view::")]
+            if len(vkeys) > 20:
+                for k in vkeys[:-20]:
+                    data.pop(k, None)
+        except Exception:
+            pass
+        try:
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def _restore_view_state(self, path: str) -> bool:
+        """恢复某张蓝图上次的视图缩放/中心。没有记录或恢复失败返回 False。"""
+        data = self._read_editor_prefs()
+        if not data:
+            return False
+        key = "view::" + os.path.normcase(os.path.abspath(path))
+        rec = data.get(key)
+        if not isinstance(rec, dict):
+            return False
+        try:
+            view = self._view
+            if view is None:
+                return False
+            scale = float(rec.get("scale", 1.0) or 1.0)
+            if scale <= 0.01 or scale > 20:
+                scale = 1.0
+            view.resetTransform()
+            view.scale(scale, scale)
+            view.centerOn(QPointF(float(rec.get("cx", 0.0)), float(rec.get("cy", 0.0))))
+            return True
+        except Exception:
+            return False
 
     def _new_graph(self):
         g = BlueprintStore.new_graph("Untitled")
@@ -1268,99 +1334,7 @@ class BlueprintMainWindow(QMainWindow):
         self._bind_new_graph(g, zoom_fit=False)  # 新空图不用缩放
         self._log.append_log("新建空白蓝图（未保存）。", "SUCCESS")
         self._update_title()
-
-    def _on_new(self):
-        """『工程 ▾ → 新建蓝图』回调：
-        先弹对话框让用户输入蓝图名称（默认建议名自动防重），点确定才在工程目录下创建 .bp.json；
-        点取消就什么都不做（也不会生成任何文件）。"""
-        # 1) 先确认要不要保存当前未保存的修改（任何情况下都要问）
-        if not self._confirm_discard():
-            return
-        # 2) 没有工程 → 退回旧行为：内存空画布（没地方落盘）
-        if not self._ensure_project_open("新建蓝图"):
-            self._new_graph()
-            return
-        # 3) 有工程 → 先计算不重名的默认建议名："新蓝图 / 新蓝图 1 / 新蓝图 2..."
-        proj_root = self._pm.project_root
-        base_suggest = "新蓝图"
-        i = 0
-        while True:
-            suggest_stem = base_suggest if i == 0 else f"{base_suggest} {i}"
-            candidate = os.path.join(proj_root, suggest_stem + BlueprintStore.EXT)
-            if not os.path.exists(candidate):
-                default_stem = suggest_stem
-                break
-            i += 1
-        # 4) 循环问用户蓝图名，直到：用户输入合法且不冲突（或点取消→直接放弃）
-        chosen_stem: Optional[str] = None
-        while True:
-            user_stem, ok = QInputDialog.getText(
-                self,
-                "新建蓝图",                         # 标题
-                "请输入新蓝图的名称（无需写 .bp.json 后缀）：",  # 提示
-                text=default_stem,                 # 默认值=自动防重的建议名
-            )
-            if not ok:
-                # 用户点取消：什么都不创建，直接返回
-                return
-            # 4.1 清洗用户输入：去掉首尾空白
-            user_stem = (user_stem or "").strip()
-            if not user_stem:
-                QMessageBox.warning(self, "名称不能为空", "蓝图名称不能为空，请重新输入。")
-                continue
-            # 4.2 去掉用户不小心输入的 .bp.json 后缀（避免生成 "xxx.bp.json.bp.json"）
-            if user_stem.lower().endswith(BlueprintStore.EXT.lower()):
-                user_stem = user_stem[: -len(BlueprintStore.EXT)]
-            # 4.3 Windows 文件系统非法字符替换成下划线（防止创建失败）
-            invalid = '<>:"/\\|?*'
-            safe_stem = "".join("_" if ch in invalid else ch for ch in user_stem).strip()
-            if not safe_stem:
-                QMessageBox.warning(self, "名称非法", "请输入不含特殊字符的蓝图名称。")
-                continue
-            # 4.4 重名检查：如果已有同名 .bp.json，问用户是否覆盖
-            final_path = os.path.join(proj_root, safe_stem + BlueprintStore.EXT)
-            if os.path.exists(final_path):
-                r = QMessageBox.question(
-                    self,
-                    "蓝图名称已存在",
-                    f"工程目录下已经存在同名蓝图文件：\n{final_path}\n\n是否覆盖？（覆盖后原文件会进备份，不会永久丢失。）",
-                    QMessageBox.Yes | QMessageBox.No,
-                    QMessageBox.No,
-                )
-                if r != QMessageBox.Yes:
-                    # 不覆盖：回到输入循环（下一次默认值仍取用户这次输入的 safe_stem，用户能继续改）
-                    default_stem = safe_stem
-                    continue
-                # 用户明确要覆盖 → 继续往下走，BlueprintStore.save 会自动做 .backup
-            chosen_stem = safe_stem
-            break
-        if chosen_stem is None:
-            return
-        # 5) 用户选好名称了 → 创建 graph 对象，同步 graph.name = chosen_stem（中文写进 JSON.name，下次加载标题栏正确）
-        g = BlueprintStore.new_graph(chosen_stem)
-        g.name = chosen_stem
-        ok = BlueprintStore.save(g, final_path)  # 重名时用户已选 Yes，make_backup 默认 True
-        if not ok:
-            QMessageBox.warning(
-                self, "创建蓝图失败",
-                f"无法在工程目录创建新蓝图文件，请检查目录权限：\n{final_path}"
-            )
-            # 即使落盘失败，也把 graph 绑到画布让用户不至于白等
-            self._current_path = None
-            self._last_saved_graph_hash = None
-            self._bind_new_graph(g, zoom_fit=False)
-            self._update_title()
-            return
-        # 6) 落盘成功 → 先 bind 再 mark_clean(g)，保证不显示未保存星号
-        self._current_path = final_path
-        self._bind_new_graph(g, zoom_fit=False)
-        self._mark_graph_clean(g)
-        try:
-            self._pm.set_last_opened_blueprint(final_path)
-        except Exception:
-            pass
-        self._log.append_log(f"✅ 已创建新蓝图：{final_path}", "SUCCESS")
-        self._update_title()
+        self._refresh_assets()
 
     def _on_open(self):
         """原『加载蓝图』入口：弹文件浏览器选文件。"""
@@ -1405,6 +1379,7 @@ class BlueprintMainWindow(QMainWindow):
             pass
         self._log.append_log(f"已加载蓝图: {path}", "SUCCESS")
         self._update_title()
+        self._refresh_assets()
         # 工程下的蓝图列表可能因为"最近修改时间"重排，下次打开工程下拉时自动刷新（aboutToShow 已经连了刷新）
 
     def _on_save(self):
@@ -1428,6 +1403,7 @@ class BlueprintMainWindow(QMainWindow):
                 pass
             self._log.append_log(f"已保存: {self._current_path}", "SUCCESS")
             self._update_title()
+            self._refresh_assets()
         else:
             QMessageBox.warning(self, "保存失败", "写入文件失败，请检查路径与权限。")
 
@@ -1479,79 +1455,923 @@ class BlueprintMainWindow(QMainWindow):
                 pass
             self._log.append_log(f"另存为: {path}", "SUCCESS")
             self._update_title()
+            self._refresh_assets()
         else:
             QMessageBox.warning(self, "保存失败", "写入文件失败。")
 
-    def _on_delete_blueprint(self):
-        """从磁盘上删除当前蓝图文件（真删，不可恢复）。"""
-        if self._graph is None:
-            QMessageBox.information(self, "提示", "当前没有蓝图可删除。")
+    # ==================== 蓝图 / 组件 创建（统一流程） ====================
+    def _components_dir(self) -> str:
+        """当前工程的 components/ 目录绝对路径（不存在则创建）。"""
+        root = (self._pm.project_root if (self._pm and self._pm.is_open()) else "") or ""
+        comp_dir = os.path.join(root, "components")
+        os.makedirs(comp_dir, exist_ok=True)
+        return comp_dir
+
+    @staticmethod
+    def _sanitize_stem(raw: str) -> str:
+        """清洗用户输入的文件名主干：去空白、去 .bp.json 后缀、替换 Windows 非法字符。"""
+        s = (raw or "").strip()
+        if s.lower().endswith(BlueprintStore.EXT.lower()):
+            s = s[: -len(BlueprintStore.EXT)]
+        invalid = '<>:"/\\|?*'
+        return "".join("_" if ch in invalid else ch for ch in s).strip()
+
+    def _ask_blueprint_stem(self, target_dir: str, *, title: str, prompt: str,
+                            default_stem: str) -> Optional[str]:
+        """循环询问文件名，返回最终 stem（用户取消返回 None）。
+        重名覆盖确认统一在这里处理，保证「新建蓝图/新建组件/另存为组件」三条路径行为一致。"""
+        while True:
+            user_stem, ok = QInputDialog.getText(self, title, prompt, text=default_stem)
+            if not ok:
+                return None
+            stem = self._sanitize_stem(user_stem)
+            if not stem:
+                QMessageBox.warning(self, "名称非法", "名称不能为空，且不能只包含特殊字符。")
+                continue
+            final_path = os.path.join(target_dir, stem + BlueprintStore.EXT)
+            if os.path.exists(final_path):
+                r = QMessageBox.question(
+                    self, "名称已存在",
+                    f"目标目录下已存在同名文件：\n{final_path}\n\n是否覆盖？（覆盖后原文件会进备份，不会永久丢失。）",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+                if r != QMessageBox.Yes:
+                    default_stem = stem
+                    continue
+            return stem
+
+    def _suggest_stem(self, target_dir: str, base: str) -> str:
+        """给出不重名的建议名：base / base 1 / base 2 ..."""
+        i = 0
+        while True:
+            stem = base if i == 0 else f"{base} {i}"
+            if not os.path.exists(os.path.join(target_dir, stem + BlueprintStore.EXT)):
+                return stem
+            i += 1
+
+    def _create_blueprint_at(self, target_dir: Optional[str], *, as_component: bool,
+                             use_current_graph: bool = False):
+        """统一创建入口（新建蓝图 / 新建组件 / 另存为组件 共用）：
+          - as_component=False          新建空白蓝图
+          - as_component=True           新建空白组件（落到 components/）
+          - use_current_graph=True      把当前蓝图另存一份到目标目录（一键转组件）
+        """
+        if not target_dir:
             return
-        if not self._current_path:
-            QMessageBox.warning(
-                self, "无法删除",
-                "当前蓝图是尚未保存过的空白蓝图，不需要删除，直接点「工程 ▾ → 新建蓝图」换新即可。"
+        if not self._ensure_project_open("新建组件" if as_component else "新建蓝图"):
+            return
+        if not use_current_graph and not self._confirm_discard():
+            return
+        os.makedirs(target_dir, exist_ok=True)
+        kind_cn = "组件" if as_component else "蓝图"
+        if use_current_graph:
+            if self._graph is None:
+                return
+            # 正在子画布编辑 → 先回写宿主，保证存下来的是完整父图
+            if self._subgraph_stack:
+                self._flush_subgraph_to_host()
+                parent_graph = self._subgraph_stack[0].get("parent_graph")
+                if parent_graph is not None:
+                    self._graph = parent_graph
+            default_stem = getattr(self._graph, "name", None) or f"新{kind_cn}"
+        else:
+            default_stem = self._suggest_stem(target_dir, f"新{kind_cn}")
+        stem = self._ask_blueprint_stem(
+            target_dir,
+            title=(f"另存为{kind_cn}" if use_current_graph else f"新建{kind_cn}"),
+            prompt=f"请输入{kind_cn}名称（保存到 {target_dir}，无需写后缀）：",
+            default_stem=default_stem,
+        )
+        if stem is None:
+            return
+        final_path = os.path.join(target_dir, stem + BlueprintStore.EXT)
+        if use_current_graph:
+            self._graph.name = stem      # 文件名同步为蓝图名，重开标题栏显示正确
+            g = self._graph
+            need_bind = False
+        else:
+            g = BlueprintStore.new_graph(stem)
+            g.name = stem
+            need_bind = True
+        ok = BlueprintStore.save(g, final_path)
+        if not ok:
+            QMessageBox.warning(self, f"创建{kind_cn}失败", f"无法写入文件，请检查目录权限：\n{final_path}")
+            if need_bind:                # 落盘失败也把空白图绑到画布，用户不至于白等
+                self._current_path = None
+                self._last_saved_graph_hash = None
+                self._bind_new_graph(g, zoom_fit=False)
+                self._update_title()
+            return
+        self._current_path = final_path
+        if need_bind:
+            self._bind_new_graph(g, zoom_fit=False)
+        self._mark_graph_clean(g)
+        try:
+            self._pm.set_last_opened_blueprint(final_path)
+        except Exception:
+            pass
+        verb = "已另存为" if use_current_graph else "已创建"
+        suffix = "（Component 节点下拉列表可直接选用）" if as_component else ""
+        self._log.append_log(f"✅ {verb}{kind_cn}：{final_path}{suffix}", "SUCCESS")
+        self._update_title()
+        self._refresh_assets()
+
+    def _on_new(self):
+        """新建空白蓝图（落在工程根目录）。"""
+        if not self._ensure_project_open("新建蓝图"):
+            return
+        self._create_blueprint_at(self._pm.project_root, as_component=False)
+
+    def _on_save_as_component(self):
+        """把当前打开的蓝图另存一份到 components/，现有蓝图一键转组件。"""
+        if not self._ensure_project_open("另存为组件"):
+            return
+        self._create_blueprint_at(self._components_dir(), as_component=True, use_current_graph=True)
+
+    # ==================== 🗂 资源面板回调（面板只发意图，写文件在这里） ====================
+    def _refresh_assets(self):
+        """刷新资源树 + 当前蓝图高亮（新建/保存/删除/切工程后调用）。"""
+        try:
+            if getattr(self, "_assets", None) is None:
+                return
+            self._assets.set_project(
+                self._pm.project_root if (self._pm and self._pm.is_open()) else None,
+                self._pm.project_name if self._pm else "",
+            )
+            self._assets.set_current_path(self._current_path)
+        except Exception as e:
+            try:
+                self._log.append_log(f"[Assets] 刷新资源树失败: {e}", "WARN")
+            except Exception:
+                pass
+
+    def _on_asset_open_blueprint(self, path: str):
+        """资源面板双击/右键「打开蓝图」。"""
+        if not path or not os.path.isfile(path):
+            QMessageBox.warning(self, "打开失败", f"文件不存在（可能已被外部删除）：\n{path}")
+            self._refresh_assets()
+            return
+        if self._current_path:
+            try:
+                if os.path.normcase(os.path.abspath(path)) == os.path.normcase(os.path.abspath(self._current_path)):
+                    self._log.append_log(f"该蓝图已是当前蓝图：{os.path.basename(path)}", "INFO")
+                    return
+            except Exception:
+                pass
+        if not self._confirm_discard():
+            return
+        self._open_blueprint_path(path)
+        self._refresh_assets()
+
+    def _on_asset_new(self, kind: str, target_dir: str):
+        """资源面板「新建蓝图/组件/文件夹」。"""
+        if kind == "folder":
+            self._on_asset_new_folder(target_dir)
+            return
+        if not self._ensure_project_open("新建资源"):
+            return
+        as_component = (kind == "component")
+        if as_component and os.path.normcase(os.path.abspath(target_dir)) == os.path.normcase(os.path.abspath(self._pm.project_root)):
+            target_dir = self._components_dir()   # 从根节点发起的「新建组件」也落到 components/
+        self._create_blueprint_at(target_dir, as_component=as_component)
+
+    def _on_asset_new_folder(self, parent_dir: str):
+        if not self._ensure_project_open("新建文件夹"):
+            return
+        if not parent_dir or not os.path.isdir(parent_dir):
+            QMessageBox.warning(self, "无法创建", "目标目录不存在，请先刷新资源树。")
+            return
+        name, ok = QInputDialog.getText(self, "新建文件夹", "文件夹名称：", text="新建文件夹")
+        if not ok:
+            return
+        name = self._sanitize_stem(name)   # 复用清洗逻辑（去掉路径非法字符）
+        if not name:
+            QMessageBox.warning(self, "名称非法", "文件夹名称不能为空。")
+            return
+        new_dir = os.path.join(parent_dir, name)
+        if os.path.exists(new_dir):
+            QMessageBox.warning(self, "已存在", f"同名文件/文件夹已存在：\n{new_dir}")
+            return
+        try:
+            os.makedirs(new_dir, exist_ok=False)
+        except Exception as e:
+            QMessageBox.critical(self, "创建失败", f"无法创建文件夹：\n{e}")
+            return
+        self._log.append_log(f"📁 已创建文件夹：{new_dir}", "SUCCESS")
+        self._refresh_assets()
+
+    def _on_asset_rename(self, path: str):
+        """重命名文件/目录；若被其它蓝图以组件形式引用，同步更新引用路径。"""
+        if not path or not os.path.exists(path):
+            self._refresh_assets()
+            return
+        is_dir = os.path.isdir(path)
+        old_name = os.path.basename(path)
+        default_name = old_name
+        if (not is_dir) and old_name.lower().endswith(BlueprintStore.EXT.lower()):
+            default_name = old_name[: -len(BlueprintStore.EXT)]
+        new_name, ok = QInputDialog.getText(
+            self, "重命名", f"新名称（{'文件夹' if is_dir else '文件'}）：", text=default_name
+        )
+        if not ok:
+            return
+        new_name = self._sanitize_stem(new_name)
+        if not new_name:
+            QMessageBox.warning(self, "名称非法", "名称不能为空。")
+            return
+        if (not is_dir) and (not new_name.lower().endswith(BlueprintStore.EXT.lower())):
+            new_name = new_name + BlueprintStore.EXT
+        if new_name == old_name:
+            return
+        new_path = os.path.join(os.path.dirname(path), new_name)
+        if os.path.exists(new_path):
+            QMessageBox.warning(self, "已存在", f"同名文件/文件夹已存在：\n{new_path}")
+            return
+        try:
+            os.rename(path, new_path)
+        except Exception as e:
+            QMessageBox.critical(self, "重命名失败", f"无法重命名：\n{e}")
+            return
+        self._log.append_log(f"✏ 已重命名：{old_name} → {new_name}", "SUCCESS")
+        # 当前编辑的正是被重命名的文件/其子文件 → 同步 _current_path，避免后续保存写回旧路径
+        self._retarget_current_path_after_move(path, new_path, is_dir)
+        # 同步更新其它蓝图里对旧路径的组件引用
+        if old_name.lower().endswith(BlueprintStore.EXT.lower()) or is_dir:
+            self._fix_component_refs_after_rename(path, new_path, is_dir)
+        self._refresh_assets()
+
+    def _retarget_current_path_after_move(self, old_path: str, new_path: str, is_dir: bool):
+        """移动/重命名后，若当前蓝图路径受影响则同步更新。"""
+        cur = self._current_path
+        if not cur:
+            return
+        try:
+            cur_abs = os.path.abspath(cur)
+            old_abs = os.path.abspath(old_path)
+            new_abs = os.path.abspath(new_path)
+        except Exception:
+            return
+        changed = False
+        if os.path.normcase(cur_abs) == os.path.normcase(old_abs):
+            self._current_path = new_path
+            changed = True
+        elif is_dir:
+            try:
+                prefix = os.path.normcase(old_abs) + os.sep
+                if os.path.normcase(cur_abs).startswith(prefix):
+                    rel = os.path.relpath(cur_abs, old_abs)
+                    self._current_path = os.path.join(new_abs, rel)
+                    changed = True
+            except Exception:
+                pass
+        if changed:
+            try:
+                self._pm.set_last_opened_blueprint(self._current_path)
+            except Exception:
+                pass
+            try:
+                self._graph.name = os.path.splitext(os.path.basename(self._current_path))[0].replace(".bp", "")
+            except Exception:
+                pass
+            self._update_title()
+            self._log.append_log(f"[Assets] 当前蓝图路径已同步为：{self._current_path}", "INFO")
+
+    def _fix_component_refs_after_rename(self, old_path: str, new_path: str, is_dir: bool):
+        """扫描工程内所有蓝图，把 Component 节点里指向旧路径的引用改写为新路径。
+
+        组件引用存的是「相对工程根」的路径（如 components/登录.bp.json），
+        重命名组件后若不改引用，所有调用处都会静默变成空操作 —— 这里一次性修好。
+        """
+        root = self._pm.project_root if (self._pm and self._pm.is_open()) else None
+        if not root:
+            return
+        try:
+            old_rel = os.path.relpath(os.path.abspath(old_path), os.path.abspath(root)).replace("\\", "/")
+            new_rel = os.path.relpath(os.path.abspath(new_path), os.path.abspath(root)).replace("\\", "/")
+        except Exception:
+            return
+        patched_files = 0
+        patched_nodes = 0
+        # 收集受影响的蓝图文件（含子目录，跳过隐藏/运行产物目录）
+        targets = []
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if not d.startswith(".") and d.lower() not in
+                           ("cache", "debug", "log", "logs", "__pycache__", "dist", "build")]
+            for fn in filenames:
+                if fn.lower().endswith(".bp.json") and ".backup_" not in fn:
+                    targets.append(os.path.join(dirpath, fn))
+        for bp_path in targets:
+            try:
+                bp_path_abs = os.path.abspath(bp_path)
+                if os.path.normcase(bp_path_abs) == os.path.normcase(os.path.abspath(new_path)):
+                    continue          # 自己不用改
+                g = BlueprintStore.load(bp_path)
+                if g is None:
+                    continue
+                hits = self._rewrite_component_refs_in_graph(g, old_rel, new_rel, is_dir)
+                hits += self._rewrite_component_refs_in_subgraphs(g, old_rel, new_rel, is_dir)
+                if hits:
+                    BlueprintStore.save(g, bp_path)
+                    patched_files += 1
+                    patched_nodes += hits
+            except Exception as e:
+                try:
+                    self._log.append_log(f"[Assets] 修正组件引用失败 {os.path.basename(bp_path)}: {e}", "WARN")
+                except Exception:
+                    pass
+        if patched_nodes:
+            self._log.append_log(
+                f"🔗 已在 {patched_files} 个蓝图里同步 {patched_nodes} 处组件引用：{old_rel} → {new_rel}",
+                "SUCCESS",
+            )
+            # 当前打开的蓝图若是被改写的文件之一，需要重新加载以反映新引用
+            try:
+                cur = self._current_path
+                if cur and os.path.isfile(cur):
+                    g2 = BlueprintStore.load(cur)
+                    if g2 is not None:
+                        self._bind_new_graph(g2, zoom_fit=False)
+                        self._mark_graph_clean(g2)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _rewrite_component_refs_in_graph(graph, old_rel: str, new_rel: str, is_dir: bool,
+                                        count_only: bool = False) -> int:
+        """改写一张蓝图里的 Component 节点引用。返回改写处数。
+
+        注意：节点参数存在 node.params（序列化时可能落在 data 键，由 Node.from_dict 统一读入），
+        组件路径参数名为 blueprint_path，存的是相对工程根路径。
+        """
+        hits = 0
+        try:
+            nodes = getattr(graph, "nodes", {}) or {}
+            for node in nodes.values():
+                if getattr(node, "type", "") != "Component":
+                    continue
+                p = getattr(node, "params", None)
+                if not isinstance(p, dict):
+                    continue
+                ref = p.get("blueprint_path")
+                if not isinstance(ref, str) or not ref:
+                    continue
+                ref_norm = ref.replace("\\", "/").lstrip("./")
+                if ref_norm == old_rel:
+                    if not count_only:
+                        p["blueprint_path"] = new_rel
+                    hits += 1
+                elif is_dir and ref_norm.startswith(old_rel.rstrip("/") + "/"):
+                    if not count_only:
+                        p["blueprint_path"] = new_rel.rstrip("/") + "/" + ref_norm[len(old_rel.rstrip("/")) + 1:]
+                    hits += 1
+        except Exception:
+            pass
+        return hits
+
+    @classmethod
+    def _rewrite_component_refs_in_subgraphs(cls, graph, old_rel: str, new_rel: str, is_dir: bool,
+                                             count_only: bool = False) -> int:
+        """递归改写子画布（loop_body / seq_body / par_body）里的 Component 引用。"""
+        hits = 0
+        try:
+            nodes = getattr(graph, "nodes", {}) or {}
+            for node in nodes.values():
+                p = getattr(node, "params", None)
+                if not isinstance(p, dict):
+                    continue
+                for body_key in ("loop_body", "seq_body", "par_body"):
+                    body = p.get(body_key)
+                    if not (isinstance(body, dict) and isinstance(body.get("nodes"), dict)):
+                        continue
+                    sub_nodes = body.get("nodes") or {}
+                    for sn in sub_nodes.values():
+                        if not isinstance(sn, dict):
+                            continue
+                        if str(sn.get("type", "")).lower() != "component":
+                            continue
+                        sp = sn.get("data") if isinstance(sn.get("data"), dict) else sn.get("params")
+                        if not isinstance(sp, dict):
+                            continue
+                        ref = sp.get("blueprint_path")
+                        if not isinstance(ref, str) or not ref:
+                            continue
+                        ref_norm = ref.replace("\\", "/").lstrip("./")
+                        if ref_norm == old_rel:
+                            if not count_only:
+                                sp["blueprint_path"] = new_rel
+                            hits += 1
+                        elif is_dir and ref_norm.startswith(old_rel.rstrip("/") + "/"):
+                            if not count_only:
+                                sp["blueprint_path"] = new_rel.rstrip("/") + "/" + ref_norm[len(old_rel.rstrip("/")) + 1:]
+                            hits += 1
+        except Exception:
+            pass
+        return hits
+
+    def _count_component_refs(self, old_path: str) -> int:
+        """统计工程内其它蓝图对本文件（组件）的引用处数。"""
+        root = self._pm.project_root if (self._pm and self._pm.is_open()) else None
+        if not root:
+            return 0
+        try:
+            old_rel = os.path.relpath(os.path.abspath(old_path), os.path.abspath(root)).replace("\\", "/")
+        except Exception:
+            return 0
+        total = 0
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if not d.startswith(".") and d.lower() not in
+                           ("cache", "debug", "log", "logs", "__pycache__", "dist", "build")]
+            for fn in filenames:
+                if not fn.lower().endswith(".bp.json") or ".backup_" in fn:
+                    continue
+                bp = os.path.join(dirpath, fn)
+                try:
+                    if os.path.normcase(os.path.abspath(bp)) == os.path.normcase(os.path.abspath(old_path)):
+                        continue
+                    g = BlueprintStore.load(bp)
+                    if g is None:
+                        continue
+                    total += self._rewrite_component_refs_in_graph(g, old_rel, "", False, count_only=True)
+                    total += self._rewrite_component_refs_in_subgraphs(g, old_rel, "", False, count_only=True)
+                except Exception as e:
+                    try:
+                        self._log.append_log(f"[Assets] 统计引用失败 {fn}: {e}", "WARN")
+                    except Exception:
+                        pass
+        return total
+
+    # ============================================================
+    # 组件：引用收集 / 反向依赖 / 端口自动对齐 / 循环引用检测
+    # ============================================================
+    def _proj_root(self) -> Optional[str]:
+        """当前工程根目录（未打开工程返回 None）。"""
+        try:
+            if self._pm and self._pm.is_open():
+                return self._pm.project_root
+        except Exception:
+            pass
+        return None
+
+    def _iter_project_blueprints(self):
+        """遍历工程内所有蓝图文件（跳过隐藏目录、运行产物与备份文件）。"""
+        root = self._proj_root()
+        if not root:
+            return
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if not d.startswith(".") and d.lower() not in
+                           ("cache", "debug", "log", "logs", "__pycache__", "dist", "build")]
+            for fn in filenames:
+                if fn.lower().endswith(".bp.json") and ".backup_" not in fn:
+                    yield os.path.join(dirpath, fn)
+
+    @staticmethod
+    def _norm_rel(rel: str) -> str:
+        """组件引用路径归一化：统一斜杠、去掉开头的 ./ 与空白。"""
+        return (rel or "").replace("\\", "/").lstrip("./").strip()
+
+    @classmethod
+    def _collect_refs_in_graph(cls, graph, target_rel: str, bp_path: str) -> List[dict]:
+        """收集一张蓝图主画布组件的引用位置。"""
+        out: List[dict] = []
+        tr = cls._norm_rel(target_rel)
+        for node in (getattr(graph, "nodes", {}) or {}).values():
+            if getattr(node, "type", "") != "Component":
+                continue
+            ref = (getattr(node, "params", None) or {}).get("blueprint_path")
+            if isinstance(ref, str) and cls._norm_rel(ref) == tr:
+                out.append({"bp": bp_path, "node_id": str(getattr(node, "id", "")), "where": "主画布"})
+        return out
+
+    @classmethod
+    def _collect_refs_in_subgraphs(cls, graph, target_rel: str, bp_path: str) -> List[dict]:
+        """收集一张蓝图各子画布（循环体/顺序体/并行体）内的组件引用位置。"""
+        out: List[dict] = []
+        tr = cls._norm_rel(target_rel)
+        for node in (getattr(graph, "nodes", {}) or {}).values():
+            p = getattr(node, "params", None)
+            if not isinstance(p, dict):
+                continue
+            for body_key, label in (("loop_body", "循环体"), ("seq_body", "顺序体"), ("par_body", "并行体")):
+                body = p.get(body_key)
+                if not (isinstance(body, dict) and isinstance(body.get("nodes"), dict)):
+                    continue
+                for sn in (body.get("nodes") or {}).values():
+                    if not isinstance(sn, dict):
+                        continue
+                    if str(sn.get("type", "")).lower() != "component":
+                        continue
+                    sp = sn.get("data") if isinstance(sn.get("data"), dict) else sn.get("params")
+                    if not isinstance(sp, dict):
+                        continue
+                    ref = sp.get("blueprint_path")
+                    if isinstance(ref, str) and cls._norm_rel(ref) == tr:
+                        out.append({
+                            "bp": bp_path,
+                            "node_id": str(sn.get("id", "")),
+                            "where": f"{label}（宿主节点 {getattr(node, 'id', '')}）",
+                        })
+        return out
+
+    def _collect_component_refs(self, target_path: str) -> List[dict]:
+        """扫描整个工程，找出所有引用了 target_path（组件蓝图）的位置。"""
+        root = self._proj_root()
+        if not root:
+            return []
+        try:
+            target_rel = os.path.relpath(os.path.abspath(target_path), os.path.abspath(root))
+        except Exception:
+            return []
+        results: List[dict] = []
+        for bp in self._iter_project_blueprints():
+            try:
+                if os.path.normcase(os.path.abspath(bp)) == os.path.normcase(os.path.abspath(target_path)):
+                    continue
+                g = BlueprintStore.load(bp)
+                if g is None:
+                    continue
+                results += self._collect_refs_in_graph(g, target_rel, bp)
+                results += self._collect_refs_in_subgraphs(g, target_rel, bp)
+            except Exception:
+                continue
+        return results
+
+    def _on_asset_reverse_deps(self, path: str):
+        """🔗 谁引用了它：列出所有引用该组件的蓝图/节点，双击跳转。"""
+        if not self._ensure_project_open("查看组件引用"):
+            return
+        name = os.path.basename(path)
+        refs = self._collect_component_refs(path)
+        root = self._proj_root() or ""
+        if not refs:
+            QMessageBox.information(
+                self, "谁引用了它",
+                f"当前工程里没有任何「调用组件」节点引用 {name}。\n\n"
+                "（可以放心删除或改名，不会影响其它蓝图。）",
             )
             return
-        path = self._current_path
-        disp = path
-        if not os.path.isfile(path):
-            ret = QMessageBox.question(
-                self, "文件不存在",
-                f"记录的蓝图路径不存在（可能已手动被外部删除：\n{disp}\n\n是否清空当前编辑内容并置为空白蓝图？",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
-            )
-            if ret == QMessageBox.Yes:
-                self._new_graph()
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"🔗 谁引用了 {name}")
+        dlg.resize(620, 380)
+        lay = QVBoxLayout(dlg)
+        head = QLabel(f"共 {len(refs)} 处引用（双击条目可跳转到对应蓝图）：")
+        head.setStyleSheet("color:#C9D1D9; font-size:11px;")
+        lay.addWidget(head)
+        lst = QListWidget()
+        lst.setStyleSheet(
+            "QListWidget { background:#0D1117; color:#C9D1D9; border:1px solid #30363D; font-size:11px; }"
+            "QListWidget::item { padding:4px 6px; }"
+            "QListWidget::item:selected { background:#1F6FEB; color:#FFFFFF; }"
+        )
+        for r in refs:
+            try:
+                shown = os.path.relpath(r["bp"], root) if root else r["bp"]
+            except Exception:
+                shown = r["bp"]
+            it = QListWidgetItem(f"🗺 {shown}   ·   {r['where']}   ·   节点 {r['node_id']}")
+            it.setData(Qt.UserRole, r["bp"])
+            lst.addItem(it)
+        lay.addWidget(lst, 1)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        btn_close = QPushButton("关闭")
+        btn_close.clicked.connect(dlg.reject)
+        row.addWidget(btn_close)
+        lay.addLayout(row)
+        picked = {"bp": ""}
+
+        def _open_item(item):
+            picked["bp"] = str(item.data(Qt.UserRole) or "")
+            dlg.accept()
+
+        lst.itemDoubleClicked.connect(_open_item)
+        dlg.exec()
+        if picked["bp"] and os.path.isfile(picked["bp"]):
+            if self._confirm_discard():
+                self._open_blueprint_path(picked["bp"])
+                self._log.append_log(f"[Component] 已跳转到引用方：{os.path.basename(picked['bp'])}", "SUCCESS")
+
+    # ---------------- 端口数自动对齐 ----------------
+    @staticmethod
+    def _component_port_counts(sub_graph) -> tuple:
+        """读子蓝图定义，返回 (入参端口数, 返回值端口数)；某一端不存在返回 None。"""
+        n_in = None
+        n_out = None
+        try:
+            for node in (getattr(sub_graph, "nodes", {}) or {}).values():
+                t = getattr(node, "type", "")
+                p = getattr(node, "params", None) or {}
+                if t == "Start" and n_in is None:
+                    try:
+                        n_in = max(0, min(20, int(p.get("num_params", 0) or 0)))
+                    except Exception:
+                        n_in = 0
+                elif t == "End" and n_out is None:
+                    try:
+                        n_out = max(0, min(20, int(p.get("num_returns", 0) or 0)))
+                    except Exception:
+                        n_out = 0
+        except Exception:
+            pass
+        return n_in, n_out
+
+    def _on_component_chosen(self, node_id: str, rel_path: str):
+        """选完组件蓝图后：① 自动对齐输入/输出端口数 ② 循环引用检测。"""
+        if self._graph is None or node_id not in self._graph.nodes:
             return
-        base = os.path.basename(path)
+        rel_path = (rel_path or "").strip()
+        if not rel_path:
+            return
+        root = self._proj_root()
+        if not root:
+            return
+        abs_path = os.path.normpath(os.path.join(root, rel_path))
+        if not os.path.isfile(abs_path):
+            self._log.append_log(f"⚠ 组件文件不存在，无法对齐端口：{rel_path}", "WARN")
+            return
+        node = self._graph.nodes[node_id]
+
+        # ---- ① 端口数自动对齐 ----
+        try:
+            sub = BlueprintStore.load(abs_path)
+            if sub is not None:
+                n_in, n_out = self._component_port_counts(sub)
+                changed = []
+                cur_in = int(node.params.get("num_inputs", 0) or 0)
+                cur_out = int(node.params.get("num_outputs", 0) or 0)
+                if n_in is not None and n_in != cur_in:
+                    self._on_param_changed(node_id, "num_inputs", n_in)
+                    changed.append(f"输入 {cur_in}→{n_in}")
+                if n_out is not None and n_out != cur_out:
+                    self._on_param_changed(node_id, "num_outputs", n_out)
+                    changed.append(f"输出 {cur_out}→{n_out}")
+                if changed:
+                    self._log.append_log(
+                        f"🔧 已按组件定义自动对齐端口数（{os.path.basename(rel_path)}）：{'、'.join(changed)}",
+                        "SUCCESS",
+                    )
+                elif n_in is None and n_out is None:
+                    self._log.append_log(
+                        f"提示：组件 {os.path.basename(rel_path)} 里没有 Start/End 节点，端口数保持不变。",
+                        "INFO",
+                    )
+        except Exception as e:
+            self._log.append_log(f"[Component] 端口对齐失败：{e}", "WARN")
+
+        # ---- ② 循环引用检测 ----
+        try:
+            cycle = self._find_component_cycle(rel_path)
+            if cycle:
+                chain = " → ".join(cycle)
+                self._log.append_log(f"⛔ 检测到组件循环引用：{chain}", "ERROR")
+                QMessageBox.warning(
+                    self, "组件循环引用",
+                    "检测到循环引用，运行时会无限递归、必须修掉：\n\n"
+                    f"  {chain}\n\n"
+                    "说明：链路上的蓝图互相「调用组件」绕回了自己。请断开其中一环。",
+                )
+        except Exception:
+            pass
+
+    def _find_component_cycle(self, start_rel: str, max_depth: int = 12) -> Optional[List[str]]:
+        """从 start_rel（组件相对路径）出发，检测是否绕回当前正在编辑的蓝图。
+
+        返回循环链路（如 ['components/A.bp.json', 'components/B.bp.json', 'main.bp.json']）；
+        无循环返回 None。
+        """
+        root = self._proj_root()
+        cur = self._current_path
+        if not root or not cur:
+            return None
+        try:
+            cur_rel = self._norm_rel(os.path.relpath(os.path.abspath(cur), os.path.abspath(root)))
+        except Exception:
+            return None
+
+        def _refs_of(rel: str) -> List[str]:
+            abs_p = os.path.normpath(os.path.join(root, rel))
+            if not os.path.isfile(abs_p):
+                return []
+            g = BlueprintStore.load(abs_p)
+            if g is None:
+                return []
+            refs: List[str] = []
+            for node in (getattr(g, "nodes", {}) or {}).values():
+                if getattr(node, "type", "") == "Component":
+                    r = (getattr(node, "params", None) or {}).get("blueprint_path")
+                    if isinstance(r, str) and r.strip():
+                        refs.append(self._norm_rel(r))
+                p = getattr(node, "params", None)
+                if isinstance(p, dict):
+                    for k in ("loop_body", "seq_body", "par_body"):
+                        body = p.get(k)
+                        if not (isinstance(body, dict) and isinstance(body.get("nodes"), dict)):
+                            continue
+                        for sn in (body.get("nodes") or {}).values():
+                            if not isinstance(sn, dict) or str(sn.get("type", "")).lower() != "component":
+                                continue
+                            sp = sn.get("data") if isinstance(sn.get("data"), dict) else sn.get("params")
+                            if isinstance(sp, dict):
+                                r = sp.get("blueprint_path")
+                                if isinstance(r, str) and r.strip():
+                                    refs.append(self._norm_rel(r))
+            return refs
+
+        start = self._norm_rel(start_rel)
+        if start == cur_rel:
+            return [start, cur_rel]
+
+        def _dfs(rel: str, chain: List[str]):
+            if len(chain) > max_depth:
+                return None
+            for nxt in _refs_of(rel):
+                if nxt == cur_rel:
+                    return chain + [nxt]
+                if nxt in chain:
+                    continue          # 链上已有的环（与当前蓝图无关）不重复展开
+                got = _dfs(nxt, chain + [nxt])
+                if got:
+                    return got
+            return None
+
+        return _dfs(start, [start])
+
+    # ---------------- 资源面板拖蓝图到画布 ----------------
+    def _on_asset_dropped(self, abs_path: str, scene_pos):
+        """把资源面板里的蓝图拖到画布：命中「调用组件」节点则填引用，否则新建一个组件节点。"""
+        if self._graph is None or self._scene is None:
+            return
+        if not isinstance(abs_path, str) or not os.path.isfile(abs_path):
+            return
+        if not abs_path.lower().endswith(".bp.json"):
+            self._log.append_log("只有蓝图（.bp.json）可以拖到画布上。", "WARN")
+            return
+        root = self._proj_root()
+        if not root:
+            self._log.append_log("请先打开工程，再拖蓝图到画布。", "WARN")
+            return
+        # 若拖到的是当前正在编辑的蓝图本身 → 直接阻止（会自我递归）
+        try:
+            if os.path.normcase(os.path.abspath(abs_path)) == os.path.normcase(os.path.abspath(self._current_path or "")):
+                QMessageBox.information(self, "不能这么拖", "不能把蓝图拖到它自己身上（会变成自我递归调用）。")
+                return
+        except Exception:
+            pass
+        rel = self._norm_rel(os.path.relpath(abs_path, root))
+
+        # 命中已有「调用组件」节点？（拖到节点上 = 给它填引用）
+        target = None
+        try:
+            for nid, ni in self._scene._node_items.items():
+                nd = self._graph.nodes.get(nid)
+                if nd is not None and nd.type == "Component" and ni.sceneBoundingRect().contains(scene_pos):
+                    target = nd
+                    break
+        except Exception:
+            target = None
+
+        if target is not None:
+            self._on_param_changed(target.id, "blueprint_path", rel)
+            self._on_component_chosen(target.id, rel)
+            self._scene.select_node_id(target.id)
+            self._log.append_log(f"🧩 已把 {os.path.basename(abs_path)} 填入选中的组件节点", "SUCCESS")
+            return
+
+        node = self._scene.add_node_by_type("Component", scene_pos)
+        if node is None:
+            return
+        self._on_param_changed(node.id, "blueprint_path", rel)
+        self._on_component_chosen(node.id, rel)
+        self._scene.select_node_id(node.id)
+        self._log.append_log(f"🧩 已从资源面板创建「调用组件」节点 → {os.path.basename(abs_path)}", "SUCCESS")
+
+    # ---------------- 日志 ↔ 画布节点 定位 ----------------
+    def _on_log_line_activated(self, node_id: str, line_text: str):
+        """双击日志行 → 定位到画布上对应的节点。"""
+        nid = (node_id or "").strip()
+        if not nid and line_text:
+            import re as _re
+            m = _re.search(r"(?:节点|node)[\s:：=]*([A-Za-z0-9_\-]+)", line_text)
+            if m:
+                nid = m.group(1)
+        if not nid:
+            self._log.append_log("这一行日志没有关联的节点信息（只有运行日志才会带节点定位）。", "INFO")
+            return
+        self._locate_node_in_canvas(nid)
+
+    def _locate_node_in_canvas(self, node_id: str):
+        """把画布跳到并选中指定节点（复用搜索栏的定位能力）。"""
+        if self._graph is None or node_id not in self._graph.nodes:
+            self._log.append_log(f"节点 {node_id} 不在当前蓝图（可能在别的蓝图/子画布里）。", "WARN")
+            return
+        ok = False
+        try:
+            if self._view is not None:
+                ok = self._view.jump_to_node_by_id(node_id, flash_ms=2600)
+        except Exception:
+            ok = False
+        if not ok:
+            try:
+                self._scene.select_node_id(node_id)
+            except Exception:
+                pass
+        ntype = self._graph.nodes[node_id].type
+        self._log.append_log(f"📍 已定位到节点 {ntype} id={node_id[:8]}", "INFO")
+
+    def _on_node_find_in_log(self, node_id: str):
+        """节点右键「在日志中查找」→ 把日志滚动到该节点最近的一条。"""
+        ok = False
+        try:
+            ok = self._log.highlight_node(node_id)
+        except Exception:
+            ok = False
+        if ok:
+            self._log.append_log(f"🔍 日志已定位到节点 {node_id[:8]} 的记录", "INFO")
+        else:
+            self._log.append_log(f"日志里还没有节点 {node_id[:8]} 的记录（先运行一次蓝图试试）。", "INFO")
+
+    def _on_asset_delete(self, paths):
+        """资源面板删除（走回收站，尽量可恢复）。"""
+        if not self._ensure_project_open("删除资源"):
+            return
+        if isinstance(paths, str):
+            paths = [paths]
+        targets = [p for p in (paths or []) if p and os.path.exists(p)]
+        if not targets:
+            self._refresh_assets()
+            return
+        display = "\n".join("  · " + p for p in targets[:10])
+        more = f"\n  …… 共 {len(targets)} 项" if len(targets) > 10 else ""
+        # 被组件引用的文件先提示引用数量，避免「删了组件，一堆蓝图静默失效」
+        ref_total = 0
+        for p in targets:
+            if os.path.isfile(p) and p.lower().endswith(BlueprintStore.EXT.lower()):
+                ref_total += self._count_component_refs(p)
+        ref_warn = f"\n\n⚠ 检测到 {ref_total} 处组件引用指向它，删除后这些调用会变成空操作。" if ref_total else ""
         ret = QMessageBox.warning(
-            self, "⚠ 删除蓝图（不可恢复）",
-            f"确定要从磁盘上永久删除这个蓝图文件吗？\n\n  · {disp}\n\n⚠此操作不可恢复！\n（当前蓝图中的节点/连线将一起被删掉，且不会进回收站。）",
+            self, "⚠ 删除资源",
+            f"确定要删除以下内容吗？（会移入回收站）\n\n{display}{more}{ref_warn}",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
         )
         if ret != QMessageBox.Yes:
             return
+        deleted, failed = [], []
+        for p in targets:
+            err = self._trash_one(p)
+            (failed.append((p, err)) if err else deleted.append(p))
+        if deleted:
+            self._log.append_log(f"🗑 已删除 {len(deleted)} 项：{', '.join(os.path.basename(d) for d in deleted[:5])}", "WARN")
+        if failed:
+            QMessageBox.critical(self, "部分删除失败", "\n".join(f"{p}\n  → {e}" for p, e in failed[:5]))
+        # 当前蓝图被删 → 清成空白蓝图，避免继续往已删文件里写
         try:
-            import send2trash  # type: ignore
-            has_trash = True
-        except Exception:
-            has_trash = False
-        ok = False
-        err = ""
-        if has_trash:
-            try:
-                send2trash.send2trash(path)
-                ok = True
-            except Exception as e:
-                err = f"移动到回收站失败：{e}；改为彻底删除？"
-        if not ok:
-            if err:
-                r2 = QMessageBox.question(
-                    self, "回收站不可用", err + "\n\n是否仍要彻底删除？",
-                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
-                )
-                if r2 != QMessageBox.Yes:
-                    return
-            try:
-                os.remove(path)
-                ok = True
-            except Exception as e:
-                ok = False
-                err = str(e)
-        if not ok:
-            QMessageBox.critical(self, "删除失败", f"删除蓝图文件失败：\n{err}")
-            return
-        self._log.append_log(f"🗑 蓝图文件已从磁盘删除：{disp}", "WARN")
-        # 如果删的就是最近使用的蓝图，清空 last_opened 避免下次打开崩溃
-        try:
-            last_bp = self._pm.get_last_opened_blueprint()
-            if path and last_bp and os.path.abspath(path) == os.path.abspath(last_bp):
-                self._pm.set_last_opened_blueprint(None)
+            cur = self._current_path
+            if cur and any(os.path.normcase(os.path.abspath(cur)) == os.path.normcase(os.path.abspath(d)) for d in deleted):
+                self._log.append_log("[Assets] 当前蓝图已被删除，已切换为空白蓝图。", "WARN")
+                self._current_path = None
+                self._new_graph()
         except Exception:
             pass
-        # 清成空白蓝图
-        self._new_graph()
+        self._refresh_assets()
+
+    def _trash_one(self, path: str) -> str:
+        """删除单个文件/目录：优先回收站，失败回退彻底删除。返回空串=成功，否则返回错误信息。"""
+        try:
+            import send2trash  # type: ignore
+        except Exception:
+            send2trash = None
+        if send2trash is not None:
+            try:
+                send2trash.send2trash(path)
+                return ""
+            except Exception as e:
+                fallback_err = f"回收站失败：{e}"
+        else:
+            fallback_err = "未安装 send2trash"
+        try:
+            if os.path.isdir(path):
+                import shutil
+                shutil.rmtree(path)
+            else:
+                os.remove(path)
+            return ""
+        except Exception as e:
+            return f"{fallback_err}；彻底删除也失败：{e}"
+
+    def _on_asset_reveal(self, path: str):
+        """在系统资源管理器中定位文件/打开目录。"""
+        try:
+            if os.name == "nt":
+                if os.path.isdir(path):
+                    os.startfile(path)  # type: ignore[attr-defined]
+                else:
+                    import subprocess
+                    subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
+            else:
+                import subprocess
+                subprocess.Popen(["xdg-open", os.path.dirname(path) if os.path.isfile(path) else path])
+        except Exception as e:
+            self._log.append_log(f"[Assets] 打开资源管理器失败: {e}", "WARN")
 
     def _confirm_discard(self) -> bool:
         """切换/新建蓝图前确认是否丢弃当前修改。
@@ -2429,6 +3249,23 @@ class BlueprintMainWindow(QMainWindow):
             self._inspector.set_node(self._graph.nodes[node_id])
 
     # ==================== 运行/停止 ====================
+    def _on_runner_log(self, msg: str, level: str = "INFO"):
+        """运行时日志 → 日志面板。
+
+        顺带把「当前正在执行的节点 id」挂在日志行上，
+        这样在日志面板里**双击任意一行**即可把画布定位到对应节点（日志 ↔ 节点 双向定位）。
+        """
+        nid = ""
+        try:
+            if self._runner is not None:
+                nid = str(getattr(self._runner, "current_node_id", "") or "")
+        except Exception:
+            nid = ""
+        try:
+            self._log.append_log(msg, level, node_id=nid or None)
+        except TypeError:
+            self._log.append_log(msg, level)
+
     def _stop_and_detach_runner(self):
         """停止正在运行的 runner 并断开所有信号连接。
         统一清理逻辑，确保切换蓝图/工程时不会因旧 runner 信号触发已销毁的对象而崩溃。
@@ -2493,7 +3330,7 @@ class BlueprintMainWindow(QMainWindow):
         #   这样「编辑器内点▶运行」与「导出后的挂机 EXE」行为完全一致，
         #   避免出现「编辑器里能跑、导出后找不到图」的口径偏差。
         runner = BlueprintRunner(self._graph, self, initial_hwnd=None)
-        runner.log_message.connect(self._log.append_log, Qt.QueuedConnection)
+        runner.log_message.connect(self._on_runner_log, Qt.QueuedConnection)
         runner.highlight_node.connect(
             lambda nid, s=self._scene: s.set_running_node(nid), Qt.QueuedConnection,
         )
@@ -3183,6 +4020,11 @@ class BlueprintMainWindow(QMainWindow):
                 # 用户选了 Cancel 或保存后仍需保存（例如保存失败又取消丢弃）
                 event.ignore()
                 return
+        except Exception:
+            pass
+        # 2.5) 记录视图状态（下次打开同一张蓝图接着看）
+        try:
+            self._persist_view_state()
         except Exception:
             pass
         # 2) 释放全局热键钩子

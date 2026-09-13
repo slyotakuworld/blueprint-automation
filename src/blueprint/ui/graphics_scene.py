@@ -49,6 +49,9 @@ class NodeScene(QGraphicsScene):
     edge_will_remove = Signal(str, dict)  # edge_id, edge_snapshot
     nodes_dragged = Signal(list)  # list of (node_id, old_pos_tuple, new_pos_tuple)
     node_double_clicked = Signal(str)  # node_id，双击节点（进入子图/循环体子画布）
+    node_find_in_log = Signal(str)     # node_id，节点右键「在日志中查找」
+    node_open_component = Signal(str)  # node_id，节点右键「打开引用的组件」
+    asset_dropped = Signal(str, object)  # (蓝图绝对路径, 场景坐标 QPointF)，从资源面板拖入画布
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -171,6 +174,8 @@ class NodeScene(QGraphicsScene):
         ni.node_position_changed.connect(lambda nid, p, s=self: s._on_node_moved(nid))
         ni.node_selected_changed.connect(self._on_node_sel)
         ni.node_double_clicked.connect(self.node_double_clicked.emit)
+        ni.request_find_in_log.connect(self.node_find_in_log.emit)
+        ni.request_open_component.connect(self.node_open_component.emit)
         # 给所有 PortItem 连接交互信号（端口拖动连线 + 右键菜单）
         self._connect_port_signals_for_node(node.id)
         if emit:
@@ -684,6 +689,7 @@ class NodeView(QGraphicsView):
     """QGraphicsView 封装：滚轮缩放 + 中键平移 + 拖入节点（MIME data = application/x-node-type）。"""
 
     NODE_MIME = "application/x-node-type"
+    ASSET_MIME = "application/x-bp-asset"   # 从资源面板拖入的蓝图绝对路径（生成/填充「调用组件」节点）
 
     def __init__(self, scene: NodeScene, parent: Optional[QWidget] = None):
         super().__init__(scene, parent)
@@ -1111,13 +1117,15 @@ class NodeView(QGraphicsView):
 
     # ---------------- 拖入节点 ----------------
     def dragEnterEvent(self, event: QDragEnterEvent):
-        if event.mimeData().hasFormat(self.NODE_MIME):
+        md = event.mimeData()
+        if md.hasFormat(self.NODE_MIME) or md.hasFormat(self.ASSET_MIME):
             event.acceptProposedAction()
             return
         super().dragEnterEvent(event)
 
     def dragMoveEvent(self, event: QDragMoveEvent):
-        if event.mimeData().hasFormat(self.NODE_MIME):
+        md = event.mimeData()
+        if md.hasFormat(self.NODE_MIME) or md.hasFormat(self.ASSET_MIME):
             event.acceptProposedAction()
             return
         super().dragMoveEvent(event)
@@ -1130,6 +1138,18 @@ class NodeView(QGraphicsView):
             scene = self.scene()
             if isinstance(scene, NodeScene):
                 scene.add_node_by_type(node_type, scene_pos)
+            event.acceptProposedAction()
+            return
+        if md.hasFormat(self.ASSET_MIME):
+            # 资源面板拖入的蓝图：交给主窗口处理（算相对路径 + 进撤销栈 + 刷新画布）
+            try:
+                asset_path = bytes(md.data(self.ASSET_MIME)).decode("utf-8")
+            except Exception:
+                asset_path = ""
+            scene = self.scene()
+            if asset_path and isinstance(scene, NodeScene):
+                scene_pos = self.mapToScene(event.position().toPoint())
+                scene.asset_dropped.emit(asset_path, scene_pos)
             event.acceptProposedAction()
             return
         super().dropEvent(event)

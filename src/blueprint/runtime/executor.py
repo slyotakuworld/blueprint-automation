@@ -27,6 +27,14 @@ from ...config.app_paths import debug_dir
 
 
 # ============================================================
+# 组件递归保护：组件是文件引用（A 可调 B、B 可调 A），没有上限就会无限递归
+# 直接把整个运行时撑爆。超过这个层数一律判为「疑似循环引用」并中止该分支。
+# 32 层对正常业务足够深（组件嵌套很少超过 5 层），又远小于 Python 递归上限。
+# ============================================================
+MAX_COMPONENT_DEPTH = 32
+
+
+# ============================================================
 # 辅助：目标窗口(HWND) 应用到运行时所有服务
 # ============================================================
 def _apply_target_hwnd(ctx: ExecutionContext, hwnd, res_w=1920, res_h=1080):
@@ -3085,6 +3093,30 @@ def execute_Component(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any])
         annotate_step(ctx, node, "component", note="FAIL: 缺少runner_ref")
         return _empty_component_outputs(node), ["out_done"], ""
 
+    # ---------- 循环引用 / 递归深度保护 ----------
+    # 组件是文件引用，A 调 B、B 调 A 会让运行时无限递归直到栈溢出（整个程序被杀掉）。
+    # 这里维护一条「当前组件调用链」，命中重复 → 立刻判定循环引用并中止该分支。
+    _chain = getattr(ctx, "_component_chain", None)
+    if not isinstance(_chain, list):
+        _chain = []
+        try:
+            ctx._component_chain = _chain
+        except Exception:
+            pass
+    _self_norm = os.path.normcase(os.path.abspath(path))
+    _chain_norms = [os.path.normcase(os.path.abspath(c)) for c in _chain]
+    if _self_norm in _chain_norms:
+        _loop = " → ".join(os.path.basename(c) for c in _chain + [path])
+        note = f"检测到组件循环引用，已中止：{_loop}"
+        ctx.log(f"[Component] {node.id[:6]} {note}", "ERROR")
+        annotate_step(ctx, node, "component", note="FAIL: 组件循环引用")
+        return _empty_component_outputs(node), ["out_done"], ""
+    if len(_chain) >= MAX_COMPONENT_DEPTH:
+        note = f"组件递归层数超过 {MAX_COMPONENT_DEPTH} 层，已中止（疑似循环引用）"
+        ctx.log(f"[Component] {node.id[:6]} {note}", "ERROR")
+        annotate_step(ctx, node, "component", note="FAIL: 组件嵌套过深")
+        return _empty_component_outputs(node), ["out_done"], ""
+
     # 找子蓝图入口（Start 的下游作为真正起点）
     start_node = sub.find_start_node()
     if start_node is None:
@@ -3102,33 +3134,42 @@ def execute_Component(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any])
     annotate_step(ctx, node, "component", note=f"进入组件 {os.path.basename(path)}")
     ctx.log(f"[Component] {node.id[:6]} 执行子蓝图 {os.path.basename(path)}", "INFO")
 
-    # ---------- 传参：输入端口 in_0... → ctx 变量 __arg_0... ----------
-    num_in = int(node.params.get("num_inputs", 0) or 0)
-    for i in range(num_in):
-        ctx.variables[f"__arg_{i}"] = inputs.get(f"in_{i}")
-
-    # ---------- 执行子蓝图 Start 节点，把入参输出到 param_0... 端口（供子图内连线取用）----------
-    # Start 无 in_exec，这里手动执行一次，让它的 param_0... 输出写入 last_outputs（带前缀）
+    _chain.append(path)
     try:
-        start_outputs, _, _ = execute_Start(ctx, start_node, {})
-        ctx.set_outputs(f"{node.id}::{start_node.id}", start_outputs or {})
-    except Exception as e:
-        ctx.log(f"[Component] 执行子蓝图 Start 异常: {e}", "WARN")
+        # ---------- 传参：输入端口 in_0... → ctx 变量 __arg_0... ----------
+        num_in = int(node.params.get("num_inputs", 0) or 0)
+        for i in range(num_in):
+            ctx.variables[f"__arg_{i}"] = inputs.get(f"in_{i}")
 
-    ctrl = _run_subgraph_until_control(ctx, sub, runner, entry_id)
-    # 组件内不应有 Continue/Break（那是循环体专用），若出现按正常结束处理
-    if ctrl in ("break", "continue"):
-        ctrl = "end"
-    if ctrl == "stop":
-        return {}, [], "运行被停止"
-    annotate_step(ctx, node, "component", note=f"组件完成 {os.path.basename(path)}")
+        # ---------- 执行子蓝图 Start 节点，把入参输出到 param_0... 端口（供子图内连线取用）----------
+        # Start 无 in_exec，这里手动执行一次，让它的 param_0... 输出写入 last_outputs（带前缀）
+        try:
+            start_outputs, _, _ = execute_Start(ctx, start_node, {})
+            ctx.set_outputs(f"{node.id}::{start_node.id}", start_outputs or {})
+        except Exception as e:
+            ctx.log(f"[Component] 执行子蓝图 Start 异常: {e}", "WARN")
 
-    # ---------- 回传：ctx 变量 __ret_0... → 输出端口 out_0... ----------
-    num_out = int(node.params.get("num_outputs", 0) or 0)
-    out_vals: Dict[str, Any] = {}
-    for i in range(num_out):
-        out_vals[f"out_{i}"] = ctx.variables.get(f"__ret_{i}")
-    return out_vals, ["out_done"], ""
+        ctrl = _run_subgraph_until_control(ctx, sub, runner, entry_id)
+        # 组件内不应有 Continue/Break（那是循环体专用），若出现按正常结束处理
+        if ctrl in ("break", "continue"):
+            ctrl = "end"
+        if ctrl == "stop":
+            return {}, [], "运行被停止"
+        annotate_step(ctx, node, "component", note=f"组件完成 {os.path.basename(path)}")
+
+        # ---------- 回传：ctx 变量 __ret_0... → 输出端口 out_0... ----------
+        num_out = int(node.params.get("num_outputs", 0) or 0)
+        out_vals: Dict[str, Any] = {}
+        for i in range(num_out):
+            out_vals[f"out_{i}"] = ctx.variables.get(f"__ret_{i}")
+        return out_vals, ["out_done"], ""
+    finally:
+        # 出链：任何返回路径都要把本组件从调用链上摘掉，避免误报循环引用
+        try:
+            if _chain and os.path.normcase(os.path.abspath(_chain[-1] or "")) == _self_norm:
+                _chain.pop()
+        except Exception:
+            pass
 
 
 def _empty_component_outputs(node: Node) -> Dict[str, Any]:

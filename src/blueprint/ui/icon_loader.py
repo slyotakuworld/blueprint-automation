@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """蓝图编辑器通用图标资源统一加载 + 缓存（避免每次 QPixmap 重复解码大图）。
 
-图标源目录：<APP_DIR>/images/doc_icons/
-（打包后为 INTERNAL_DIR/images/doc_icons，开发模式为源码根 images/doc_icons）
+图标源目录：assets/doc_icons/（兼容旧布局 images/doc_icons/）
+（打包后为 INTERNAL_DIR/assets/doc_icons，开发模式为源码根 assets/doc_icons）
 """
 from __future__ import annotations
 
@@ -16,16 +16,21 @@ from PySide6.QtGui import QIcon, QPixmap, QPainter, QPainterPath, QPen, QColor
 def _resolve_icon_dir() -> str:
     try:
         from src.config.app_paths import INTERNAL_DIR
-        internal = os.path.normpath(os.path.join(INTERNAL_DIR, "images", "doc_icons"))
-        if os.path.isdir(internal):
-            return internal
+        for rel in (("assets", "doc_icons"), ("images", "doc_icons")):
+            p = os.path.normpath(os.path.join(INTERNAL_DIR, *rel))
+            if os.path.isdir(p):
+                return p
     except Exception:
         pass
     # 源码模式：本文件在 src/blueprint/ui/ 下，向上 3 级即项目根
-    return os.path.normpath(os.path.join(
-        os.path.abspath(os.path.dirname(__file__)),
-        "..", "..", "..", "images", "doc_icons",
+    root = os.path.normpath(os.path.join(
+        os.path.abspath(os.path.dirname(__file__)), "..", "..", "..",
     ))
+    for rel in (("assets", "doc_icons"), ("images", "doc_icons")):
+        p = os.path.normpath(os.path.join(root, *rel))
+        if os.path.isdir(p):
+            return p
+    return os.path.normpath(os.path.join(root, "assets", "doc_icons"))
 
 
 _ICON_DIR = _resolve_icon_dir()

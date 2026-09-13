@@ -83,6 +83,27 @@ class ExportDialog(QDialog):
         name_row.addStretch(1)
         root.addLayout(name_row)
 
+        # ---- 导出前体检（组件断链 / OCR 运行时 / 模板是否比代码旧）----
+        try:
+            self._issues = exporter.preflight(self._graph, project_root=project_root)
+        except Exception:
+            self._issues = []
+        if self._issues:
+            has_err = any(i.get("level") == "error" for i in self._issues)
+            lines = []
+            for it in self._issues:
+                icon = "⛔" if it.get("level") == "error" else "⚠"
+                lines.append(f"{icon} {it.get('msg', '')}")
+            chk = QLabel("导出前体检：\n\n" + "\n\n".join(lines))
+            chk.setWordWrap(True)
+            chk.setStyleSheet(
+                ("color:#F85149; background:#2A1414; border:1px solid #6E2A2A;"
+                 if has_err else
+                 "color:#D29922; background:#2A2414; border:1px solid #6E5A2A;")
+                + " padding:6px 8px; border-radius:4px; font-size:11px;"
+            )
+            root.addWidget(chk)
+
         root.addWidget(QLabel("打包的图片资源："))
         self._assets_view = QPlainTextEdit()
         self._assets_view.setReadOnly(True)
@@ -103,7 +124,7 @@ class ExportDialog(QDialog):
         tpl_txt = (
             f"运行时模板：已就绪（{_fmt_size(self._tpl['size'])}）"
             if self._tpl["exists"]
-            else f"运行时模板缺失：{self._tpl['path']}　→　请先运行 build_runtime.cmd"
+            else f"运行时模板缺失：{self._tpl['path']}　→　请运行 start.cmd 重打模板（start.cmd build-runtime）"
         )
         self._tpl_lbl = QLabel(tpl_txt)
         self._tpl_lbl.setStyleSheet(f"color:{tpl_color}; font-size:11px;")
@@ -182,13 +203,25 @@ class ExportDialog(QDialog):
         if not out:
             QMessageBox.warning(self, "导出", "请先选择导出路径。")
             return
+        # 体检未通过（ERROR 级）→ 明确再确认一次，避免导出个跑不起来的 EXE
+        errs = [i for i in (getattr(self, "_issues", None) or []) if i.get("level") == "error"]
+        if errs:
+            detail = "\n\n".join(f"⛔ {i.get('msg', '')}" for i in errs)
+            r = QMessageBox.warning(
+                self, "导出体检未通过",
+                f"{detail}\n\n仍要强制导出吗？（导出的 EXE 里这些节点会运行失败）",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if r != QMessageBox.Yes:
+                return
         if not self._tpl["exists"]:
             QMessageBox.critical(
                 self,
                 "缺少运行时模板",
                 "未找到 BlueprintRuntime.exe，无法导出。\n\n"
                 f"预期位置：{self._tpl['path']}\n\n"
-                "请先运行项目根目录下的 build_runtime.cmd 生成运行时模板。",
+                "请先运行项目根目录下的 start.cmd，选择「4. 仅重打运行时模板」\n"
+                "（命令行等价：start.cmd build-runtime）生成运行时模板。",
             )
             return
 

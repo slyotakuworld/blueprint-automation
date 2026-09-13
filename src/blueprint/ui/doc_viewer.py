@@ -14,7 +14,7 @@
   │                      │ - 引用块 4px蓝边+浅灰底                  │
   └──────────────────────┴──────────────────────────────────────────┘
 
-文档配置目录：config/doc/
+文档配置目录：assets/doc/（兼容旧 config/doc/）
   - doc_index.json：目录结构定义
   - *.md：各章节 Markdown 内容
 
@@ -41,7 +41,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-# 章节小图标统一走通用图标加载器（图标源目录 images/doc_icons）
+# 章节小图标统一走通用图标加载器（图标源目录 assets/doc_icons）
 from src.blueprint.ui.icon_loader import pixmap
 
 
@@ -608,19 +608,21 @@ class DocViewerPage(QFrame):
     def _resolve_doc_dir() -> str:
         from src.config.app_paths import INTERNAL_DIR, APP_DIR
 
+        # 手册目录：新布局 assets/doc/，同时兼容旧布局 config/doc/
         candidates = [
+            os.path.normpath(os.path.join(INTERNAL_DIR, "assets", "doc")),
+            os.path.normpath(os.path.join(APP_DIR, "assets", "doc")),
             os.path.normpath(os.path.join(INTERNAL_DIR, "config", "doc")),
             os.path.normpath(os.path.join(APP_DIR, "config", "doc")),
         ]
         try:
             here = os.path.abspath(os.path.dirname(__file__))
-            candidates.append(
-                os.path.normpath(
-                    os.path.join(here, "..", "..", "..", "config", "doc")
-                )
-            )
+            root = os.path.normpath(os.path.join(here, "..", "..", ".."))
+            candidates.append(os.path.normpath(os.path.join(root, "assets", "doc")))
+            candidates.append(os.path.normpath(os.path.join(root, "config", "doc")))
         except Exception:
             pass
+        candidates.append(os.path.normpath(os.path.join(os.getcwd(), "assets", "doc")))
         candidates.append(os.path.normpath(os.path.join(os.getcwd(), "config", "doc")))
 
         for c in candidates:
@@ -832,7 +834,7 @@ class DocViewerPage(QFrame):
             "## 🧭 怎么用这本手册？\n\n"
             "- **左侧目录**：点一下章节或小节，右侧就会显示对应内容\n"
             "- **右上角搜索框**：输入关键词快速搜章节标题（比如 `找图`、`VarSwitch`、`FAQ`）\n"
-            "- 所有文档是纯文本 Markdown，保存在 `config/doc/` 目录，随时可以手动补充\n\n"
+            "- 所有文档是纯文本 Markdown，保存在 `assets/doc/` 目录，随时可以手动补充\n\n"
             "## 📚 推荐阅读顺序\n\n"
             "1. **🍎 快速上手** → 6 步跑通第一张蓝图，先和咱混个脸熟\n"
             "2. **📖 基础操作** → 项目、画布、节点、连线、变量、运行、截图，基础打牢\n"

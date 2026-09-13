@@ -242,6 +242,8 @@ class NodeItem(QGraphicsObject):
     request_delete = Signal(str)
     breakpoint_toggled = Signal(str, bool)   # (node_id, new_state) 断点切换后通知外部（scene 可更新 persist 缓存）
     node_double_clicked = Signal(str)        # node_id，双击节点（用于进入子图/循环体子画布）
+    request_find_in_log = Signal(str)        # node_id，右键「在日志中查找」
+    request_open_component = Signal(str)     # node_id，右键「打开引用的组件」（Component 节点）
 
     def __init__(self, node: Node):
         super().__init__()
@@ -279,8 +281,7 @@ class NodeItem(QGraphicsObject):
 
     # ---------------- 右键菜单（QMenu 上下文菜单） ----------------
     def contextMenuEvent(self, event: QGraphicsSceneContextMenuEvent):
-        """节点右键：只保留「切换断点」。
-        按用户 2026-07-05 明确要求：移除无效果的"删除节点"项（当前 request_delete 未挂接处理逻辑，容易误导用户）。"""
+        """节点右键：切换断点 + 在日志中查找 + （组件节点）打开引用的组件。"""
         menu = QMenu()
         menu.setStyleSheet(
             "QMenu { background: #21262D; color: #C9D1D9; border: 1px solid #30363D; padding: 4px; }"
@@ -298,6 +299,20 @@ class NodeItem(QGraphicsObject):
             self.toggle_breakpoint()
         act_bp.triggered.connect(_do_toggle)
         menu.addAction(act_bp)
+
+        # 菜单项 2：在运行日志里查找本节点（日志行 ↔ 画布节点 双向定位）
+        act_find = QAction("🔍 在日志中查找该节点", menu)
+        act_find.triggered.connect(lambda _=False: self.request_find_in_log.emit(self.node.id))
+        menu.addAction(act_find)
+
+        # 菜单项 3：Component 节点专属 —— 打开它引用的那张组件蓝图
+        if getattr(self.node, "type", "") == "Component":
+            ref = str((getattr(self.node, "params", None) or {}).get("blueprint_path", "") or "")
+            act_open = QAction("🧩 打开引用的组件", menu)
+            act_open.setEnabled(bool(ref))
+            act_open.triggered.connect(lambda _=False: self.request_open_component.emit(self.node.id))
+            menu.addAction(act_open)
+
         # 在鼠标处弹出
         menu.exec(QCursor.pos())
         super().contextMenuEvent(event)
@@ -362,6 +377,17 @@ class NodeItem(QGraphicsObject):
             if len(url) > 36:
                 url = url[:34] + "…"
             return f"[{method}] {url}" if method else url
+        if t == "Component":
+            # 调用组件：画布上直接显示"调的是谁"，双击可跳转过去编辑
+            bp = str(p.get("blueprint_path", "") or "").strip()
+            if not bp:
+                return "🧩 未选择组件（双击进入 / 属性面板下拉选择）"
+            stem = bp.replace("\\", "/").rsplit("/", 1)[-1]
+            if stem.lower().endswith(".bp.json"):
+                stem = stem[: -len(".bp.json")]
+            return f"🧩 调用组件：{stem}"
+        if t == "Parallel":
+            return "并行体（双击进入子画布）"
         if t == "Loop":
             infinite = bool(p.get("infinite", False))
             interval = float(p.get("interval_sec", 1.0) or 1.0)

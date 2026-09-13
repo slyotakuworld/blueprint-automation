@@ -1,9 +1,10 @@
 from typing import Dict, Optional
 
 from PySide6.QtCore import Qt, QMimeData, Signal
-from PySide6.QtGui import QColor, QDrag, QFont
+from PySide6.QtGui import QColor, QDrag, QFont, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QLabel,
+    QLineEdit,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -59,6 +60,8 @@ class NodePalette(QWidget):
         self.setMinimumWidth(220)
         self.setMaximumWidth(220)
         self._context_nodes: list = []  # 子画布上下文额外节点（如循环体里的 Continue/Break）
+        self._node_items: list = []     # [(QTreeWidgetItem, node_type)]，供搜索框切换可见性
+        self._filter = ""               # 当前搜索词（重建树后需要重新应用）
         self._build_ui()
 
     def set_context_nodes(self, extra_types):
@@ -84,6 +87,21 @@ class NodePalette(QWidget):
         tip.setWordWrap(True)
         tip.setStyleSheet("color: #8B949E; font-size: 9px;")
         outer.addWidget(tip)
+
+        # ---- 搜索框：输入即过滤节点（匹配名称/类型/描述/分类）----
+        self._search = QLineEdit()
+        self._search.setPlaceholderText("🔍 搜索节点…")
+        self._search.setClearButtonEnabled(True)
+        self._search.setStyleSheet(
+            "QLineEdit { background:#161B22; color:#C9D1D9; border:1px solid #30363D;"
+            " border-radius:4px; padding:3px 6px; font-size:10px; }"
+            "QLineEdit:focus { border-color:#1F6FEB; }"
+        )
+        self._search.textChanged.connect(self._on_search_changed)
+        outer.addWidget(self._search)
+        # Esc → 清空搜索（并让焦点回到列表，方便继续用键盘）
+        _sc = QShortcut(QKeySequence(Qt.Key_Escape), self._search)
+        _sc.activated.connect(self._clear_search)
 
         self._tree: _DraggableNodeTree = _DraggableNodeTree(self, self)
         self._tree.setHeaderHidden(True)
@@ -115,6 +133,7 @@ class NodePalette(QWidget):
 
     def _fill_tree(self):
         self._tree.clear()
+        self._node_items = []
         category_items: Dict[str, QTreeWidgetItem] = {}
         for cat in CATEGORIES_ORDER:
             it = QTreeWidgetItem([cat])
@@ -142,6 +161,7 @@ class NodePalette(QWidget):
             tip_parts = [ntype, meta.description or ""]
             it.setForeground(0, QColor("#C9D1D9"))
             it.setToolTip(0, "\n".join(t for t in tip_parts if t))
+            self._node_items.append((it, ntype))
         # 2) 子画布上下文节点（如循环体里的 Continue/Break）追加到各自分类
         for ntype in self._context_nodes:
             meta = NODE_LIBRARY.get(ntype)
@@ -154,7 +174,57 @@ class NodePalette(QWidget):
             it.setData(0, Qt.UserRole, ntype)
             it.setForeground(0, QColor("#A371F7"))
             it.setToolTip(0, f"{ntype}\n{meta.description or ''}")
+            self._node_items.append((it, ntype))
         self._tree.expandAll()
+        # 重建后重新套用当前搜索词（否则刷新一下过滤就丢了）
+        self._apply_filter(self._filter)
+
+    # ============================================================
+    # 搜索过滤
+    # ============================================================
+    def _on_search_changed(self, text: str):
+        self._filter = (text or "").strip()
+        self._apply_filter(self._filter)
+
+    def _clear_search(self):
+        if self._search.text():
+            self._search.clear()
+        else:
+            self._tree.setFocus()
+
+    def _apply_filter(self, keyword: str):
+        """按关键词过滤节点项：命中名称 / 类型名 / 描述 / 分类名。
+
+        空关键词 = 全部显示并展开。有关键词时收起无命中的分类，
+        并自动展开命中的分类，方便一眼看到结果。
+        """
+        kw = (keyword or "").strip().lower()
+        cat_visible: Dict[QTreeWidgetItem, int] = {}
+        for it, ntype in self._node_items:
+            meta = NODE_LIBRARY.get(ntype)
+            if kw:
+                hay = " ".join(filter(None, [
+                    meta.title if meta else "",
+                    ntype,
+                    (meta.category if meta else "") or "",
+                    (meta.description if meta else "") or "",
+                ])).lower()
+                hit = kw in hay
+            else:
+                hit = True
+            it.setHidden(not hit)
+            parent = it.parent()
+            if parent is not None:
+                cat_visible[parent] = cat_visible.get(parent, 0) + (1 if hit else 0)
+
+        for i in range(self._tree.topLevelItemCount()):
+            cat = self._tree.topLevelItem(i)
+            n = cat_visible.get(cat, 0)
+            cat.setHidden(kw != "" and n == 0)
+            if kw:
+                cat.setExpanded(n > 0)
+            else:
+                cat.setExpanded(True)
 
     def current_node_type(self) -> Optional[str]:
         it = self._tree.currentItem()

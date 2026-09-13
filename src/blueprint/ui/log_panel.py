@@ -1,5 +1,7 @@
+from typing import List, Optional
+
 from PySide6.QtCore import Signal
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFont, QTextBlockUserData
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -21,16 +23,45 @@ LEVEL_COLORS = {
 }
 
 
+class _LogLineData(QTextBlockUserData):
+    """挂在每个文本块上的附加信息：该行日志对应的执行节点 id（可为空）。"""
+
+    __slots__ = ("node_id",)
+
+    def __init__(self, node_id: str = ""):
+        super().__init__()
+        self.node_id = node_id
+
+
+class _LogView(QPlainTextEdit):
+    """日志正文：双击某一行时把该行的节点信息发出去（用于定位到画布节点）。"""
+
+    line_double_clicked = Signal(str, str)   # (node_id, 行文本)
+
+    def mouseDoubleClickEvent(self, event):
+        try:
+            cur = self.cursorForPosition(event.position().toPoint())
+            blk = cur.block()
+            data = blk.userData()
+            nid = getattr(data, "node_id", "") or ""
+            self.line_double_clicked.emit(nid, blk.text())
+        except Exception:
+            pass
+        super().mouseDoubleClickEvent(event)
+
+
 class LogPanel(QWidget):
-    """底部日志面板：分级+过滤。"""
+    """底部日志面板：分级+过滤。双击日志行可定位到画布上的执行节点。"""
 
     request_clear = Signal()
+    node_activated = Signal(str, str)   # (node_id, 行文本)：双击日志行
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumHeight(140)
         self._build_ui()
         self._min_level = 0
+        self._keep: List[_LogLineData] = []   # 保活：块 userData 的 Python 侧引用
 
     def _build_ui(self):
         outer = QVBoxLayout(self)
@@ -62,9 +93,11 @@ class LogPanel(QWidget):
         top.addWidget(self._btn_clear)
         outer.addLayout(top)
 
-        self._text = QPlainTextEdit()
+        self._text = _LogView()
         self._text.setReadOnly(True)
         self._text.setMaximumBlockCount(2000)
+        self._text.setToolTip("双击某一行可跳到对应的画布节点（运行日志带节点信息时可用）")
+        self._text.line_double_clicked.connect(self._on_line_double_clicked)
         self._text.setStyleSheet(
             "QPlainTextEdit {"
             "  background: #1C2128; color: #C9D1D9;"
@@ -108,7 +141,7 @@ class LogPanel(QWidget):
             return 3
         return 1
 
-    def append_log(self, msg: str, level: str = "INFO"):
+    def append_log(self, msg: str, level: str = "INFO", node_id: Optional[str] = None):
         level_key = (level or "INFO").upper()
         color = LEVEL_COLORS.get(level_key, LEVEL_COLORS["INFO"])
         ts = self._ts()
@@ -123,13 +156,47 @@ class LogPanel(QWidget):
             f' <span style="color:{color};">{self._escape(msg)}</span>'
         )
         self._text.appendHtml(html)
+        # 给刚追加的块挂上节点 id（双击该行即可跳到画布节点）
+        try:
+            data = _LogLineData(str(node_id or ""))
+            self._keep.append(data)
+            self._text.document().lastBlock().setUserData(data)
+            if len(self._keep) > 2500:
+                del self._keep[:500]
+        except Exception:
+            pass
         sb = self._text.verticalScrollBar()
         sb.setValue(sb.maximum())
 
-    def log_runtime(self, msg: str, level: str = "INFO"):
-        self.append_log(msg, level)
+    # ---------------- 日志 ↔ 节点 双向定位 ----------------
+    def _on_line_double_clicked(self, node_id: str, line_text: str):
+        self.node_activated.emit(node_id or "", line_text or "")
+
+    def highlight_node(self, node_id: str, nodes_hint: Optional[dict] = None) -> bool:
+        """把日志滚动到最近一条属于 node_id 的日志并选中该行。命中返回 True。"""
+        if not node_id:
+            return False
+        doc = self._text.document()
+        target = None
+        blk = doc.firstBlock()
+        while blk.isValid():
+            data = blk.userData()
+            if getattr(data, "node_id", "") == node_id:
+                target = blk
+            blk = blk.next()
+        if target is None:
+            return False
+        cur = self._text.textCursor()
+        cur.setPosition(target.position())
+        self._text.setTextCursor(cur)
+        self._text.centerCursor()
+        return True
+
+    def log_runtime(self, msg: str, level: str = "INFO", node_id: Optional[str] = None):
+        self.append_log(msg, level, node_id=node_id)
 
     def clear(self):
+        self._keep.clear()
         self._text.clear()
         self.request_clear.emit()
 

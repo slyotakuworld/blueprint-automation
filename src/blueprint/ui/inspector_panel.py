@@ -196,6 +196,8 @@ class InspectorPanel(QWidget):
     request_pick_template = Signal(str, str)  # node_id, param_name
     request_snip_for_node = Signal(str, str)  # node_id, mode（"if_img_add" / "if_static_roi" / "if_img_replace_<idx>"）
     request_pick_coord = Signal(str, str)  # node_id, param_name（Mouse 点属性 📍 坐标拾取）
+    request_open_component = Signal(str)   # 组件蓝图相对路径（点「打开这个组件」→ 主窗口跳转过去编辑）
+    component_chosen = Signal(str, str)    # (node_id, 组件蓝图相对路径)：选完组件 → 主窗口做端口自动对齐 + 循环引用检测
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -4067,17 +4069,21 @@ class InspectorPanel(QWidget):
         return [str(k).strip().lower() for k in keys if str(k).strip()]
 
     def _keycombo_save(self, keys):
-        """保存 key_combo 到 node.params（不重建表单，避免销毁触发回调的下拉框控件）"""
+        """保存 key_combo 到 node.params（不重建表单，避免销毁触发回调的下拉框控件）
+
+        注意：这里**不能**先手动写 node.params 再发信号 —— 主窗口的撤销栈靠比较
+        「旧值 vs 新值」决定是否入栈，提前写入会让新旧值相等、修改无法 Ctrl+Z 撤销。
+        统一交给 param_changed 让主窗口写入。
+        """
         import json
         node = self._current_node
         if node is None:
             return
         val = json.dumps(keys, ensure_ascii=False)
-        node.params["key_combo"] = val
         try:
             self.param_changed.emit(node.id, "key_combo", val)
         except Exception:
-            pass
+            node.params["key_combo"] = val   # 兜底：没有任何接收方时至少把值落下去
 
     def _keycombo_add_key(self, key):
         """添加一个键到组合"""
@@ -4245,6 +4251,10 @@ class InspectorPanel(QWidget):
         combo.currentIndexChanged.connect(
             lambda i, n=nid, c=combo: self.param_changed.emit(n, "blueprint_path", c.currentData() or "")
         )
+        # 选完组件后通知主窗口：自动对齐端口数 + 循环引用检测（在参数已写入之后触发）
+        combo.currentIndexChanged.connect(
+            lambda i, n=nid, c=combo: self.component_chosen.emit(n, str(c.currentData() or ""))
+        )
         # 替换
         self._form.removeRow(target_row)
         new_label = QLabel("组件蓝图")
@@ -4252,6 +4262,19 @@ class InspectorPanel(QWidget):
         new_label.setToolTip("从工程 components/ 目录下选择要复用的蓝图")
         self._form.insertRow(target_row, new_label, combo)
         self._widgets["blueprint_path"] = combo
+        # 便捷入口：直接跳过去编辑该组件（在画布上双击组件节点效果相同）
+        btn_open = QPushButton("↗ 打开这个组件")
+        btn_open.setCursor(Qt.PointingHandCursor)
+        btn_open.setToolTip("跳转到该组件蓝图编辑它（画布上双击组件节点同效）")
+        btn_open.setStyleSheet(self._btn_style("#1F6FEB", "#388BFD"))
+        btn_open.setEnabled(bool(str(combo.currentData() or "")))
+        btn_open.clicked.connect(
+            lambda _=False, c=combo: self.request_open_component.emit(str(c.currentData() or ""))
+        )
+        combo.currentIndexChanged.connect(
+            lambda _i, b=btn_open, c=combo: b.setEnabled(bool(c.currentData() or ""))
+        )
+        self._form.addRow(btn_open)
         if not components:
             combo.setToolTip("当前工程没有 components/ 目录或目录下没有 .bp.json 蓝图。\n"
                              "请先把要复用的蓝图保存到工程 components/ 子目录下。")
@@ -4955,7 +4978,8 @@ class InspectorPanel(QWidget):
             return False
         nid = self._current_node.id
         for pname, pval in merge.items():
-            self._current_node.params[pname] = pval
+            # 不要提前写 params：撤销栈靠「旧值 vs 新值」比较决定是否入栈，
+            # 提前写入会让新旧值相等而漏记撤销。统一交给 param_changed 由主窗口写入。
             try:
                 self.param_changed.emit(nid, pname, pval)
             except Exception:

@@ -2,7 +2,7 @@
 
 做法：
     1. 找到运行时模板 exe：<程序目录>/BlueprintRuntime.exe
-       （由 build_runtime.cmd / build.cmd 生成，见项目根脚本）
+       （由 start.cmd 的「打包发布版 / 仅重打运行时模板」生成，实现见 scripts/bp_dev.py）
     2. 把蓝图 JSON + 它引用的图片资源打成载荷 zip（见 payload.py）
     3. 复制模板 exe，并在末尾追加载荷（见 overlay.py）
 
@@ -58,6 +58,142 @@ def template_info() -> Dict[str, Any]:
 def preview_assets(graph) -> Any:
     """预览：扫描蓝图会带出哪些图片资源、哪些找不到。"""
     return scan_assets(graph.to_dict())
+
+
+# ============================================================
+# 导出前体检
+# ============================================================
+def _ocr_runtime_dirs() -> List[str]:
+    """OCR 运行时的候选位置：程序目录 / ocr_runtime，开发模式下还有项目根（src 的上一级）。"""
+    cands: List[str] = []
+    try:
+        from src.config.app_paths import APP_DIR
+        cands.append(os.path.join(APP_DIR, "ocr_runtime"))
+        parent = os.path.dirname(os.path.abspath(APP_DIR))
+        cands.append(os.path.join(parent, "ocr_runtime"))
+    except Exception:
+        pass
+    return cands
+
+
+def runtime_source_mtime() -> float:
+    """编辑器侧「运行时代码」的最新修改时间（用于判断模板是不是旧的）。"""
+    newest = 0.0
+    try:
+        root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+        rt_dir = os.path.join(root, "src", "blueprint", "runtime")
+        if os.path.isdir(rt_dir):
+            for fn in os.listdir(rt_dir):
+                if fn.endswith(".py"):
+                    try:
+                        newest = max(newest, os.path.getmtime(os.path.join(rt_dir, fn)))
+                    except OSError:
+                        pass
+        runner_py = os.path.join(root, "src", "blueprint_runner.py")
+        if os.path.isfile(runner_py):
+            newest = max(newest, os.path.getmtime(runner_py))
+    except Exception:
+        pass
+    return newest
+
+
+def preflight(graph, project_root: Optional[str] = None) -> List[Dict[str, str]]:
+    """导出前体检。返回 [{"level": "error"|"warn", "msg": ...}]，空列表表示一切正常。
+
+    检查三项（都是「不检查就会白忙一场」的类型）：
+      1. 组件引用断链：蓝图里「调用组件」指向的 .bp.json 不存在（含子画布与递归嵌套）。
+      2. 用了 OCR 但没带 ocr_runtime/ 目录 → 导出的 EXE 识别节点必然报「OCR 未安装」。
+      3. 运行时模板比编辑器里的运行时代码旧 → 导出的 EXE 跑的还是旧代码（需执行 start.cmd build-runtime）。
+    """
+    issues: List[Dict[str, str]] = []
+
+    # ---------- 1) 组件引用断链 ----------
+    missing: List[str] = []
+    visited: set = set()
+
+    def _walk_refs(g, depth: int = 0):
+        if g is None or depth > 10:
+            return
+        try:
+            nodes = getattr(g, "nodes", {}) or {}
+        except Exception:
+            return
+        refs: List[str] = []
+        for node in nodes.values():
+            if getattr(node, "type", "") == "Component":
+                r = (getattr(node, "params", None) or {}).get("blueprint_path")
+                if isinstance(r, str) and r.strip():
+                    refs.append(r.strip())
+            p = getattr(node, "params", None)
+            if isinstance(p, dict):
+                for k in ("loop_body", "seq_body", "par_body"):
+                    body = p.get(k)
+                    if not (isinstance(body, dict) and isinstance(body.get("nodes"), dict)):
+                        continue
+                    for sn in (body.get("nodes") or {}).values():
+                        if not isinstance(sn, dict) or str(sn.get("type", "")).lower() != "component":
+                            continue
+                        sp = sn.get("data") if isinstance(sn.get("data"), dict) else sn.get("params")
+                        if isinstance(sp, dict):
+                            r = sp.get("blueprint_path")
+                            if isinstance(r, str) and r.strip():
+                                refs.append(r.strip())
+        for r in refs:
+            cand = r if os.path.isabs(r) else os.path.join(project_root or "", r)
+            if not os.path.isfile(cand):
+                if r not in missing:
+                    missing.append(r)
+                continue
+            key = os.path.normcase(os.path.abspath(cand))
+            if key in visited:
+                continue
+            visited.add(key)
+            try:
+                from src.blueprint.core.graph_store import BlueprintStore
+                _walk_refs(BlueprintStore.load(cand), depth + 1)
+            except Exception:
+                pass
+
+    if project_root:
+        _walk_refs(graph)
+        if missing:
+            shown = "、".join(missing[:6]) + ("…" if len(missing) > 6 else "")
+            issues.append({
+                "level": "error",
+                "msg": f"组件引用断链：{len(missing)} 个「调用组件」指向的蓝图文件不存在（{shown}）。"
+                       "运行到该节点会失败（按空操作跳过）。",
+            })
+
+    # ---------- 2) OCR 运行时 ----------
+    try:
+        if uses_ocr(graph, project_root=project_root):
+            if not any(os.path.isdir(d) for d in _ocr_runtime_dirs()):
+                issues.append({
+                    "level": "warn",
+                    "msg": "蓝图包含「文字识别」节点，但没找到 ocr_runtime/ 目录："
+                           "导出后必须把 ocr_runtime/ 放到 EXE 同级目录，否则识别节点会报「OCR 未安装」。",
+                })
+    except Exception:
+        pass
+
+    # ---------- 3) 运行时模板新旧 ----------
+    try:
+        tpl = runtime_template_path()
+        if os.path.isfile(tpl):
+            tpl_m = os.path.getmtime(tpl)
+            src_m = runtime_source_mtime()
+            if src_m > tpl_m + 1:
+                from datetime import datetime as _dt
+                issues.append({
+                    "level": "warn",
+                    "msg": "运行时模板比编辑器里的运行时代码旧（模板 "
+                           f"{_dt.fromtimestamp(tpl_m):%Y-%m-%d %H:%M} < 代码 {_dt.fromtimestamp(src_m):%Y-%m-%d %H:%M}）："
+                           "导出的 EXE 会跑旧代码，请先执行 start.cmd build-runtime 再导出。",
+                })
+    except Exception:
+        pass
+
+    return issues
 
 
 def uses_ocr(graph, project_root: Optional[str] = None) -> bool:
@@ -118,7 +254,8 @@ def export_blueprint(
             message=(
                 "未找到运行时模板 BlueprintRuntime.exe。\n\n"
                 f"预期位置：{tmpl}\n\n"
-                "请先运行项目根目录下的 build_runtime.cmd 生成运行时模板"
+                "请先运行项目根目录下的 start.cmd 重打运行时模板"
+                "（双击 start.cmd 选「4. 仅重打运行时模板」，或命令行 start.cmd build-runtime）"
                 "（正式发布版已随主程序一起分发，通常不会缺）。"
             ),
         )
