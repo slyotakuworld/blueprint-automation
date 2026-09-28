@@ -10,17 +10,15 @@ class ProjectManager(QObject):
     工程管理器（单例）：
       - 每个"工程"是一个独立文件夹，内部结构：
           <project_root>/
-            ├── <project_name>.bp.json     # 蓝图文件（节点/连线/配置）
-            ├── project_meta.json          # 工程元数据（创建/最近打开时间、工程名、版本）
-            ├── screenshots/               # 热键截图/源图
-            │   ├── autocap_autosave/      #   目标窗口自动抓帧保存的PNG
-            │   └── imported_images/       #   从外部磁盘导入的图片拷贝（缓存）
-            ├── templates/                 # 裁剪为模板的小PNG（FindAnyImage 用）
-            ├── cache/                     # 模板匹配缓存/其它运行期缓存
-            └── debug/                     # 运行期debug截图/标注输出
+            ├── blueprints/                # 普通蓝图默认目录（系统默认蓝图放在这里）
+            ├── components/                # 组件蓝图默认目录（类型由蓝图自身 bp_type 决定，不强制）
+            ├── resource/                  # 资源根：蓝图用到的图片按蓝图所在目录镜像存放
+            │   └── <蓝图相对目录>/          #   例如 resource/blueprints/tpl_xxx.png
+            ├── cache/                     # 运行期缓存
+            └── debug/                     # 运行期debug输出
       - 启动时必须先新建或打开一个工程（否则所有写资源操作都被拦截）。
       - 通过 register_path_provider() 把自身路径解析函数注入给 src.config.app_paths，
-        这样 app_paths 下的 screenshot_dir/template_dir 等老代码无需修改就能自动路由到工程目录。
+        这样 app_paths 下的资源/缓存/debug 路径解析自动路由到工程目录。
     """
 
     project_opened = Signal(str)       # project_root
@@ -49,10 +47,20 @@ class ProjectManager(QObject):
         return bool(self.project_root) and os.path.isdir(self.project_root)
 
     def blueprint_path(self) -> Optional[str]:
-        """返回本工程的 .bp.json 蓝图文件绝对路径（即第一次创建工程时自动生成的同名默认蓝图路径）"""
+        """返回本工程的默认蓝图 .bp.json 绝对路径。
+
+        新式：默认蓝图放在 <工程根>/blueprints/<工程名>.bp.json；
+        兼容旧工程：若该文件不存在，回退到工程根下的 <工程名>.bp.json。
+        """
         if not self.is_open():
             return None
-        return os.path.join(self.project_root, f"{self.project_name}.bp.json")
+        new_style = os.path.join(self.project_root, "blueprints", f"{self.project_name}.bp.json")
+        if os.path.isfile(new_style):
+            return new_style
+        legacy = os.path.join(self.project_root, f"{self.project_name}.bp.json")
+        if os.path.isfile(legacy):
+            return legacy
+        return new_style
 
     # ============================================================
     # 工程 meta.json 读写（集中封装，避免重复 open/close）
@@ -127,17 +135,9 @@ class ProjectManager(QObject):
             os.makedirs(p, exist_ok=True)
         return p
 
-    def screenshot_dir(self) -> Optional[str]:
-        return self._sub("screenshots")
-
-    def screenshot_autocap_dir(self) -> Optional[str]:
-        return self._sub("screenshots", "autocap_autosave")
-
-    def screenshot_imported_dir(self) -> Optional[str]:
-        return self._sub("screenshots", "imported_images")
-
-    def template_dir(self) -> Optional[str]:
-        return self._sub("templates")
+    def asset_dir(self) -> Optional[str]:
+        """资源根目录 <project>/resource/：蓝图用到的图片按蓝图所在目录镜像存进去。"""
+        return self._sub("resource")
 
     def cache_dir(self) -> Optional[str]:
         return self._sub("cache")
@@ -151,14 +151,15 @@ class ProjectManager(QObject):
     def path_provider(self, key: str) -> Optional[str]:
         """
         供 app_paths 注入回调时调用。
-        key ∈ {"screenshot", "template", "cache", "debug"}
+        key ∈ {"root", "assets", "cache", "debug"}
+          root 用于把蓝图里的「相对工程根资源路径」解析成绝对路径（app_paths.project_root_dir）。
         """
         if not self.is_open():
             return None
-        if key == "screenshot":
-            return self.screenshot_dir()
-        if key == "template":
-            return self.template_dir()
+        if key == "root":
+            return self.project_root
+        if key == "assets":
+            return self.asset_dir()
         if key == "cache":
             return self.cache_dir()
         if key == "debug":
@@ -223,10 +224,9 @@ class ProjectManager(QObject):
             return None
         # 子目录
         for sub in [
-            "screenshots",
-            os.path.join("screenshots", "autocap_autosave"),
-            os.path.join("screenshots", "imported_images"),
-            "templates",
+            "blueprints",   # 普通蓝图默认目录（系统默认蓝图放在这里）
+            "components",   # 组件蓝图默认目录（类型仍以蓝图自身 bp_type 为准，不强制放这里）
+            "resource",     # 资源根目录
             "cache",
             "debug",
         ]:
@@ -247,14 +247,14 @@ class ProjectManager(QObject):
             return None
         # 初始蓝图（带Start节点）——**只有首次创建工程时自动生成这一张**
         from src.blueprint.core.graph_store import BlueprintStore
-        bp_path = os.path.join(project_root, f"{safe}.bp.json")
+        bp_path = os.path.join(project_root, "blueprints", f"{safe}.bp.json")
         g = BlueprintStore.new_graph(name=safe)
         if not BlueprintStore.save(g, bp_path, make_backup=False):
             return None
         # 把这张首次自动生成的同名蓝图设为 last_opened_blueprint（直接写 meta 文件，无需 is_open 为 True）
         # 注意：这里不能用 set_last_opened_blueprint()，因为 auto_open=False 时 is_open 会返回 False，
         # set_last_opened_blueprint 会直接拒绝。改用内部函数 _write_meta_to_file，接受任意 meta_path。
-        self._write_meta_to_file(meta_path, {"last_opened_blueprint": f"{safe}.bp.json"})
+        self._write_meta_to_file(meta_path, {"last_opened_blueprint": os.path.join("blueprints", f"{safe}.bp.json")})
 
         if auto_open:
             # 打开它（open_project 后 is_open 才会 True，此时才能成功写 meta）

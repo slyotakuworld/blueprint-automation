@@ -82,6 +82,34 @@ def _isfile(path: str) -> bool:
         return False
 
 
+def _resolve_img(s: str) -> str:
+    """把「看起来是图片路径」的字符串解析成真实存在的绝对路径。
+
+    新式资源路径是「相对工程根」的（如 res/脚本/组件1/tpl_xxx.png），
+    直接丢给 os.path.isfile 会因为按进程 CWD 解析而误判成文件缺失 →
+    整张图既不会被打包、导出后路径也失效。所以统一走 app_paths.get_img_path
+    （编辑器找图、运行时找图用的也是它），保证「打包口径 = 找图口径」。
+    解析不到（文件真的不存在）返回空串。
+    """
+    if _isfile(s):
+        try:
+            return os.path.abspath(s)
+        except Exception:
+            return s
+    try:
+        from src.config.app_paths import get_img_path
+
+        cand = get_img_path(s)
+    except Exception:
+        return ""
+    if cand and _isfile(cand):
+        try:
+            return os.path.abspath(cand)
+        except Exception:
+            return cand
+    return ""
+
+
 class _Scanner:
     """递归遍历蓝图结构：收集存在的图片、记录缺失的图片、把路径换成记号。"""
 
@@ -122,8 +150,9 @@ class _Scanner:
             return s
         # 1) 整串就是一个存在的图片路径 → 换成记号
         if _is_image_path(s):
-            if _isfile(s):
-                return self.token_for(s)
+            real = _resolve_img(s)
+            if real:
+                return self.token_for(real)
             if s not in self.missing:
                 self.missing.append(s)
             return s

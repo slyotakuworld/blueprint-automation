@@ -107,6 +107,25 @@ def _sanitize_params_for_save(params: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def _resolve_img_value(v: str) -> str:
+    """把蓝图参数里的图片路径解析成绝对路径。
+
+    兼容三种写法：
+      1) 绝对路径            → 原样（runtime 载荷还原后就是这种）
+      2) 工程根相对路径      → <工程根>/resource/<蓝图目录>/xxx.png（新式，跟着蓝图走）
+      3) 旧式相对文件名      → 工程 templates/ 或全局 images/1080p 下同名文件
+    统一委托给 app_paths.get_img_path（运行时找图走的也是它，保证编辑器/运行时口径一致）。
+    """
+    if not isinstance(v, str) or not v:
+        return v
+    try:
+        from src.config.app_paths import get_img_path
+
+        return get_img_path(v)
+    except Exception:
+        return v
+
+
 def _hydrate_params_after_load(node_type: str, params: Dict[str, Any]) -> Dict[str, Any]:
     """加载后缓存 image_b64 / template_path 对应的 PIL 图到 node.runtime_attrs（不写回params，避免二次序列化膨胀）。
 
@@ -117,11 +136,13 @@ def _hydrate_params_after_load(node_type: str, params: Dict[str, Any]) -> Dict[s
         return runtime_attrs
     # 优先级：template_path 存在且文件有效 > image_b64 非空
     tpl_path = params.get("template_path") or params.get("template") or ""
-    if isinstance(tpl_path, str) and tpl_path and os.path.exists(tpl_path):
-        pil = _path_to_pil(tpl_path)
-        if pil is not None:
-            runtime_attrs["_pil_template"] = pil
-            return runtime_attrs
+    if isinstance(tpl_path, str) and tpl_path:
+        real = _resolve_img_value(tpl_path)
+        if os.path.exists(real):
+            pil = _path_to_pil(real)
+            if pil is not None:
+                runtime_attrs["_pil_template"] = pil
+                return runtime_attrs
     # b64：几个常见 key 都试一遍（常见格式 b64 / b64_preview，其他：image_b64 / roi_preview_b64 / template_b64）
     for k in ("image_b64", "b64", "b64_preview", "roi_preview_b64", "template_b64"):
         v = params.get(k)
@@ -151,8 +172,10 @@ def _hydrate_params_after_load(node_type: str, params: Dict[str, Any]) -> Dict[s
                 p = item.get("path")
                 b = item.get("b64") or item.get("image_b64")
                 pil = None
-                if isinstance(p, str) and p and os.path.exists(p):
-                    pil = _path_to_pil(p)
+                if isinstance(p, str) and p:
+                    real = _resolve_img_value(p)
+                    if os.path.exists(real):
+                        pil = _path_to_pil(real)
                 if pil is None and isinstance(b, str) and b:
                     pil = _b64_to_pil(b)
                 cached.append(pil)
@@ -217,9 +240,16 @@ class BlueprintStore:
             data = graph.to_dict()
             with open(file_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, sort_keys=True, indent=2, ensure_ascii=False)
-            return True
         except Exception:
             return False
+        # 蓝图类型缓存（bp_kind 按 mtime 缓存）失效，否则资源树会显示旧类型
+        try:
+            from .bp_kind import invalidate as _bp_kind_invalidate
+
+            _bp_kind_invalidate(file_path)
+        except Exception:
+            pass
+        return True
 
     @staticmethod
     def _prune_backups(directory: str, stem_name: str, keep: int = 5):
@@ -321,8 +351,8 @@ class BlueprintStore:
         return node
 
     @staticmethod
-    def new_graph(name: str = "Untitled") -> BlueprintGraph:
-        g = BlueprintGraph(name=name)
+    def new_graph(name: str = "Untitled", bp_type: str = "blueprint") -> BlueprintGraph:
+        g = BlueprintGraph(name=name, bp_type=str(bp_type or "blueprint"))
         # Start = 蓝图中分配的第一个节点（id=1）
         BlueprintStore.add_node(g, "Start", pos=(100, 200))
         return g

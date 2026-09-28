@@ -239,6 +239,9 @@ class BlueprintGraph:
     updated_at: str = ""
     dev_scale_x: float = 1.0
     dev_scale_y: float = 1.0
+    # 蓝图类型："blueprint"=普通蓝图 / "component"=组件蓝图（可被 Component 节点调用）。
+    # ⚠ 这是「蓝图是什么」的元数据，与「蓝图放在哪个目录」无关 —— 位置由用户在资源面板决定。
+    bp_type: str = "blueprint"
     # 运行时：下一个要分配的节点id（1,2,3…自增，每张蓝图独立计数，不序列化）
     _next_node_id: int = 1
 
@@ -278,6 +281,9 @@ class BlueprintGraph:
             })
         # ★ 注意：这里不再 self.updated_at = datetime.now()！改为只在 save 时 graph.touch() 刷新
         return {
+            # bp_type 刻意放顶层：save 时 sort_keys=True 让它落在文件首行，
+            # 资源面板/下拉框只需读文件头 4KB 就能判出这张蓝图是普通蓝图还是组件
+            "bp_type": str(self.bp_type or "blueprint"),
             "nodes": nodes_d,
             "links": links,
             "breakpoints": breakpoints_list,
@@ -353,6 +359,9 @@ class BlueprintGraph:
         g.dev_scale_y = float(meta.get("dev_scale_y", 1.0))
         g.created_at = str(meta.get("created_at") or g.created_at)
         g.updated_at = str(meta.get("updated_at") or g.updated_at)
+        # 蓝图类型：顶层优先（新格式），metadata 里也认（兜底），都没有则普通蓝图
+        _bt = d.get("bp_type") or meta.get("bp_type") or "blueprint"
+        g.bp_type = str(_bt).strip().lower() or "blueprint"
         # 根据已加载节点的最大数字id，初始化下一个要分配的自增id（避免与现有节点冲突）
         _max = 0
         for nid in list(g.nodes.keys()):

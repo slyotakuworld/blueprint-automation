@@ -65,6 +65,8 @@ if _PROJECT_ROOT not in sys.path:
 import uuid
 
 from src.blueprint.core.graph_store import BlueprintStore
+from src.blueprint.core import asset_store as asset_store_mod
+from src.blueprint.core import bp_kind as bp_kind_mod
 from src.blueprint.core.models import BlueprintGraph, Edge, Port
 from src.blueprint.core.node_library import NODE_LIBRARY, create_node
 from src.blueprint.project_manager import ProjectManager
@@ -250,7 +252,8 @@ class BlueprintMainWindow(QMainWindow):
         # 就加载该工程下的 <工程名>.bp.json；否则创建一张未保存的空白图（理论不会走到这，main会强制先选工程）
         self._load_or_new_graph_for_current_project()
         # 启动时把左侧「🗂 工程资源」树按当前工程填好（这条启动路径不走 _finalize_project_switch）
-        self._refresh_assets()
+        # reveal_path=默认蓝图：自动展开 blueprints/ 并选中默认蓝图，避免它藏在折叠目录里看不见
+        self._refresh_assets(reveal_path=self._current_path)
 
         # 最后：把 settings 中所有快捷键应用（global 注册到 _hotkey_mgr + local 到 QAction）
         self._apply_shortcuts_from_settings(changed_keys=None, log_success=True)
@@ -326,7 +329,9 @@ class BlueprintMainWindow(QMainWindow):
         except Exception:
             pass
         try:
-            self._refresh_assets()
+            # reveal_path=当前蓝图：自动展开其所在目录（如 blueprints/）并选中，
+            # 确保「创建/打开工程」后默认蓝图立刻在资源树里可见，而不是藏在折叠目录中
+            self._refresh_assets(reveal_path=self._current_path)
         except Exception:
             pass
         try:
@@ -1022,8 +1027,9 @@ class BlueprintMainWindow(QMainWindow):
         if not ref:
             QMessageBox.information(
                 self, "未选择组件",
-                "这个组件节点还没有选择要调用的蓝图。\n\n请在右侧属性面板的「组件蓝图」下拉里选一张 components/ 目录下的蓝图；"
-                "若还没有组件，可在左侧「🗂 工程资源」面板点「＋组件」新建。",
+                "这个组件节点还没有选择要调用的蓝图。\n\n请在右侧属性面板的「组件蓝图」下拉里选一张组件蓝图；"
+                "若还没有组件，可在左侧「🗂 工程资源」面板点「＋组件」新建（放哪个目录都行），"
+                "或右键任意蓝图 → 🧩 设为组件蓝图。",
             )
             return
         self._open_component_ref(ref, node=node)
@@ -1185,11 +1191,19 @@ class BlueprintMainWindow(QMainWindow):
         self._assets.request_new.connect(self._on_asset_new)
         self._assets.request_rename.connect(self._on_asset_rename)
         self._assets.request_delete.connect(self._on_asset_delete)
+        self._assets.request_set_bp_type.connect(self._on_asset_set_bp_type)
+        self._assets.request_cleanup_assets.connect(self._on_asset_cleanup_assets)
         self._assets.save_current.connect(self._on_save)
         self._assets.save_as_component.connect(self._on_save_as_component)
         self._assets.open_from_disk.connect(self._on_open)
         self._assets.reveal_path.connect(self._on_asset_reveal)
         self._assets.request_reverse_deps.connect(self._on_asset_reverse_deps)
+        # 保险：任何「工程打开」事件都强制刷新资源树（即便某条开工程路径忘了调 _refresh_assets，
+        # 也能靠信号兜底，避免出现「开了工程但面板空白」）。
+        try:
+            self._pm.project_opened.connect(lambda *_a: self._refresh_assets())
+        except Exception:
+            pass
         # 注意：全局热键已由 GlobalHotkeyManager.set_callback 直接绑定到主线程 QTimer.singleShot，
         # 无需额外 bridge.connect
 
@@ -1460,12 +1474,22 @@ class BlueprintMainWindow(QMainWindow):
             QMessageBox.warning(self, "保存失败", "写入文件失败。")
 
     # ==================== 蓝图 / 组件 创建（统一流程） ====================
-    def _components_dir(self) -> str:
-        """当前工程的 components/ 目录绝对路径（不存在则创建）。"""
+    def _default_component_dir(self) -> str:
+        """「另存为组件」的默认落点：当前蓝图所在目录（没有则工程根）。
+
+        ⚠ 组件不再强制放在 components/ —— 放哪儿由用户在资源面板决定，
+          「是不是组件」写在蓝图自己的 bp_type 里，与目录无关。
+        """
         root = (self._pm.project_root if (self._pm and self._pm.is_open()) else "") or ""
-        comp_dir = os.path.join(root, "components")
-        os.makedirs(comp_dir, exist_ok=True)
-        return comp_dir
+        cur = self._current_path
+        if cur:
+            try:
+                d = os.path.dirname(os.path.abspath(cur))
+                if d and os.path.isdir(d):
+                    return d
+            except Exception:
+                pass
+        return root
 
     @staticmethod
     def _sanitize_stem(raw: str) -> str:
@@ -1546,12 +1570,14 @@ class BlueprintMainWindow(QMainWindow):
         if stem is None:
             return
         final_path = os.path.join(target_dir, stem + BlueprintStore.EXT)
+        want_type = bp_kind_mod.BP_TYPE_COMPONENT if as_component else bp_kind_mod.BP_TYPE_BLUEPRINT
         if use_current_graph:
             self._graph.name = stem      # 文件名同步为蓝图名，重开标题栏显示正确
+            self._graph.bp_type = want_type
             g = self._graph
             need_bind = False
         else:
-            g = BlueprintStore.new_graph(stem)
+            g = BlueprintStore.new_graph(stem, bp_type=want_type)
             g.name = stem
             need_bind = True
         ok = BlueprintStore.save(g, final_path)
@@ -1575,7 +1601,7 @@ class BlueprintMainWindow(QMainWindow):
         suffix = "（Component 节点下拉列表可直接选用）" if as_component else ""
         self._log.append_log(f"✅ {verb}{kind_cn}：{final_path}{suffix}", "SUCCESS")
         self._update_title()
-        self._refresh_assets()
+        self._refresh_assets(reveal_path=final_path)
 
     def _on_new(self):
         """新建空白蓝图（落在工程根目录）。"""
@@ -1584,22 +1610,37 @@ class BlueprintMainWindow(QMainWindow):
         self._create_blueprint_at(self._pm.project_root, as_component=False)
 
     def _on_save_as_component(self):
-        """把当前打开的蓝图另存一份到 components/，现有蓝图一键转组件。"""
+        """把当前蓝图另存一份（默认落在当前蓝图所在目录）并标记为组件蓝图。
+
+        「组件」是蓝图自己的类型元数据，跟放在哪个目录无关；
+        想让某个目录里的蓝图变成组件，直接在资源树里右键「设为组件蓝图」即可。
+        """
         if not self._ensure_project_open("另存为组件"):
             return
-        self._create_blueprint_at(self._components_dir(), as_component=True, use_current_graph=True)
+        self._create_blueprint_at(self._default_component_dir(), as_component=True,
+                                  use_current_graph=True)
 
     # ==================== 🗂 资源面板回调（面板只发意图，写文件在这里） ====================
-    def _refresh_assets(self):
-        """刷新资源树 + 当前蓝图高亮（新建/保存/删除/切工程后调用）。"""
+    def _refresh_assets(self, reveal_path: Optional[str] = None):
+        """刷新资源树 + 当前蓝图高亮（新建/保存/删除/切工程后调用）。
+
+        reveal_path: 新建/保存后让该文件自动展开并选中（避免落在子目录里被折叠藏住）。
+        """
         try:
             if getattr(self, "_assets", None) is None:
                 return
-            self._assets.set_project(
-                self._pm.project_root if (self._pm and self._pm.is_open()) else None,
-                self._pm.project_name if self._pm else "",
-            )
+            pm = self._pm
+            root = pm.project_root if (pm and pm.is_open()) else None
+            name = pm.project_name if pm else ""
+            # 只有「工程根/名真变了」才走 set_project（它会重置展开状态）；
+            # 普通的保存/新建只 refresh()，保留用户已展开的目录，避免每次都折叠回只剩根。
+            if root == self._assets._last_root and name == self._assets._last_name:
+                self._assets.refresh()
+            else:
+                self._assets.set_project(root, name)
             self._assets.set_current_path(self._current_path)
+            if reveal_path:
+                self._assets.reveal(reveal_path)
         except Exception as e:
             try:
                 self._log.append_log(f"[Assets] 刷新资源树失败: {e}", "WARN")
@@ -1622,18 +1663,19 @@ class BlueprintMainWindow(QMainWindow):
         if not self._confirm_discard():
             return
         self._open_blueprint_path(path)
-        self._refresh_assets()
+        # reveal_path=当前蓝图：自动展开其所在目录并选中，双击打开后在资源树里定位到它
+        self._refresh_assets(reveal_path=self._current_path)
 
     def _on_asset_new(self, kind: str, target_dir: str):
-        """资源面板「新建蓝图/组件/文件夹」。"""
+        """资源面板「新建蓝图/组件/文件夹」：落在面板当前选中的目录下（不再固定 components/）。"""
         if kind == "folder":
             self._on_asset_new_folder(target_dir)
             return
         if not self._ensure_project_open("新建资源"):
             return
         as_component = (kind == "component")
-        if as_component and os.path.normcase(os.path.abspath(target_dir)) == os.path.normcase(os.path.abspath(self._pm.project_root)):
-            target_dir = self._components_dir()   # 从根节点发起的「新建组件」也落到 components/
+        if not target_dir or not os.path.isdir(target_dir):
+            target_dir = self._pm.project_root
         self._create_blueprint_at(target_dir, as_component=as_component)
 
     def _on_asset_new_folder(self, parent_dir: str):
@@ -1660,6 +1702,141 @@ class BlueprintMainWindow(QMainWindow):
             return
         self._log.append_log(f"📁 已创建文件夹：{new_dir}", "SUCCESS")
         self._refresh_assets()
+
+    # ==================== 蓝图类型切换 / 资源清理 ====================
+    def _on_asset_set_bp_type(self, path: str, bp_type: str):
+        """资源面板右键：把某张蓝图设为「普通蓝图」或「组件蓝图」。
+
+        类型是蓝图自己的元数据（JSON 顶层 bp_type），与所在目录无关；
+        只改这一个字段、不刷新 updated_at，画布上的未保存修改不受影响。
+        """
+        if not self._ensure_project_open("切换蓝图类型"):
+            return
+        if bp_type not in bp_kind_mod.VALID_TYPES:
+            return
+        if not path or not os.path.isfile(path):
+            QMessageBox.warning(self, "切换失败", f"文件不存在（可能已被外部删除）：\n{path}")
+            self._refresh_assets()
+            return
+        old_type = bp_kind_mod.read_bp_type(path)
+        if old_type == bp_type:
+            return
+        if not bp_kind_mod.write_bp_type(path, bp_type):
+            QMessageBox.critical(self, "切换失败", f"无法写入蓝图文件：\n{path}")
+            return
+        # 正在编辑的就是这张 → 内存里的图也要同步，否则一保存又把类型写回去
+        try:
+            if self._current_path and os.path.normcase(os.path.abspath(self._current_path)) == \
+                    os.path.normcase(os.path.abspath(path)) and self._graph is not None:
+                self._graph.bp_type = bp_type
+                self._mark_graph_clean(self._graph)
+        except Exception:
+            pass
+        to_cn = "组件蓝图" if bp_type == bp_kind_mod.BP_TYPE_COMPONENT else "普通蓝图"
+        extra = ""
+        if old_type == bp_kind_mod.BP_TYPE_COMPONENT and bp_type == bp_kind_mod.BP_TYPE_BLUEPRINT:
+            refs = self._count_component_refs(path)
+            if refs:
+                extra = (f"\n⚠ 仍有 {refs} 处「调用组件」节点引用它，"
+                         "改成普通蓝图后这些调用不会失效，但语义上就不再是组件了。")
+        self._log.append_log(f"🔁 已把 {os.path.basename(path)} 设为{to_cn}{extra}", "SUCCESS")
+        if extra:
+            QMessageBox.information(self, "已切换类型", f"{os.path.basename(path)} → {to_cn}{extra}")
+        self._refresh_assets()
+
+    def _on_asset_cleanup_assets(self):
+        """🧹 清理未使用资源：删掉没有任何蓝图引用的图片，避免打包进无意义资源。"""
+        if not self._ensure_project_open("清理未使用资源"):
+            return
+        root = self._proj_root()
+        if not root:
+            return
+        try:
+            unused, total = asset_store_mod.find_unused_assets(root)
+        except Exception as e:
+            QMessageBox.critical(self, "扫描失败", f"扫描工程资源时出错：\n{e}")
+            return
+        scope_cn = "、".join(asset_store_mod.SCAN_DIRS)
+        if total == 0:
+            QMessageBox.information(
+                self, "🧹 清理未使用资源",
+                f"扫描范围（{scope_cn}/）里还没有任何图片资源。\n\n"
+                "截图 / 导入的图片会自动存进 resource/<蓝图所在目录>/，与蓝图一一对应。",
+            )
+            return
+        if not unused:
+            QMessageBox.information(
+                self, "🧹 清理未使用资源",
+                f"扫描了 {total} 个图片资源，全部都被蓝图引用着，没有可清理的内容。",
+            )
+            return
+        try:
+            size = sum(os.path.getsize(p) for p in unused)
+            size_cn = f"{size / 1048576:.2f} MB" if size >= 1048576 else f"{size / 1024:.1f} KB"
+        except Exception:
+            size_cn = "未知大小"
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("🧹 清理未使用资源")
+        box.setText(
+            f"扫描范围：{scope_cn}/（只扫资源目录，不动其它目录）\n"
+            f"共 {total} 个图片资源，其中 {len(unused)} 个没有被任何蓝图引用，合计 {size_cn}。"
+        )
+        box.setInformativeText("确认后将「移入回收站」（可从系统回收站恢复），列表见下方详情。")
+        box.setDetailedText("\n".join(unused))
+        box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        box.setDefaultButton(QMessageBox.No)
+        if box.exec() != QMessageBox.Yes:
+            self._log.append_log(f"🧹 已取消清理（{len(unused)} 个候选资源未处理）", "INFO")
+            return
+        deleted, failed = [], []
+        for p in unused:
+            err = self._trash_one(p)
+            (failed.append((p, err)) if err else deleted.append(p))
+        # 清理后顺带收掉空目录，避免 res/ 里留下一堆空壳
+        self._prune_empty_dirs([os.path.join(root, d) for d in asset_store_mod.SCAN_DIRS])
+        self._log.append_log(
+            f"🧹 已清理 {len(deleted)} 个未使用资源" + (f"，{len(failed)} 个失败" if failed else ""),
+            "SUCCESS" if deleted else "WARN",
+        )
+        if failed:
+            QMessageBox.warning(self, "部分清理失败",
+                                "\n".join(f"{p}\n  → {e}" for p, e in failed[:5]))
+        self._refresh_assets()
+
+    @staticmethod
+    def _prune_empty_dirs(roots):
+        """自底向上删掉空目录（只在自己给定的根目录内，且不删根本身）。"""
+        for root in roots:
+            if not os.path.isdir(root):
+                continue
+            for dirpath, dirnames, filenames in os.walk(root, topdown=False):
+                if os.path.normcase(dirpath) == os.path.normcase(root):
+                    continue
+                try:
+                    if not os.listdir(dirpath):
+                        os.rmdir(dirpath)
+                except OSError:
+                    pass
+
+    def _save_node_asset(self, node, image, prefix: str, ext: str = ".png") -> str:
+        """把节点用到的图片存进「该蓝图对应的 resource 目录」，返回相对工程根的路径。
+
+        口径：<工程根>/resource/<当前蓝图所在目录>/<prefix>_<时间戳>_<随机>.png
+              （蓝图未保存到工程内时落在 <工程根>/resource/ 根下）
+        """
+        root = self._proj_root()
+        if not root:
+            self._log.append_log("[资源] 尚未打开工程，图片资源无处安放。", "WARN")
+            return ""
+        try:
+            rel = asset_store_mod.save_image(root, self._current_path, image, prefix=prefix, ext=ext)
+        except Exception as e:
+            self._log.append_log(f"[资源] 保存图片失败: {e}", "ERROR")
+            return ""
+        if not rel:
+            self._log.append_log("[资源] 保存图片失败（写入被拒绝）。", "ERROR")
+        return rel
 
     def _on_asset_rename(self, path: str):
         """重命名文件/目录；若被其它蓝图以组件形式引用，同步更新引用路径。"""
@@ -2218,6 +2395,10 @@ class BlueprintMainWindow(QMainWindow):
         except Exception:
             pass
         rel = self._norm_rel(os.path.relpath(abs_path, root))
+        if not bp_kind_mod.is_component(abs_path, root):
+            self._log.append_log(
+                f"ℹ {os.path.basename(abs_path)} 目前是「普通蓝图」，这里按「调用组件」引用了它。"
+                "若要让它算作组件（资源树显示为 🧩），右键 → 设为组件蓝图。", "INFO")
 
         # 命中已有「调用组件」节点？（拖到节点上 = 给它填引用）
         target = None
@@ -2663,7 +2844,7 @@ class BlueprintMainWindow(QMainWindow):
         self._scene.graph_changed.emit()
 
     def _on_pick_template(self, node_id: str, param_name: str):
-        if not self._ensure_project_open("裁剪模板保存到工程templates/"):
+        if not self._ensure_project_open("裁剪模板保存到工程resource/"):
             return
         self._log.append_log("调用裁图工具 (region_selector)...", "INFO")
         try:
@@ -2674,19 +2855,14 @@ class BlueprintMainWindow(QMainWindow):
                 self._log.append_log("裁图已取消。", "INFO")
                 return
             img_bgr, region = result
-            # ✅ 保存到「当前工程的 templates/」目录（而不是全局 APP_DIR/images/1080p，避免串工程
-            from src.config.app_paths import template_dir
-            save_dir = template_dir()
-            os.makedirs(save_dir, exist_ok=True)
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            ms = int(time.time() * 1000) % 1000
-            filename = f"tpl_{ts}_{ms:03d}.png"
-            full = os.path.join(save_dir, filename)
-            import cv2
-            ok, buf = cv2.imencode(".png", img_bgr)
-            if ok:
-                buf.tofile(full)
-            self._on_param_changed(node_id, param_name, filename)
+            # ✅ 存到「该蓝图对应的 resource 目录」：<工程根>/resource/<蓝图所在目录>/tpl_*.png
+            #    （资源跟着蓝图走，不再全工程塞一个目录；清理时也能逐个蓝图对账）
+            rel = self._save_node_asset(None, img_bgr, "tpl")
+            if not rel:
+                self._log.append_log("[资源] 模板保存失败，未回填路径。", "ERROR")
+                return
+            full = os.path.join(self._proj_root() or "", rel.replace("/", os.sep))
+            self._on_param_changed(node_id, param_name, rel)
             self._log.append_log(f"模板已裁到: {full}", "SUCCESS")
             # 重新 set_node 刷新表单
             if self._graph and node_id in self._graph.nodes:
@@ -2789,7 +2965,7 @@ class BlueprintMainWindow(QMainWindow):
             return
         # findimg_target / if_img_add / if_img_replace 都需要 templates 目录保存文件，
         # 工程未打开时禁止操作（避免 fallback 到全局 APP_DIR 污染 src/）
-        if not self._ensure_project_open("裁剪模板保存到工程templates/"):
+        if not self._ensure_project_open("裁剪模板保存到工程resource/"):
             return
         try:
             from src.blueprint.ui.snip_overlay import SnipOverlay
@@ -2892,17 +3068,13 @@ class BlueprintMainWindow(QMainWindow):
                     )
                     self._inspector.set_node(node)
                     return
-                # FindImage：findimg_target - 保存PNG到templates，回填template路径 + b64预览
+                # FindImage：findimg_target - 保存PNG到该蓝图的 res/ 镜像目录，回填 template 路径 + b64预览
                 if m == "findimg_target":
                     try:
-                        import uuid
-                        # templates 目录：工程根/templates （不存在则创建）
-                        from src.config.app_paths import template_dir
-                        tpl_dir = template_dir()
-                        os.makedirs(tpl_dir, exist_ok=True)
-                        fname = f"findimg_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}.png"
-                        fpath = os.path.join(tpl_dir, fname)
-                        pil.save(fpath, format="PNG")
+                        rel = self._save_node_asset(node, pil, "findimg")
+                        if not rel:
+                            self._log.append_log("[FindImage] 模板保存失败（未打开工程或写入被拒）", "ERROR")
+                            return
                         # 同时写入PIL runtime_attrs缓存
                         try:
                             if not hasattr(node, "runtime_attrs") or node.runtime_attrs is None:
@@ -2910,10 +3082,10 @@ class BlueprintMainWindow(QMainWindow):
                             node.runtime_attrs["_pil_template"] = pil.copy()
                         except Exception:
                             pass
-                        self._on_param_changed(nid, "template", fpath)
+                        self._on_param_changed(nid, "template", rel)
                         self._on_param_changed(nid, "template_b64", b64)
                         self._log.append_log(
-                            f"[FindImage] 截取目标完成: {w}×{h} 已保存到 {fpath}", "SUCCESS"
+                            f"[FindImage] 截取目标完成: {w}×{h} 已保存到 {rel}", "SUCCESS"
                         )
                         self._inspector.set_node(node)
                     except Exception as e_fe:
@@ -2936,6 +3108,11 @@ class BlueprintMainWindow(QMainWindow):
                     "w": int(w),
                     "h": int(h),
                 }
+                # 参考图同时落盘一份到该蓝图的 res/ 镜像目录：
+                #   1) 资源面板里能看到、能清理；2) 导出的 EXE 用全分辨率原图匹配，比 b64 缩略图更准
+                rel_img = self._save_node_asset(node, pil, "ifimg")
+                if rel_img:
+                    new_item["path"] = rel_img
                 if m.startswith("if_img_replace_"):
                     try:
                         idx = int(m.split("_")[-1])
@@ -2972,11 +3149,17 @@ class BlueprintMainWindow(QMainWindow):
                                 pil_img = _PILImage.open(_io.BytesIO(base64.b64decode(b64_str))).convert("RGBA")
                             except Exception:
                                 pil_img = None
-                        elif path and os.path.exists(path):
+                        elif path:
                             try:
-                                pil_img = _PILImage.open(path).convert("RGBA")
+                                from src.config.app_paths import get_img_path
+                                real = get_img_path(path)
                             except Exception:
-                                pil_img = None
+                                real = path
+                            if os.path.exists(real):
+                                try:
+                                    pil_img = _PILImage.open(real).convert("RGBA")
+                                except Exception:
+                                    pil_img = None
                         new_cache.append(pil_img)
                     node.runtime_attrs["_pil_images"] = new_cache
                     self._log.append_log(f"[if_img] 已刷新图片缓存({len(new_cache)}张)", "DEBUG")

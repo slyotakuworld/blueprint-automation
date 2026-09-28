@@ -8,7 +8,7 @@
 启动流程：
     1. 读取自身 exe 末尾的载荷（开发/调试时可用环境变量 BP_RUNTIME_PAYLOAD 指定文件）
     2. 解包到 %LOCALAPPDATA%/BlueprintRuntime/<载荷指纹>/，把它当成"伪工程根"，
-       注册给 app_paths，使 templates/screenshots/cache/debug 等目录可用
+       注册给 app_paths，使 resource/cache/debug 等目录可用
     3. 把蓝图 JSON 里的 @@BPASSET:n@@ 记号还原成解包目录下的真实图片路径
     4. 弹出控制面板窗口：**默认不自动运行**，由用户点「▶ 开始」或按 F5 启动；
        全局热键 F5 开始 / F6 暂停继续 / F7 停止 / F12 紧急退出。
@@ -74,7 +74,7 @@ APP_TITLE = "蓝图独立运行"
 ENV_PAYLOAD = "BP_RUNTIME_PAYLOAD"
 PREFS_FILE = "runtime_prefs.json"
 
-_SUB_DIRS = ("templates", "screenshots", "cache", "debug", "assets")
+_SUB_DIRS = ("resource", "cache", "debug", "assets")
 
 # 状态色（浅色主题）
 _C_READY = "#57606A"
@@ -183,9 +183,12 @@ def _prepare(payload: bytes):
 
     # 伪工程根：app_paths 不认识"工程"，这里用一个固定目录冒充，保证四个子目录可用
     def _provider(key: str):
+        if key == "root":
+            # 蓝图里的资源路径可能是「相对工程根」的（新式 resource/... 写法）。
+            # 导出的载荷会把它们替换成解包后的绝对路径，这里只是兜底解析。
+            return work_dir
         mapping = {
-            "screenshot": "screenshots",
-            "template": "templates",
+            "assets": "resource",
             "cache": "cache",
             "debug": "debug",
         }

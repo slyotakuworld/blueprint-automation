@@ -8,9 +8,8 @@ from typing import Any, Callable, Dict, Optional
 # ============================================================
 # 工程路径 Provider 注入（由 ProjectManager 在 open_project 时赋值）
 # 函数签名: provider(key: str) -> Optional[str]
-#   key ∈ {"screenshot", "template", "cache", "debug"}
-#   返回工程目录对应子路径；未开工程 / 不识别 key 时返回 None，
-#   这时下方 screenshot_dir() 等会回退到旧行为：APP_DIR 下的全局目录。
+#   key ∈ {"root", "assets", "cache", "debug"}
+#   返回工程目录对应子路径；未开工程 / 不识别 key 时返回 None。
 # ============================================================
 _project_path_provider: Optional[Callable[[str], Optional[str]]] = None
 
@@ -29,6 +28,16 @@ def _project_sub(key: str) -> Optional[str]:
         return p if (p and os.path.isdir(p)) else None
     except Exception:
         return None
+
+
+def project_root_dir() -> Optional[str]:
+    """当前工程根目录（未开工程 / 运行时未注入则 None）。
+
+    用途：蓝图里的图片资源现在按「相对工程根的路径」存（如 resource/脚本/xxx.png），
+    解析时必须知道工程根。运行时 frozen exe 里注册的是解包目录（伪工程根），
+    因此这个函数在编辑器和运行时都成立。
+    """
+    return _project_sub("root")
 
 
 def get_app_dir():
@@ -78,34 +87,6 @@ def template_meta_file() -> str:
 
 
 CURRENT_VERSION = "4.1"
-
-
-def template_dir() -> str:
-    """
-    有工程时：<project>/templates/  （FindAnyImage 的模板小图）
-    未开工程：直接抛 RuntimeError（禁止写入全局 APP_DIR/templates/，避免串工程和污染 src/ 代码目录）
-    """
-    p = _project_sub("template")
-    if p:
-        return p
-    raise RuntimeError(
-        "[template_dir] 尚未打开任何 BlueprintAutomation 工程，无法获取 templates/ 目录。"
-        "请先新建或打开一个工程后再保存模板图片。"
-    )
-
-
-def screenshot_dir() -> str:
-    """
-    有工程时：<project>/screenshots/  （热键截图/源截图所在）
-    未开工程：直接抛 RuntimeError（禁止写入全局 APP_DIR/screenshots/，避免串工程和污染 src/ 代码目录）
-    """
-    p = _project_sub("screenshot")
-    if p:
-        return p
-    raise RuntimeError(
-        "[screenshot_dir] 尚未打开任何 BlueprintAutomation 工程，无法获取 screenshots/ 目录。"
-        "请先新建或打开一个工程后再执行截图操作。"
-    )
 
 
 def debug_dir() -> str:
@@ -185,6 +166,14 @@ def auto_extract_images(folder_name="images"):
 
 
 def get_img_path(filename):
+    """把蓝图参数里的图片路径解析成真实可用路径。
+
+    解析顺序（编辑器与运行时口径完全一致）：
+      1) 绝对路径且存在        → 原样（runtime 载荷还原后就是这种）
+      2) <工程根>/相对路径     → resource/<蓝图目录>/xxx.png 这类「跟着蓝图走」的新式资源
+      3) <工程根>/templates/x  → 旧式：只存文件名，落在工程 templates/ 下
+      4) 全局 images/1080p     → 更老的兼容路径
+    """
     rel_name = os.path.normpath(str(filename))
     basename = os.path.basename(rel_name)
     cache = getattr(get_img_path, "_cache", None)
@@ -198,6 +187,15 @@ def get_img_path(filename):
         cache[rel_name] = rel_name
         return rel_name
 
+    # 2) 工程根相对路径（新式）
+    root = project_root_dir()
+    if root:
+        cand = os.path.normpath(os.path.join(root, rel_name))
+        if os.path.exists(cand):
+            cache[rel_name] = cand
+            return cand
+
+    # 3) 全局 images/1080p（更老的兼容路径）
     for candidate_name in (rel_name, basename):
         ext_path = os.path.join(APP_DIR, "images", DEFAULT_IMAGES_DIRNAME, candidate_name)
         if os.path.exists(ext_path):

@@ -1638,22 +1638,39 @@ class InspectorPanel(QWidget):
             self.param_changed.emit(node.id, k, v)
 
     def _get_project_templates_dir(self) -> str:
-        """获取当前工程的 templates 目录路径。
-        有工程时：返回 <project>/templates（不存在则自动创建）。
-        无工程时：返回用户主目录。
+        """图片选择对话框的默认目录：当前蓝图对应的资源目录 <工程根>/resource/<蓝图相对目录>。
+
+        资源按蓝图所在目录镜像存放，所以「导入图片」默认就落在同目录蓝图对应的 res 子目录里，
+        方便一个目录里的蓝图连同它的资源一起搬移。无工程时回退用户主目录。
         """
         try:
+            from src.blueprint.core import asset_store
+
             mw = self.window()
             pm = getattr(mw, "_pm", None)
-            if pm and pm.is_open():
-                root = pm.project_root
-                if root and os.path.isdir(root):
-                    tpl_dir = os.path.join(root, "templates")
-                    os.makedirs(tpl_dir, exist_ok=True)
-                    return tpl_dir
+            if pm and pm.is_open() and pm.project_root:
+                cur = getattr(mw, "_current_path", None)
+                d = asset_store.assets_dir_for(pm.project_root, cur)
+                if os.path.isdir(d):
+                    return d
         except Exception:
             pass
         return os.path.expanduser("~")
+
+    def _project_asset_rel(self, src_path: str, prefix: str) -> str:
+        """把外部图片拷进「当前蓝图对应的 res 目录」，返回相对工程根的路径（失败返回空串）。"""
+        try:
+            from src.blueprint.core import asset_store
+
+            mw = self.window()
+            pm = getattr(mw, "_pm", None)
+            if not (pm and pm.is_open() and pm.project_root):
+                return ""
+            return asset_store.copy_into_store(
+                pm.project_root, getattr(mw, "_current_path", None), src_path, prefix=prefix
+            )
+        except Exception:
+            return ""
 
     def _ifimg_import_files(self):
         default_dir = self._get_project_templates_dir()
@@ -1667,11 +1684,24 @@ class InspectorPanel(QWidget):
         arr = self._parse_ifimg_list()
         for p in paths:
             try:
+                # 先拷进该蓝图对应的 res/ 目录：资源跟着蓝图走，搬移/清理都清爽
+                rel = self._project_asset_rel(p, "ifimg_import")
+                if not rel:
+                    try:
+                        from PySide6.QtWidgets import QMessageBox
+                        QMessageBox.warning(
+                            self, "导入失败",
+                            f"无法把图片拷贝到工程的 res/ 资源目录：\n{p}\n\n"
+                            "请先新建或打开一个 BlueprintAutomation 工程后再导入。"
+                        )
+                    except Exception:
+                        pass
+                    return
                 pil = Image.open(p) if Image is not None else None
                 w, h = pil.size if pil is not None else (0, 0)
                 item: Dict[str, Any] = {
                     "id": self._gen_id(),
-                    "path": str(p),
+                    "path": rel,
                     "w": int(w),
                     "h": int(h),
                 }
@@ -1691,6 +1721,19 @@ class InspectorPanel(QWidget):
     def _gen_id() -> str:
         import uuid
         return uuid.uuid4().hex[:8]
+
+    @staticmethod
+    def _real_img_path(p: str) -> str:
+        """把蓝图里存的图片路径解析成真实存在的路径（相对工程根的新式 res/ 路径也能解析）。"""
+        if not isinstance(p, str) or not p:
+            return ""
+        try:
+            from src.config.app_paths import get_img_path
+
+            real = get_img_path(p)
+            return real if os.path.exists(real) else ""
+        except Exception:
+            return p if os.path.exists(p) else ""
 
     def _append_ifimg_grid(self):
         """在表单底部追加：统计Label + 缩略图网格 + 逐张删除按钮"""
@@ -1761,9 +1804,10 @@ class InspectorPanel(QWidget):
         if isinstance(b64, str) and b64:
             pil = self._b64_to_pil(b64)
         path = item.get("path", "")
-        if pil is None and isinstance(path, str) and path and os.path.exists(path) and Image is not None:
+        real_path = self._real_img_path(path if isinstance(path, str) else "")
+        if pil is None and real_path and Image is not None:
             try:
-                pil = Image.open(path)
+                pil = Image.open(real_path)
             except Exception:
                 pil = None
         w = int(item.get("w", 0) or 0)
@@ -2681,8 +2725,9 @@ class InspectorPanel(QWidget):
                 path = str(item.get("path", "") or "")
                 b64 = str(item.get("b64", "") or "")
                 use_path = None
-                if isinstance(path, str) and path and os.path.exists(path):
-                    use_path = path
+                real_p = self._real_img_path(path)
+                if real_p:
+                    use_path = real_p
                 elif isinstance(b64, str) and b64:
                     try:
                         tpl_pil = self._b64_to_pil(b64)
@@ -3147,25 +3192,20 @@ class InspectorPanel(QWidget):
                 pil = Image.open(path)
         except Exception:
             pil = None
-        # 保存到 templates 目录（对齐「📸 截取目标」的行为）
+        # 保存到该蓝图对应的 res 目录（对齐「📸 截取目标」的行为）
         final_path = path
         try:
-            import shutil, uuid, time
-            from src.config.app_paths import template_dir
-            tpl_dir = template_dir()
-            os.makedirs(tpl_dir, exist_ok=True)
-            ext = os.path.splitext(path)[1] or ".png"
-            fname = f"findimg_import_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}{ext}"
-            fpath = os.path.join(tpl_dir, fname)
-            shutil.copy2(path, fpath)
-            final_path = fpath
+            rel = self._project_asset_rel(path, "findimg_import")
+            if not rel:
+                raise RuntimeError("未打开工程或拷贝失败")
+            final_path = rel
         except Exception as e_img:
-            # 未开工程等场景：template_dir() 会直接抛 RuntimeError，必须显式拒绝而不是静默吞
+            # 未开工程等场景：必须显式拒绝而不是静默吞（否则路径指向工程外的原图，搬移即失效）
             try:
                 from PySide6.QtWidgets import QMessageBox
                 QMessageBox.warning(
                     self, "导入模板失败",
-                    f"无法将模板图片拷贝到工程 templates/ 目录：\n{e_img}\n\n"
+                    f"无法把模板图片拷贝到工程的 res/ 资源目录：\n{e_img}\n\n"
                     "请先新建或打开一个 BlueprintAutomation 工程后再导入图片。"
                 )
             except Exception:
@@ -4219,7 +4259,7 @@ class InspectorPanel(QWidget):
         self._form.addRow(hint)
 
     def _replace_component_path_with_combobox(self):
-        """Component：blueprint_path 输入框替换为下拉列表（扫描工程 components/ 目录下的 .bp.json）。"""
+        """Component：blueprint_path 输入框替换为下拉列表（列出工程里所有「组件蓝图」）。"""
         if self._current_node is None or self._current_node.type != "Component":
             return
         w_bp = self._widgets.get("blueprint_path")
@@ -4234,7 +4274,7 @@ class InspectorPanel(QWidget):
                 break
         if target_row < 0:
             return
-        # 扫描 components/ 目录下的蓝图
+        # 收集工程里所有「组件蓝图」（按 bp_type 判定，与所在目录无关）
         components = self._scan_component_blueprints()
         combo = _disable_wheel(QComboBox())
         combo.setStyleSheet(self._edit_style())
@@ -4259,7 +4299,10 @@ class InspectorPanel(QWidget):
         self._form.removeRow(target_row)
         new_label = QLabel("组件蓝图")
         new_label.setStyleSheet("color: #C9D1D9; font-size: 9px;")
-        new_label.setToolTip("从工程 components/ 目录下选择要复用的蓝图")
+        new_label.setToolTip(
+            "选择一张「组件蓝图」来调用。\n"
+            "组件蓝图放在哪个目录都可以（资源树里右键蓝图 → 🧩 设为组件蓝图）。"
+        )
         self._form.insertRow(target_row, new_label, combo)
         self._widgets["blueprint_path"] = combo
         # 便捷入口：直接跳过去编辑该组件（在画布上双击组件节点效果相同）
@@ -4276,30 +4319,35 @@ class InspectorPanel(QWidget):
         )
         self._form.addRow(btn_open)
         if not components:
-            combo.setToolTip("当前工程没有 components/ 目录或目录下没有 .bp.json 蓝图。\n"
-                             "请先把要复用的蓝图保存到工程 components/ 子目录下。")
+            combo.setToolTip(
+                "当前工程里还没有任何「组件蓝图」。\n"
+                "在资源树里右键任意蓝图 → 🧩 设为组件蓝图，或点「＋组件」新建一张，"
+                "它就会出现在这里。"
+            )
 
     def _scan_component_blueprints(self) -> List[tuple]:
-        """扫描当前工程 components/ 目录下的所有 .bp.json，返回 [(相对路径, 绝对路径)]。"""
+        """扫描整个工程里「被标记为组件蓝图」的 .bp.json，返回 [(相对工程根路径, 绝对路径)]。
+
+        组件放哪个目录由用户决定，所以扫全工程（跳过 cache/debug 等运行产物目录），
+        再按蓝图自身的 bp_type 元数据过滤 —— 不再看它在不在 components/ 目录下。
+        """
         results: List[tuple] = []
         try:
+            from src.blueprint.core import asset_store, bp_kind
             from src.blueprint.project_manager import ProjectManager
+
             pm = ProjectManager.instance()
             if not pm.is_open() or not pm.project_root:
                 return results
-            comp_dir = os.path.join(pm.project_root, "components")
-            if not os.path.isdir(comp_dir):
-                return results
-            for root, _dirs, files in os.walk(comp_dir):
-                for f in files:
-                    if not f.endswith(".bp.json"):
-                        continue
-                    abs_path = os.path.join(root, f)
-                    try:
-                        rel = os.path.relpath(abs_path, pm.project_root).replace("\\", "/")
-                    except Exception:
-                        rel = f
-                    results.append((rel, abs_path))
+            root = pm.project_root
+            for bp in asset_store.iter_project_blueprints(root):
+                if not bp_kind.is_component(bp, root):
+                    continue
+                try:
+                    rel = os.path.relpath(bp, root).replace("\\", "/")
+                except Exception:
+                    rel = os.path.basename(bp)
+                results.append((rel, bp))
             results.sort(key=lambda x: x[0].lower())
         except Exception:
             pass

@@ -263,15 +263,15 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         type="Component",
         category=CATEGORY_LOGIC,
         title="调用组件",
-        description="把一个蓝图当作「预制体/组件」复用~选中工程 components/ 目录下的一张蓝图，跑到咱这里就跳到那张蓝图去跑一遍，跑完再回来继续。\n\n支持显式传参：左侧 in_0/in_1… 输入端口把值传给子蓝图的 Start 入参端口，子蓝图 End 的返回值会回到右侧 out_0/out_1… 输出端口。变量仍然全局共享。",
+        description="把一个蓝图当作「预制体/组件」复用~选中工程里任意一张「组件蓝图」，跑到咱这里就跳到那张蓝图去跑一遍，跑完再回来继续。\n\n组件蓝图放在哪个目录都可以（资源树里右键蓝图 → 🧩 设为组件蓝图）。\n\n支持显式传参：左侧 in_0/in_1… 输入端口把值传给子蓝图的 Start 入参端口，子蓝图 End 的返回值会回到右侧 out_0/out_1… 输出端口。变量仍然全局共享。",
         color="#1F6FEB",
         accent="#58A6FF",
         inputs=[_exec_in("in_exec", label="▶")],
         outputs=[_exec_out("out_done", label="完成")],
         params=[
             ParamDef(name="blueprint_path", editor=EDITOR_STRING, default="", label="组件蓝图",
-                     placeholder="从下拉列表选择 components/ 目录下的蓝图",
-                     help="要复用的那张蓝图（工程 components/ 目录下的 .bp.json）。从下拉列表选择即可，无需手填路径。"),
+                     placeholder="从下拉列表选择一张组件蓝图",
+                     help="要复用的那张蓝图（工程里任何位置的 .bp.json，只要被标为组件蓝图）。从下拉列表选择即可，无需手填路径。"),
             ParamDef(name="num_inputs", editor=EDITOR_INT, default=0, min=0, max=20,
                      label="输入参数端口数",
                      help="传给子蓝图 Start 入参端口的参数个数（in_0/in_1… 数据输入端口）。\n"

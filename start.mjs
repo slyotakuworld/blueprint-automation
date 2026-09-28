@@ -252,6 +252,7 @@ async function main() {
   }
 
   switch (choice) {
+    case '1':
     case 'run': {
       if (!(await ensureDeps(py, { force }))) {
         warn('依赖未完全就绪，仍尝试启动编辑器（缺包时会报导入错误）。');
