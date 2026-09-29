@@ -19,6 +19,8 @@ env/
 config*.json
 *.local.json
 *.log
+# 编辑器界面状态记忆（画布缩放/位置、资源树展开目录），含本机绝对路径，仅本地
+editor_prefs.json
 .env
 cache/
 debug/

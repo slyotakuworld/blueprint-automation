@@ -51,8 +51,8 @@ CATEGORY_NODE_ORDER: Dict[str, List[str]] = {
     CATEGORY_LOGIC: [
         "Start",         # 1、开始
         "End",           # 2、结束
-        "Loop",          # 3、循环
-        "Component",     # 4、调用组件（蓝图复用/预制体）
+        "Component",     # 3、组件（蓝图复用/预制体）
+        "Loop",          # 4、循环
         "Sequence",      # 5、顺序执行（纯串行队列，子画布容器）
         "Parallel",      # 6、并行执行（多分支并发，子画布容器）
         "SetVariable",   # 7、变量
@@ -209,6 +209,8 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
             _exec_out("out_exit", label="退出"),
         ],
         params=[
+            ParamDef(name="loop_body", editor=EDITOR_MULTILINE, default="", label="循环体子图(只读)",
+                     help="内部字段，保存循环体子画布内容。双击本节点进入子画布编辑，无需手填。"),
             ParamDef(name="infinite", editor=EDITOR_BOOL, default=False, label="无限循环",
                      help="勾选后忽略最大迭代次数，仅手动停止或条件退出才结束（慎用）"),
             ParamDef(name="max_iterations", editor=EDITOR_INT, default=5, label="最大迭代",
@@ -262,7 +264,7 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
     "Component": NodeMeta(
         type="Component",
         category=CATEGORY_LOGIC,
-        title="调用组件",
+        title="组件",
         description="把一个蓝图当作「预制体/组件」复用~选中工程里任意一张「组件蓝图」，跑到咱这里就跳到那张蓝图去跑一遍，跑完再回来继续。\n\n组件蓝图放在哪个目录都可以（资源树里右键蓝图 → 🧩 设为组件蓝图）。\n\n支持显式传参：左侧 in_0/in_1… 输入端口把值传给子蓝图的 Start 入参端口，子蓝图 End 的返回值会回到右侧 out_0/out_1… 输出端口。变量仍然全局共享。",
         color="#1F6FEB",
         accent="#58A6FF",
@@ -288,7 +290,7 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         type="Wait",
         category=CATEGORY_EXECUTE,
         title="等待",
-        description="歇会儿再接着跑~要么固定睡几秒，要么在范围内随机小睡更像真人，上游传过来秒数也能用，实际等了多久还能输出给下游用哟。",
+        description="歇会儿再接着跑~要么固定睡几秒，要么在范围内随机小睡更像真人，上游传过来的秒数也能直接拿来用哟。",
         color="#2D333B",
         accent="#8B949E",
         inputs=[

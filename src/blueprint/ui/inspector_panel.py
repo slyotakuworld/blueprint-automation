@@ -1466,6 +1466,9 @@ class InspectorPanel(QWidget):
                 w_inf = self._widgets.get("infinite")
                 if isinstance(w_inf, QCheckBox):
                     w_inf.toggled.connect(lambda _: self._apply_loop_infinite_visibility())
+                # 循环体子画布内容（loop_body 只读字段）不进属性面板，双击节点进入编辑
+                self._hide_param_row("loop_body")
+                self._append_subgraph_hint("双击本节点进入「循环体」子画布编辑每圈要跑的内容")
             except Exception as e:
                 print(f"[Inspector] Loop UI 出错: {e}")
 

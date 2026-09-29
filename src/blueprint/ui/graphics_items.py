@@ -385,7 +385,7 @@ class NodeItem(QGraphicsObject):
             stem = bp.replace("\\", "/").rsplit("/", 1)[-1]
             if stem.lower().endswith(".bp.json"):
                 stem = stem[: -len(".bp.json")]
-            return f"🧩 调用组件：{stem}"
+            return f"🧩 组件：{stem}"
         if t == "Parallel":
             return "并行体（双击进入子画布）"
         if t == "Loop":
@@ -396,16 +396,7 @@ class NodeItem(QGraphicsObject):
             max_it = int(p.get("max_iterations", 5) or 5)
             return f"循环{max_it}次  间隔{interval:g}s"
         if t == "Sequence":
-            mode = str(p.get("mode", "short_circuit") or "short_circuit")
-            if mode == "complete":
-                mode_txt = "完全求值"
-            elif mode == "or_true":
-                mode_txt = "一真即真"
-            else:
-                mode_txt = "短路模式"
-            interval = float(p.get("interval_sec", 1.0) or 1.0)
-            num = int(p.get("num_paths", 3) or 3)
-            return f"[{mode_txt}] {num}路径  间隔{interval:g}s"
+            return "顺序体（双击进入子画布）"
         if t == "Notify":
             msg = str(p.get("message", "") or "").strip()
             duration = float(p.get("duration_sec", 3.0) or 3.0)

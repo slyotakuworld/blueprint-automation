@@ -487,11 +487,7 @@ def execute_Loop(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
         note = f"Loop ∞ i={counter+1} -> loop_body"
         annotate_step(ctx, node, "loop", note=note)
         ctx.log(f"[Loop] {node.id[:6]}  ∞ i={counter+1} -> loop_body", "DEBUG")
-        return (
-            {"out_iteration": counter + 1, "out_max": -1},
-            ["loop_body"],
-            "",
-        )
+        return {}, ["loop_body"], ""
     elif counter < max_it:
         ctx.loop_counters[node.id] = counter + 1
         if interval > 0 and ctx.is_running:
@@ -503,11 +499,7 @@ def execute_Loop(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
         note = f"Loop i={counter+1}/{max_it} -> loop_body"
         annotate_step(ctx, node, "loop", note=note)
         ctx.log(f"[Loop] {node.id[:6]}  i={counter+1}/{max_it} -> loop_body", "DEBUG")
-        return (
-            {"out_iteration": counter + 1, "out_max": max_it},
-            ["loop_body"],
-            "",
-        )
+        return {}, ["loop_body"], ""
     else:
         ctx.log(
             f"[Loop] {node.id[:6]} 达到 max_iterations={max_it}，退出循环。",
@@ -515,11 +507,7 @@ def execute_Loop(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
         )
         annotate_step(ctx, node, "loop", note=f"EXIT: hit max={max_it}")
         ctx.loop_counters.pop(node.id, None)
-        return (
-            {"out_iteration": counter, "out_max": max_it},
-            ["out_exit"],
-            "",
-        )
+        return {}, ["out_exit"], ""
 
 
 def _execute_loop_body_container(
@@ -589,7 +577,7 @@ def _execute_loop_body_container(
                 ctx.log(f"[Loop] {node.id[:6]} 达到 max_iterations={max_it}，退出循环。", "WARN")
                 annotate_step(ctx, node, "loop", note=f"EXIT: hit max={max_it}")
                 ctx.loop_counters.pop(node.id, None)
-                return {"out_iteration": iteration, "out_max": max_it}, ["out_exit"], ""
+                return {}, ["out_exit"], ""
             ctx.loop_counters[node.id] = iteration + 1
 
         _interval_wait()
@@ -602,13 +590,13 @@ def _execute_loop_body_container(
             ctx.log(f"[Loop] {node.id[:6]} 循环体内 Break → 跳出循环。", "INFO")
             annotate_step(ctx, node, "loop", note="Break → out_exit")
             ctx.loop_counters.pop(node.id, None)
-            return {"out_iteration": iteration + 1, "out_max": -1 if infinite else max_it}, ["out_exit"], ""
+            return {}, ["out_exit"], ""
         if ctrl == "stop":
-            return {"out_iteration": iteration + 1, "out_max": max_it}, [], "运行被停止"
+            return {}, [], "运行被停止"
         # ctrl == "continue" 或 "end"：进入下一轮
         iteration += 1
 
-    return {"out_iteration": iteration, "out_max": max_it}, [], ""
+    return {}, [], ""
 
 
 def execute_Continue(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
@@ -655,7 +643,7 @@ def execute_Wait(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
         time.sleep(0.05)
     wait_if_paused(ctx)
     annotate_step(ctx, node, "wait", note=note)
-    return {"out_waited_sec": round(sec, 4)}, ["out_exec"], ""
+    return {}, ["out_exec"], ""
 
 
 # ============================================================
@@ -671,7 +659,7 @@ def execute_OpenApp(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
         msg = "[OpenApp] path 为空，未启动任何程序。"
         ctx.log(msg, "WARN")
         annotate_step(ctx, node, "open_app", note="FAIL(path空)")
-        return {"out_pid": None, "out_path": path_raw}, ["fail"], msg
+        return {}, ["fail"], msg
     # 路径插值（允许 {game_dir}/xx.exe 这种）
     try:
         from src.blueprint.core.variable_engine import VariableEngine
@@ -706,16 +694,16 @@ def execute_OpenApp(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
             note = f"OpenApp PID={pid}  wait={wait_sec}s"
             ctx.log(f"[OpenApp] {note}", "SUCCESS")
             annotate_step(ctx, node, "open_app", note=note)
-            return {"out_pid": pid, "out_path": path_raw}, ["out"], ""
+            return {}, ["out"], ""
         else:
             ctx.log(f"[OpenApp] FAIL: {msg}", "WARN")
             annotate_step(ctx, node, "open_app", note=f"FAIL: {str(msg)[:60]}")
-            return {"out_pid": None, "out_path": path_raw}, ["fail"], str(msg or "启动失败")
+            return {}, ["fail"], str(msg or "启动失败")
     except Exception as e:
         tb = traceback.format_exc()
         ctx.log(f"[OpenApp] 异常: {e}\n{tb}", "ERROR")
         annotate_step(ctx, node, "open_app", note=f"Exception: {type(e).__name__}")
-        return {"out_pid": None, "out_path": path_raw}, ["fail"], str(e)
+        return {}, ["fail"], str(e)
 
 
 def _enum_windows_win32():
@@ -3764,14 +3752,13 @@ def execute_SoundDetect(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any
                 "WARN",
             )
             annotate_step(ctx, node, "sound", note="采集库不可用→no")
-            return {"out_level_db": None}, ["no"], ""
+            return {}, ["no"], ""
 
         # 计算峰值dB和均值dB
         peak = float(np.max(np.abs(chunk)) + 1e-8)
         mean = float(np.mean(np.abs(chunk)) + 1e-8)
         peak_db = float(20.0 * np.log10(peak))
         mean_db = float(20.0 * np.log10(mean))
-        out_db = peak_db
 
         # 每次采集都输出（INFO），方便排查采集问题
         ctx.log(f"[if_sound] 采集结果: peak={peak_db:.1f}dB mean={mean_db:.1f}dB thr={thr_db:.0f}dB mode={mode}", "INFO")
@@ -3806,7 +3793,7 @@ def execute_SoundDetect(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any
             mode_cn = "检测声音" if mode == "detect_sound" else "检测静音"
             ctx.log(f"[if_sound] ✅ {mode_cn} 满足条件：{note}", "DEBUG")
             annotate_step(ctx, node, "sound", note=f"YES[{mode_cn}] peak={peak_db:.1f}dB")
-            return {"out_level_db": round(out_db, 2)}, ["yes"], ""
+            return {}, ["yes"], ""
 
         # 轮询间隔（避免死循环占CPU）
         t_slp = time.time()
@@ -3823,7 +3810,7 @@ def execute_SoundDetect(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any
         "DEBUG",
     )
     annotate_step(ctx, node, "sound", note=f"TIMEOUT[{mode_cn}] last={note[:60]}")
-    return {"out_level_db": None}, ["no"], ""
+    return {}, ["no"], ""
 
 
 # ============================================================

@@ -114,14 +114,14 @@
           "file": "node_End.md"
         },
     {
+      "id": "node_component",
+      "title": "组件",
+      "file": "node_Component.md"
+    },
+    {
       "id": "node_loop",
       "title": "循环",
       "file": "node_Loop.md"
-    },
-    {
-      "id": "node_component",
-      "title": "调用组件",
-      "file": "node_Component.md"
     },
     {
       "id": "node_sequence",
