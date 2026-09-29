@@ -3645,8 +3645,7 @@ def execute_StillnessDetect(ctx: ExecutionContext, node: Node, inputs: Dict[str,
 # ---------------- 检测：声音 if_sound ----------------
 def _capture_sound_blocking(device: str, duration_sec: float, sr: int = 44100):
     """采集一段系统音频，失败返回 None。
-    首选 soundcard（支持 default_loopback 录系统扬声器自己播放的声音），
-    不可用回退 PyAudio（麦克风为主）。
+    使用 soundcard（支持 default_loopback 录系统扬声器自己播放的声音）。
     """
     import numpy as np
     # 1) soundcard 首选（WASAPI loopback 稳定）
@@ -3684,43 +3683,7 @@ def _capture_sound_blocking(device: str, duration_sec: float, sr: int = 44100):
             return None
         return arr
     except Exception:
-        pass
-    # 2) PyAudio 兜底（仅对非 default_loopback 设备使用，避免用麦克风代替系统环回）
-    if device != "default_loopback":
-        try:
-            import pyaudio
-            p = pyaudio.PyAudio()
-            stream = p.open(
-                format=pyaudio.paFloat32,
-                channels=1,
-                rate=sr,
-                input=True,
-                frames_per_buffer=1024,
-            )
-            frames: List[Any] = []
-            total = int(sr * max(0.01, duration_sec))
-            chunk = 1024
-            while len(frames) * chunk < total:
-                try:
-                    raw = stream.read(chunk, exception_on_overflow=False)
-                    frames.append(np.frombuffer(raw, dtype=np.float32))
-                except Exception:
-                    break
-            try:
-                stream.stop_stream()
-                stream.close()
-                p.terminate()
-            except Exception:
-                pass
-            if frames:
-                arr = np.concatenate(frames)
-                # 同样检查全零数据
-                if float(np.max(np.abs(arr))) < 1e-7:
-                    return None
-                return arr
-        except Exception:
-            return None
-    return None
+        return None
 
 
 def _ascii_waveform(data, peak_marker_db: float = -30.0, width: int = 60, height: int = 7) -> str:
@@ -3762,7 +3725,7 @@ def execute_SoundDetect(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any
     """
     if_sound 节点：系统播放/麦克风声音检测。
     - judge_mode: detect_sound(检测声音) / detect_silence(检测静音)
-    - 失败兜底：soundcard → PyAudio，都不可用 WARN 走 no
+    - 采集失败（soundcard 不可用/设备不可用）时 WARN 走 no
     """
     import numpy as np
 
@@ -3797,8 +3760,7 @@ def execute_SoundDetect(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any
         if chunk is None:
             ctx.log(
                 "[if_sound] 音频采集库未安装或设备不可用，自动走 no。请先执行："
-                " pip install soundcard pyaudio "
-                "（PyAudio 安装失败可尝试： pip install pipwin && pipwin install pyaudio ）",
+                " pip install soundcard ",
                 "WARN",
             )
             annotate_step(ctx, node, "sound", note="采集库不可用→no")

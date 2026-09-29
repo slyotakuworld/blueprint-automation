@@ -158,9 +158,8 @@ async function ensureDeps(py, { force = false } = {}) {
   // 刻意不升级 pip：受限环境下 pip 自卸载会触发安全删除失败，导致 venv 的 pip 损坏。
   const code = await runStreamed(py, ['-m', 'pip', 'install', '-r', REQUIREMENTS]);
   if (code !== 0) {
-    warn('pip 退出码非 0（个别包如 PyAudio 可能需要编译环境）。');
+    warn('pip 退出码非 0。');
     warn(`  可稍后手动重试：${VENV_PY} -m pip install -r requirements.txt`);
-    warn('  PyAudio 编译报错的解决办法见：assets/doc/44_faq_env.md');
     return false;
   }
   ok('依赖安装完成');

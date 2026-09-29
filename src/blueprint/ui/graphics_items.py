@@ -680,12 +680,21 @@ class NodeItem(QGraphicsObject):
         return []
 
     def _has_summary(self) -> bool:
-        """是否支持摘要显示区域（用于固定节点高度，避免有/无内容时高度跳变）。"""
+        """是否支持摘要显示区域（用于固定节点高度，避免有/无内容时高度跳变）。
+
+        ⚠ 这里必须与 _summary_text()/_summary_lines() 支持的节点类型保持一致：
+        只要 paint() 会画摘要，就必须在此登记。否则 node_height() 不预留摘要高度，
+        boundingRect() 会比实际绘制内容矮一截，摘要文字被画到卡片外——
+        而 QGraphicsView 用的是 BoundingRectViewportUpdate，超出 boundingRect 的像素
+        在节点移动时不会被重绘，表现为拖动节点时留下一串"拖影"。
+        （Component / Parallel 之前就是漏登记的两种，已补上。）
+        """
         return self.node.type in (
             "OpenApp", "BindWindow", "WebBrowser", "Command", "HttpRequest",
             "Loop", "Sequence", "Notify", "VarSwitch", "Clipboard", "SetVariable",
             "Mouse", "PressKey", "Wait",
             "StillnessDetect", "IfImageDetect", "FindImage", "SoundDetect",
+            "Component", "Parallel",
         )
 
     def _preview_extra_height(self) -> int:

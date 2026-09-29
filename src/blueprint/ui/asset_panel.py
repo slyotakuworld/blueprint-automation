@@ -14,11 +14,12 @@
 
 from __future__ import annotations
 
+import json
 import os
 from typing import Dict, List, Optional, Set
 
-from PySide6.QtCore import Qt, QFileSystemWatcher, QMimeData, QTimer, Signal
-from PySide6.QtGui import QAction, QBrush, QColor, QDrag, QFont
+from PySide6.QtCore import QPointF, Qt, QFileSystemWatcher, QMimeData, QTimer, Signal
+from PySide6.QtGui import QAction, QBrush, QColor, QDrag, QFont, QPainter, QPolygonF
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QHBoxLayout,
@@ -58,6 +59,10 @@ _MAX_ITEMS_PER_DIR = 500  # 单个目录最多显示多少条（超出显示「�
 _MAX_ITEMS = 20000        # 整树兜底上限
 _MAX_WATCH_DIRS = 200   # 文件监听最多注册的目录数（防止超深目录树拖慢）
 _MAX_RECENT = 10        # 「最近打开」保留条数
+_MAX_PREFS_DIRS = 300   # 每个工程最多记住多少个「已展开目录」（防止偏好文件膨胀）
+
+# 资源树「已展开目录」在 editor_prefs.json 里的键前缀（与主窗口的 view:: 视图记录共用一个文件）
+_TREE_PREFS_PREFIX = "tree::"
 
 # 类型配色（深色主题）：普通蓝图=蓝，组件蓝图=橙（与画布上 Component 节点同色系）
 _COLOR_BP = "#79C0FF"
@@ -76,11 +81,72 @@ def _bp_stem(filename: str) -> str:
     return filename
 
 
+def _editor_prefs_path() -> str:
+    """编辑器偏好文件路径（与主窗口的视图缩放记录共用同一个文件）。"""
+    try:
+        from src.config.app_paths import get_app_dir
+
+        return os.path.join(get_app_dir(), "editor_prefs.json")
+    except Exception:
+        return ""
+
+
+def _tree_prefs_key(root: str) -> str:
+    """某工程的「已展开目录」在偏好文件里的键。"""
+    try:
+        return _TREE_PREFS_PREFIX + os.path.normcase(os.path.abspath(root))
+    except Exception:
+        return _TREE_PREFS_PREFIX + str(root or "")
+
+
 
 class _AssetTree(QTreeWidget):
     """资源树：额外提供「拖蓝图到画布」的拖拽起手（MIME = NodeView.ASSET_MIME）。"""
 
     ASSET_MIME = "application/x-bp-asset"   # 与 NodeView.ASSET_MIME 保持一致（画布侧接收）
+
+    _ARROW_COLOR = "#8B949E"                # 折叠/展开箭头（未选中）
+    _ARROW_COLOR_ACTIVE = "#FFFFFF"         # 选中行上的箭头（深色主题下才看得清）
+
+    def drawBranches(self, painter: QPainter, rect, index):
+        """自绘展开/折叠箭头。
+
+        为什么必须自绘：深色主题的样式表一旦命中 ::branch 子控件，Qt 就不再绘制默认展开箭头
+        （旧写法 `QTreeWidget::branch { background:transparent; }` 就是这样）。结果折叠的目录
+        看起来和「没有内容、也不可展开」的死叶子一模一样——components/ 里的组件蓝图因此被
+        误判成「不显示」。这里统一画一个高对比度小三角：有子节点才画，展开朝下、折叠朝右。
+        """
+        try:
+            model = index.model()
+            if model is None or not model.hasChildren(index):
+                return
+            ind = float(self.indentation())
+            # rect 是该行「分支区域」的整体矩形：宽度 = indentation * (层级 + 1)，
+            # 本层箭头画在最右侧那一段的正中。
+            cx = rect.x() + rect.width() - ind / 2.0
+            cy = rect.y() + rect.height() / 2.0
+            color = QColor(self._ARROW_COLOR)
+            sel = self.selectionModel()
+            if sel is not None and sel.isSelected(index):
+                color = QColor(self._ARROW_COLOR_ACTIVE)
+            painter.save()
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(color))
+            tri = QPolygonF()
+            s = 3.2
+            if self.isExpanded(index):
+                tri.append(QPointF(cx - s, cy - s * 0.6))
+                tri.append(QPointF(cx + s, cy - s * 0.6))
+                tri.append(QPointF(cx, cy + s * 0.9))
+            else:
+                tri.append(QPointF(cx - s * 0.6, cy - s))
+                tri.append(QPointF(cx - s * 0.6, cy + s))
+                tri.append(QPointF(cx + s * 0.9, cy))
+            painter.drawPolygon(tri)
+            painter.restore()
+        except Exception:
+            pass
 
     def startDrag(self, supportedActions):
         items = self.selectedItems() or []
@@ -130,7 +196,79 @@ class AssetPanel(QWidget):
         self._fs_timer.setSingleShot(True)
         self._fs_timer.setInterval(700)       # 防抖：一次批量写入只刷新一次
         self._fs_timer.timeout.connect(self._on_fs_debounce)
+        # 展开状态落盘（防抖）：重启后资源树保持上次的样子，组件目录不会「消失」
+        self._prefs_timer = QTimer(self)
+        self._prefs_timer.setSingleShot(True)
+        self._prefs_timer.setInterval(500)
+        self._prefs_timer.timeout.connect(self._save_expanded)
         self._build_ui()
+
+    # ============================================================
+    # 展开状态持久化（重启后资源树保持一致）
+    # ============================================================
+    def _load_expanded(self, root: str) -> Set[str]:
+        """读出该工程上次展开的目录（绝对路径集合）。读不到返回空集合。"""
+        out: Set[str] = set()
+        p = _editor_prefs_path()
+        if not p or not os.path.isfile(p):
+            return out
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            rels = data.get(_tree_prefs_key(root)) if isinstance(data, dict) else None
+        except Exception:
+            return out
+        if not isinstance(rels, list):
+            return out
+        base = os.path.abspath(root)
+        for rel in rels:
+            if not isinstance(rel, str) or not rel:
+                continue
+            try:
+                full = os.path.normpath(os.path.join(base, *rel.split("/")))
+            except Exception:
+                continue
+            if full == base or (full.startswith(base + os.sep) and os.path.isdir(full)):
+                out.add(full)
+        return out
+
+    def _save_expanded(self):
+        """把当前展开的目录（相对工程根）写进偏好文件；只动自己那个键，不碰主窗口的视图记录。"""
+        root = self._project_root
+        p = _editor_prefs_path()
+        if not root or not p:
+            return
+        try:
+            base = os.path.abspath(root)
+        except Exception:
+            return
+        rels: List[str] = []
+        for path in sorted(self._expanded):
+            try:
+                ap = os.path.abspath(path)
+            except Exception:
+                continue
+            if ap == base or not ap.startswith(base + os.sep):
+                continue
+            rels.append(os.path.relpath(ap, base).replace("\\", "/"))
+            if len(rels) >= _MAX_PREFS_DIRS:
+                break
+        try:
+            data: dict = {}
+            if os.path.isfile(p):
+                try:
+                    with open(p, "r", encoding="utf-8") as f:
+                        cur = json.load(f)
+                    if isinstance(cur, dict):
+                        data = cur
+                except Exception:
+                    data = {}
+            data[_tree_prefs_key(root)] = rels
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
 
     # ============================================================
     # UI
@@ -193,7 +331,9 @@ class AssetPanel(QWidget):
             "QTreeWidget::item { padding:2px 2px; }"
             "QTreeWidget::item:selected { background:#1F6FEB; color:#FFFFFF; }"
             "QTreeWidget::item:hover { background:#1C2430; }"
-            "QTreeWidget::branch { background:transparent; }"
+            # ⚠ 不要给 QTreeWidget::branch 写任何样式：一旦命中该子控件，Qt 就不再绘制
+            #   默认展开箭头，折叠目录会看起来「不可展开、里面没东西」。
+            #   展开/折叠箭头改由 _AssetTree.drawBranches 自绘。
         )
         root.addWidget(self._tree, 1)
 
@@ -233,7 +373,9 @@ class AssetPanel(QWidget):
         """工程切换时调用：更新根目录并重建资源树。"""
         self._project_root = project_root or None
         self._project_name = project_name or ""
-        self._expanded.clear()
+        # 恢复该工程上次展开的目录：重启后资源树保持原样，
+        # 不会出现「上次明明看得到 components/ 里的组件，这次全被折叠起来」的错觉。
+        self._expanded = self._load_expanded(self._project_root) if self._project_root else set()
         self._last_root = self._project_root
         self._last_name = self._project_name
         self._recent = [p for p in self._recent if self._project_root and self._under_root(p)]
@@ -686,6 +828,7 @@ class AssetPanel(QWidget):
         p = item.data(0, Qt.UserRole)
         if p:
             self._expanded.add(p)
+            self._prefs_timer.start()
         # 展开时补扫一次：即便建树时被截断/竞态漏掉，也能在这儿补上，保证双击一定看得到文件
         try:
             self._ensure_children(item)
@@ -696,6 +839,7 @@ class AssetPanel(QWidget):
         p = item.data(0, Qt.UserRole)
         if p:
             self._expanded.discard(p)
+            self._prefs_timer.start()
 
     def _on_item_double_clicked(self, item: QTreeWidgetItem, _col: int):
         path = item.data(0, Qt.UserRole)

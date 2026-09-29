@@ -3491,7 +3491,7 @@ class InspectorPanel(QWidget):
         combo.currentIndexChanged.connect(_on_change)
 
     def _sound_refresh_devices(self, combo: QComboBox, select_val: str = ""):
-        """枚举音频设备并填充 QComboBox；仅用 soundcard（无PyAudio重复），按id去重避免一堆重复项。"""
+        """枚举音频设备并填充 QComboBox；仅用 soundcard，按id去重避免一堆重复项。"""
         if combo is None:
             return
         try:
@@ -3551,31 +3551,17 @@ class InspectorPanel(QWidget):
                 pass
 
     def _sound_check_deps(self) -> bool:
-        """检查 soundcard / PyAudio 是否安装，未安装弹提示并返回 False"""
-        ok_sc = True
-        ok_pa = True
+        """检查 soundcard 是否安装，未安装弹提示并返回 False"""
         try:
             import soundcard  # noqa: F401
-        except Exception:
-            ok_sc = False
-        try:
-            import pyaudio  # noqa: F401
-        except Exception:
-            ok_pa = False
-        if ok_sc and ok_pa:
             return True
-        tips = []
-        if not ok_sc:
-            tips.append("soundcard 未安装")
-        if not ok_pa:
-            tips.append("PyAudio 未安装")
+        except Exception:
+            pass
         msg = (
-            "声音检测依赖以下 Python 库：\n\n"
-            "  ❌ " + "；".join(tips) + "\n\n"
+            "声音检测依赖 Python 库 soundcard：\n\n"
+            "  [X] soundcard 未安装\n\n"
             "请先在终端执行：\n"
-            "  pip install soundcard pyaudio\n\n"
-            "如 PyAudio 安装失败，可尝试：\n"
-            "  pip install pipwin && pipwin install pyaudio\n\n"
+            "  pip install soundcard\n\n"
             "安装完成后请检查：\n"
             "  1. 重新选中本节点刷新设备列表\n"
             "  2. 扬声器/麦克风是否正常工作（系统音量面板能看到波形）"
@@ -3615,53 +3601,6 @@ class InspectorPanel(QWidget):
         bl.addStretch(1)
         self._form.addRow(btn_row)
 
-    def _sound_enum_devices(self):
-        items: List[str] = ["default_loopback (默认扬声器-录系统播放声)"]
-        try:
-            import soundcard as sc
-            for mic in sc.all_microphones(include_loopback=True):
-                name = getattr(mic, "name", str(mic.id) if hasattr(mic, "id") else str(mic))
-                is_loopback = "loopback" in str(getattr(mic, "id", "")).lower() or "环回" in name or "Loopback" in name
-                tag = " [环回·可录系统声]" if is_loopback else " [麦克风]"
-                items.append(f"{name}{tag}  [id={getattr(mic, 'id', '')}]")
-        except Exception as e:
-            items.append(f"(soundcard不可用：{e})")
-        try:
-            import pyaudio
-            p = pyaudio.PyAudio()
-            n = p.get_device_count()
-            for i in range(n):
-                info = p.get_device_info_by_index(i)
-                name = info.get("name", "")
-                is_input = bool(int(info.get("maxInputChannels", 0) or 0))
-                if is_input:
-                    items.append(f"(PyAudio) {name}  [idx={i}]")
-            p.terminate()
-        except Exception:
-            pass
-        choice, ok = QInputDialog.getItem(
-            self, "🎧 选择音频设备",
-            "可选设备列表（扬声器环回设备可以录系统自己播放的声音，推荐优先）：",
-            items, 0, False,
-        )
-        if not ok or not choice:
-            return
-        dev_id = "default_loopback"
-        m = re.search(r"\[id=([^\]]+)\]", choice)
-        if m:
-            dev_id = m.group(1)
-        else:
-            m2 = re.search(r"\[idx=(\d+)\]", choice)
-            if m2:
-                dev_id = f"pyaudio_idx_{m2.group(1)}"
-        # 写入设备参数
-        w = self._widgets.get("device")
-        if isinstance(w, QLineEdit):
-            w.setText(dev_id)
-        else:
-            if self._current_node is not None:
-                self.apply_params_merge({"device": dev_id})
-
     def _sound_auto_calibrate(self):
         if not self._sound_check_deps():
             return
@@ -3680,7 +3619,7 @@ class InspectorPanel(QWidget):
         sr = 44100
         chunk = _capture_sound_blocking(device, 5.0, sr)
         if chunk is None:
-            QMessageBox.critical(self, "校准失败", "采集失败，请检查：\n1. pip install soundcard PyAudio\n2. 设备ID是否正确\n3. 扬声器/麦克风是否正常工作")
+            QMessageBox.critical(self, "校准失败", "采集失败，请检查：\n1. pip install soundcard\n2. 设备ID是否正确\n3. 扬声器/麦克风是否正常工作")
             return
         peak_db = 20.0 * np.log10(float(np.max(np.abs(chunk)) + 1e-8))
         mean_db = 20.0 * np.log10(float(np.mean(np.abs(chunk)) + 1e-8))
@@ -3740,9 +3679,8 @@ class InspectorPanel(QWidget):
         chunk = _capture_sound_blocking(device, sample_ms / 1000.0, sr)
         if chunk is None:
             QMessageBox.critical(self, "🎵 试听失败",
-                "采集失败，请检查：\n1. pip install soundcard PyAudio\n"
-                "2. PyAudio 安装失败可用：pip install pipwin && pipwin install pyaudio\n"
-                "3. 设备ID是否正确")
+                "采集失败，请检查：\n1. pip install soundcard\n"
+                "2. 设备ID是否正确")
             return
         # 执行和 execute_SoundDetect 一样的判定
         peak = float(np.max(np.abs(chunk)) + 1e-8)

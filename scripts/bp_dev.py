@@ -66,7 +66,7 @@ RUNTIME_SOURCES = [
 RUNTIME_HIDDEN_IMPORTS = [
     "win32gui", "win32process", "win32clipboard", "win32con", "win32api",
     "pythoncom", "pywintypes", "psutil", "pyautogui", "pyperclip",
-    "pydirectinput", "pynput", "pynput.keyboard", "soundcard", "pyaudio",
+    "pydirectinput", "pynput", "pynput.keyboard", "soundcard",
     "cv2", "numpy", "PIL",
 ]
 
@@ -203,9 +203,8 @@ def ensure_requirements(*, force: bool = False, auto_install: bool = True) -> bo
     # 导致 venv 里的 pip 损坏、后续安装全部失败。venv 自带 pip 足够装常规包。
     rc = run([python_exe(), "-m", "pip", "install", "-r", REQUIREMENTS])
     if rc != 0:
-        warn("pip 退出码非 0（个别包如 PyAudio 可能编译失败）。")
+        warn("pip 退出码非 0。")
         warn(f"  可稍后手动重试：{python_exe()} -m pip install -r requirements.txt")
-        warn("  PyAudio 编译报错的解决办法见：assets/doc/44_faq_env.md")
         return False
     ok("依赖安装完成")
     return True

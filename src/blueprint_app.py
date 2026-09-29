@@ -234,9 +234,11 @@ class BlueprintMainWindow(QMainWindow):
         # ---- 内嵌文档对话框（UI 壳子） ----
         self._doc_dialog_ref = None            # 文档攻略对话框（单例）
 
-        # ---- 子图导航栈（组件/循环体子画布） ----
-        # 进入 Loop 循环体子画布 / 组件子图时，把父上下文压栈；返回时弹栈。
-        # 每项 = {"kind": "loop_body"|"component", "parent_graph": BlueprintGraph, "node_id": str}
+        # ---- 子图导航栈（循环体/顺序体/并行体子画布） ----
+        # 进入 Loop/Sequence/Parallel 的子画布时把父上下文压栈；返回时弹栈。
+        # 每项 = {"kind": "loop"|"seq"|"parallel", "body_key": 宿主节点参数键,
+        #         "parent_graph": BlueprintGraph, "node_id": str, "sub_graph": BlueprintGraph}
+        # sub_graph 是本层子图对象，退出/回写时以它为准（不能依赖 self._graph，它可能被保存逻辑临时改动）。
         self._subgraph_stack: list = []
         self._breadcrumb_bar = None            # 面包屑导航条（进入子图时显示）
 
@@ -1101,18 +1103,19 @@ class BlueprintMainWindow(QMainWindow):
         body = host_node.params.get(body_key)
         if not (isinstance(body, dict) and body.get("nodes")):
             return
-        self._subgraph_stack.append({
-            "kind": kind,            # "loop" | "seq" | "parallel"
-            "body_key": body_key,    # 回写参数键名（loop_body / seq_body / par_body）
-            "parent_graph": self._graph,
-            "node_id": host_node.id,
-        })
         sub = BlueprintGraph.from_dict({
             "nodes": body.get("nodes", {}),
             "links": body.get("links", []),
             "metadata": {"name": f"{host_node.id}::{body_key}"},
         })
         sub._host_node_id = host_node.id
+        self._subgraph_stack.append({
+            "kind": kind,            # "loop" | "seq" | "parallel"
+            "body_key": body_key,    # 回写参数键名（loop_body / seq_body / par_body）
+            "parent_graph": self._graph,
+            "node_id": host_node.id,
+            "sub_graph": sub,        # 本层子图对象：退出/回写时以此为准，不能依赖 self._graph
+        })
         self._scene.set_graph(sub)
         self._graph = sub
         self._inspector.set_node(None)
@@ -1138,13 +1141,16 @@ class BlueprintMainWindow(QMainWindow):
         parent_graph = item.get("parent_graph")
         if parent_graph is None:
             return
-        # 回写子图内容到宿主节点
+        # 回写子图内容到宿主节点：必须用栈里记录的本层子图对象，不能用 self._graph。
+        # 否则一旦中途保存过（保存时 self._graph 可能被临时指向父图），
+        # 这里就会把「父图内容」写进 loop_body —— 再进循环体看到的就变成整张父图（历史 bug）。
         body_key = item.get("body_key")
-        if body_key and self._graph is not None:
+        sub_graph = item.get("sub_graph") or self._graph
+        if body_key and sub_graph is not None:
             node_id = item.get("node_id")
             host = parent_graph.nodes.get(node_id)
             if host is not None:
-                host.params[body_key] = self._graph.to_dict()
+                host.params[body_key] = sub_graph.to_dict()
         self._scene.set_graph(parent_graph)
         self._graph = parent_graph
         self._inspector.set_node(None)
@@ -1396,19 +1402,31 @@ class BlueprintMainWindow(QMainWindow):
         self._refresh_assets()
         # 工程下的蓝图列表可能因为"最近修改时间"重排，下次打开工程下拉时自动刷新（aboutToShow 已经连了刷新）
 
+    def _save_target_graph(self):
+        """「保存」应写入磁盘的那张图：处于子画布时是根图（先把子图回写进宿主），否则是当前图。
+
+        ⚠ 绝不改动导航状态（self._graph / scene 仍停留在子画布）：
+        否则退出子画布时会把父图内容误写回 loop_body（历史 bug：再进循环体看到整张父图）。
+        """
+        if self._subgraph_stack:
+            self._flush_subgraph_to_host()
+            root = self._subgraph_stack[0].get("parent_graph")
+            if root is not None:
+                return root
+        return self._graph
+
     def _on_save(self):
         if self._graph is None:
             return
-        # 若当前正处在子画布（循环体/组件），先把子图内容回写进宿主节点，再保存真正的父图
-        if self._subgraph_stack:
-            self._flush_subgraph_to_host()
-            parent_graph = self._subgraph_stack[0].get("parent_graph")
-            if parent_graph is not None:
-                self._graph = parent_graph
+        # 处于子画布（循环体/顺序体/并行体）时，先把子图回写进宿主节点，再保存「根图」；
+        # 但不改动当前导航状态（画布仍停在子画布，可继续编辑）。
+        target = self._save_target_graph()
+        if target is None:
+            return
         if not self._current_path:
             self._on_save_as()
             return
-        ok = BlueprintStore.save(self._graph, self._current_path)
+        ok = BlueprintStore.save(target, self._current_path)
         if ok:
             self._mark_graph_clean()  # 保存成功，哈希更新=干净了
             try:
@@ -1433,15 +1451,20 @@ class BlueprintMainWindow(QMainWindow):
         node_id = item.get("node_id")
         if parent_graph is None or node_id is None:
             return
+        sub_graph = item.get("sub_graph") or self._graph
         host = parent_graph.nodes.get(node_id)
-        if host is not None:
-            host.params[body_key] = self._graph.to_dict()
+        if host is not None and sub_graph is not None:
+            host.params[body_key] = sub_graph.to_dict()
 
     def _on_save_as(self):
         if self._graph is None:
             return
+        # 处于子画布时，「另存为」保存的仍是整张根图（先回写子图内容），与 _on_save 口径一致
+        target = self._save_target_graph()
+        if target is None:
+            return
         default_dir = self._pm.project_root or os.getcwd()
-        default = self._current_path or BlueprintStore.default_path(self._graph, default_dir)
+        default = self._current_path or BlueprintStore.default_path(target, default_dir)
         path, _ = QFileDialog.getSaveFileName(
             self, "另存为", default,
             "蓝图文件 (*.bp.json)",
@@ -1457,9 +1480,9 @@ class BlueprintMainWindow(QMainWindow):
         #   后标题栏就显示 Untitled，用户就感觉『加载中文蓝图名没生效』
         # ----------------------------------------------------------
         _, stem, _ = BlueprintStore._split_bp_path(path)
-        if stem and stem != getattr(self._graph, "name", None):
-            self._graph.name = stem
-        ok = BlueprintStore.save(self._graph, path)
+        if stem and stem != getattr(target, "name", None):
+            target.name = stem
+        ok = BlueprintStore.save(target, path)
         if ok:
             self._current_path = path
             self._mark_graph_clean()  # 另存成功，哈希更新=干净了
@@ -1549,16 +1572,15 @@ class BlueprintMainWindow(QMainWindow):
             return
         os.makedirs(target_dir, exist_ok=True)
         kind_cn = "组件" if as_component else "蓝图"
+        src_graph = None
         if use_current_graph:
             if self._graph is None:
                 return
-            # 正在子画布编辑 → 先回写宿主，保证存下来的是完整父图
-            if self._subgraph_stack:
-                self._flush_subgraph_to_host()
-                parent_graph = self._subgraph_stack[0].get("parent_graph")
-                if parent_graph is not None:
-                    self._graph = parent_graph
-            default_stem = getattr(self._graph, "name", None) or f"新{kind_cn}"
+            # 正在子画布编辑 → 先回写宿主，另存的是完整根图；但不改动当前导航状态
+            src_graph = self._save_target_graph()
+            if src_graph is None:
+                return
+            default_stem = getattr(src_graph, "name", None) or f"新{kind_cn}"
         else:
             default_stem = self._suggest_stem(target_dir, f"新{kind_cn}")
         stem = self._ask_blueprint_stem(
@@ -1572,9 +1594,9 @@ class BlueprintMainWindow(QMainWindow):
         final_path = os.path.join(target_dir, stem + BlueprintStore.EXT)
         want_type = bp_kind_mod.BP_TYPE_COMPONENT if as_component else bp_kind_mod.BP_TYPE_BLUEPRINT
         if use_current_graph:
-            self._graph.name = stem      # 文件名同步为蓝图名，重开标题栏显示正确
-            self._graph.bp_type = want_type
-            g = self._graph
+            src_graph.name = stem      # 文件名同步为蓝图名，重开标题栏显示正确
+            src_graph.bp_type = want_type
+            g = src_graph
             need_bind = False
         else:
             g = BlueprintStore.new_graph(stem, bp_type=want_type)
@@ -2589,21 +2611,81 @@ class BlueprintMainWindow(QMainWindow):
         except Exception:
             return None
 
+    def _root_graph(self):
+        """当前正在编辑的「文档」根图：处于子画布时是栈底的父图，否则就是 self._graph。"""
+        if self._subgraph_stack:
+            root = self._subgraph_stack[0].get("parent_graph")
+            if root is not None:
+                return root
+        return self._graph
+
+    def _doc_dict(self):
+        """当前文档（根图）的序列化 dict；处于子画布时把每层实时子图内容覆盖进宿主节点。
+
+        为什么要这样：dirty 判定 / 哈希比较必须始终以「整份蓝图」为准。
+        若直接对 self._graph 算 hash，进入子画布后 self._graph 变成子图，
+        退出又变回父图，哈希基准来回跳 → 会出现「刚保存就显示未保存 *」的假脏。
+        """
+        root = self._root_graph()
+        if root is None:
+            return None
+        try:
+            data = root.to_dict()
+        except Exception:
+            return None
+        nodes = data.get("nodes")
+        if not isinstance(nodes, dict):
+            return data
+        depth = len(self._subgraph_stack)
+        for idx, item in enumerate(self._subgraph_stack):
+            body_key = item.get("body_key")
+            nid = item.get("node_id")
+            host = nodes.get(nid) if isinstance(nid, str) else None
+            if not isinstance(host, dict) or not body_key:
+                break
+            sub = self._graph if idx == depth - 1 else item.get("sub_graph")
+            if sub is None:
+                break
+            try:
+                sub_data = sub.to_dict()
+            except Exception:
+                break
+            params = host.get("data")
+            if not isinstance(params, dict):
+                params = {}
+                host["data"] = params
+            params[body_key] = sub_data
+            nodes = sub_data.get("nodes") if isinstance(sub_data.get("nodes"), dict) else {}
+        return data
+
+    def _current_doc_hash(self) -> Optional[str]:
+        """当前文档（根图 + 实时子画布内容）的 SHA1 哈希，口径与 _hash_graph 完全一致。"""
+        data = self._doc_dict()
+        if data is None:
+            return None
+        try:
+            canonical = json.dumps(data, sort_keys=True, ensure_ascii=False, indent=2)
+            return hashlib.sha1(canonical.encode("utf-8")).hexdigest()
+        except Exception:
+            return None
+
     def _mark_graph_clean(self, graph=None):
         """把当前图标记为『干净状态』（未改动）——在加载成功/保存成功后调用。
 
         参数 graph：
           - 若显式传入（推荐在"绑定新 graph 之前"直接用新加载的 g），
             直接用传入对象算 hash，**不依赖 `self._graph` 此时的赋值状态**。
-          - 若不传（保存场景：保存的就是当前 self._graph），用 self._graph。
+          - 若不传（保存场景），用「当前文档」哈希（根图 + 实时子画布），
+            这样在子画布里保存后不会误报未保存。
 
         为什么要支持显式传参？
-          因为 `_bind_new_graph(g)` 里才做 `self._graph = g`（第 777 行），
+          因为 `_bind_new_graph(g)` 里才做 `self._graph = g`，
           如果在 bind 之前就调 `_mark_graph_clean()` 而不传参，算 hash 用的是
           旧的 self._graph（或 None），就会出现「刚加载完永远是未保存状态」的 bug。
         """
-        target = graph if graph is not None else self._graph
-        self._last_saved_graph_hash = self._hash_graph(target)
+        self._last_saved_graph_hash = (
+            self._hash_graph(graph) if graph is not None else self._current_doc_hash()
+        )
 
     def _need_save(self) -> bool:
         """当前蓝图是否需要保存。
@@ -2618,7 +2700,7 @@ class BlueprintMainWindow(QMainWindow):
         if not self._current_path:
             return True
         # 已落盘过：对比哈希判断有没有改动过
-        current_hash = self._hash_graph(self._graph)
+        current_hash = self._current_doc_hash()
         if self._last_saved_graph_hash is None:
             # 理论不会走到这（已有 path 但没记录 hash），保守提示需要保存
             return True

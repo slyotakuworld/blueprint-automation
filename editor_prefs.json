@@ -33,5 +33,14 @@
     "scale": 1.608695652173913,
     "cx": 198.9189189189189,
     "cy": 230.6216216216216
-  }
+  },
+  "view::g:\\work\\blueprintautomation\\projects\\gg\\blueprints\\gg.bp.json": {
+    "scale": 1.1184922866913714,
+    "cx": 179.70620127795524,
+    "cy": 78.67734185303513
+  },
+  "tree::g:\\work\\blueprintautomation\\projects\\gg": [
+    "blueprints",
+    "components"
+  ]
 }
