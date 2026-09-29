@@ -265,6 +265,11 @@
           "id": "faq_advanced",
           "title": "3. 高级FAQ",
           "file": "43_faq_advanced.md"
+        },
+        {
+          "id": "faq_env",
+          "title": "4. 环境安装FAQ",
+          "file": "44_faq_env.md"
         }
       ]
     }

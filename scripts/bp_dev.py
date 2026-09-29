@@ -205,6 +205,7 @@ def ensure_requirements(*, force: bool = False, auto_install: bool = True) -> bo
     if rc != 0:
         warn("pip 退出码非 0（个别包如 PyAudio 可能编译失败）。")
         warn(f"  可稍后手动重试：{python_exe()} -m pip install -r requirements.txt")
+        warn("  PyAudio 编译报错的解决办法见：assets/doc/44_faq_env.md")
         return False
     ok("依赖安装完成")
     return True
