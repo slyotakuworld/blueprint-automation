@@ -1,4 +1,4 @@
-# 🤫 StillnessDetect · 静止检测
+# 🤫 StillnessDetect · 静止
 
 > 盯着屏幕上一块区域看~画面安安静静不变就走yes，等太久还在动就超时走no，用来等加载结束最合适啦。
 
@@ -6,7 +6,7 @@
 
 ## 节点外观
 
-- **分类**：👁 视觉、感知
+- **分类**：👁 感知
 - **配色**：深橙 (#d84315 / #ff7043)
 - **短名**：`if_static`
 
@@ -19,6 +19,9 @@
 | 入 | `in_exec` | ▶ 执行 | ▶ | 上游触发 |
 | 出 | `yes` | ▶ 执行 | 静止 | ROI 区域画面连续静止 N 秒 → 走这里 |
 | 出 | `no`  | ▶ 执行 | 超时 | 超过最大超时画面还在变化 → 走这里 |
+| 出 | `err` | ▶ 执行 | 失败 | **仅**「范围=目标窗口」但目标窗口没定位到时走这里，不会退化成全屏去检测 |
+
+> ⚠ `err` 只管「目标窗口没定位到」这种环境/配置错误；画面一直动导致超时属于正常判定，走 `no`。
 
 ---
 
@@ -26,16 +29,28 @@
 
 | 参数 | 编辑器 | 默认值 | 说明 |
 |------|--------|--------|------|
-| `search_mode` | 下拉 | `relative` | 截图范围：相对目标程序 / 全屏模式 |
-| `temp_target_title` | 文本 | `""` | 仅相对模式：临时目标窗口标题 |
-| `temp_target_exe` | 文本 | `""` | 仅相对模式：临时目标程序名 |
-| `temp_target_class` | 文本 | `""` | 仅相对模式：临时目标窗口类名 |
+| `range_mode` | 下拉 | `window` | 检测范围：`window` 目标窗口 / `fullscreen` 全屏 |
+| `target_title` | 文本 | `""` | 仅「目标窗口」范围生效：窗口标题子串（支持 `{变量}`）；点「🎯 拾取目标窗口」可自动填 |
+| `target_exe` | 文本 | `""` | 仅「目标窗口」范围生效：程序名子串 |
+| `target_class` | 文本 | `""` | 仅「目标窗口」范围生效：窗口类名精确匹配 |
 | `stillness_seconds` | 小数 | `5.0` | 需要画面**持续静止**的最小秒数（0.1 ~ 600） |
 | `timeout_seconds` | 小数 | `20.0` | 最大超时秒（1.0 ~ 3600），超过了走 no |
 | `sample_interval_seconds` | 小数 | `1.0` | 采样间隔秒（0.03 ~ 60），每隔多久截一帧做对比 |
-| `roi` | 文本 | `"[0,0,0,0]"` | 静止检测 ROI：`[x,y,w,h]`，Inspector 里点「框选 ROI」按钮可视化选 |
+| `roi` | 文本 | `"[0,0,0,0]"` | 静止 ROI：`[x,y,w,h]`，Inspector 里点「框选 ROI」按钮可视化选 |
 | `roi_preview_b64` | 文本 | `""` | ROI 缩略图（自动记录不用手填） |
 | `diff_threshold` | 小数 | `0.01` | 帧差阈值（0.0 ~ 0.5），两帧 ROI 像素差低于该值视为"安静" |
+
+---
+
+## 检测范围 range_mode
+
+### window 目标窗口（推荐）
+- ROI 坐标**相对目标窗口左上角**；窗口移动，ROI 跟着移动
+- 窗口从哪来：本节点自己的「目标窗口」定位参数（`target_title` / `target_exe` / `target_class`，**至少填一个**）
+- ⚠ 定位不到窗口 → 直接走 `err` 失败出口，**不会退化成全屏去检测**
+
+### fullscreen 全屏
+- ROI 坐标相对**屏幕左上角**，固定不变
 
 ---
 
@@ -60,7 +75,8 @@
 ### 1. 等游戏加载完毕（过场动画结束）
 ```
 StillnessDetect：
-  search_mode       = relative
+  range_mode        = window
+  target_exe        = game.exe
   roi               = 选中游戏画面主区域（比如整个画面，不用太精确）
   stillness_seconds = 3.0     ← 画面连续 3 秒没变化 = 加载完了
   timeout_seconds   = 120.0   ← 最多等 2 分钟
@@ -70,12 +86,15 @@ StillnessDetect：
 连线：
   yes → 加载完了，可以点进入按钮
   no  → 超时了，Notify("加载超时！")
+  err → 目标窗口没开（异常）
 ```
 
 ### 2. 等对话框不晃了再点按钮
 有些弹窗打开时会有淡入动画，立刻点会点不到：
 ```
 StillnessDetect：
+  range_mode = window
+  target_title = 某某弹窗标题
   roi = 对话框矩形区域
   stillness_seconds = 0.5
   timeout_seconds   = 5.0
@@ -86,6 +105,8 @@ StillnessDetect：
 进度条本身会一直在动 → 等它**停止变化**就表示进度 100% 了：
 ```
 StillnessDetect：
+  range_mode = window
+  target_class = 某某窗口类名
   roi = 进度条那条小区域
   stillness_seconds = 1.0
   diff_threshold    = 0.015
@@ -121,3 +142,6 @@ StillnessDetect：
 
 **Q：ROI 坐标怎么选才准确？**
 → Inspector 面板里点「✂ 框选 ROI」按钮，屏幕会变半透明，直接在目标窗口上拉框选，自动填进 roi 参数，不用手算坐标。
+
+**Q：设了「目标窗口」但窗口没开，会怎样？**
+→ 直接走 `err`（失败）出口。不会退化成全屏去瞎检测——那样 ROI 坐标口径就错了，只会得到无意义的判定。

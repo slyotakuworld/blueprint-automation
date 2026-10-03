@@ -7,4 +7,3 @@ pydirectinput
 pynput
 pywin32
 psutil
-soundcard>=0.4.3

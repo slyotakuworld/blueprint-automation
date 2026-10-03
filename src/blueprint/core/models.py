@@ -411,7 +411,7 @@ class ExecutionContext:
         lambda msg, level="INFO": None
     )
     last_progress_ts: float = 0.0
-    # 扩展 runtime_attrs：给 OpenApp → BindWindow 传 last_launched_pid 等（文档P0-5上下文联动）
+    # 扩展 runtime_attrs：节点运行期零散状态（如 OpenApp 的已启动进程、FindImage 的 PIL 缓存等）
     runtime_attrs: Dict[str, Any] = field(default_factory=dict)
     # 单步调试：点"下一步"按钮后 True；执行完一个节点后自动置 False 并自动 is_paused=True 进入再次暂停（类似 debugger Step Over）
     step_mode: bool = False

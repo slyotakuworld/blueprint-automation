@@ -6,7 +6,7 @@
 
 ## 节点外观
 
-- **分类**：🎯 执行动作
+- **分类**：🎯 动作
 - **配色**：灰 (#2D333B / #8B949E)
 - **短名**：`wait`
 
@@ -91,9 +91,9 @@ VarSwitch 里算出来的 retry_after（绿色 float）→ Wait.in_seconds
 
 ### 1. 程序启动后等待加载
 ```
-OpenApp(打开游戏) → Wait(seconds=15, fixed) → BindWindow
+OpenApp(打开游戏) → Wait(seconds=15, fixed) → FindImage(进入游戏按钮)
 ```
-→ 必须等够 15 秒让游戏加载完再绑定窗口。
+→ 必须等够 15 秒让游戏加载完，再开始找图/操作。
 
 ### 2. 两次点击之间小睡（拟人）
 ```

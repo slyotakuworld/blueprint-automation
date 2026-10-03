@@ -93,12 +93,12 @@ def handler_SendWechat(node, ctx):
 
 > 更稳的方式：搭配 Celery / MQ 队列。蓝图本身是命令行模式的，任何能启动进程的调度系统都可以对接。
 
-### Q5：节点的 out_pos / out_found 能不能写进数据库？
+### Q5：节点的 out_pos 能不能写进数据库？
 
 **A**：HttpRequest 节点直接调你自己的后端接口即可：
 ```
 FindImage("怪物头像")
-  out_found=True →
+  found 分支 →
     HttpRequest：
       method = POST
       url    = "https://your-api/game/punch"
@@ -118,8 +118,8 @@ FindImage("怪物头像")
 
 ### Q7：蓝图支持多显示器吗？
 
-**A**：支持。FindImage search_mode = absolute 时，截图工具默认截主显示器。
+**A**：支持。FindImage「找图范围」= 全屏时，截图工具默认截主显示器。
 如果目标窗口在第二个显示器：
-1. BindWindow 绑的是窗口句柄，跟哪个显示器没关系
+1. 目标窗口是按窗口句柄定位的，跟它在哪个显示器没关系
 2. 把目标窗口拖回主显示器再跑（最简单）
-3. 或者用相对模式（relative）自动处理
+3. 或者把「找图范围」「坐标基准」都选「目标窗口」，坐标相对窗口自动换算，跨屏也没问题

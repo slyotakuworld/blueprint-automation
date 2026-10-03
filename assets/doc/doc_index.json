@@ -77,11 +77,6 @@
           "file": "node_OpenApp.md"
         },
         {
-          "id": "node_bindwindow",
-          "title": "绑定窗口",
-          "file": "node_BindWindow.md"
-        },
-        {
           "id": "node_webbrowser",
           "title": "打开网页",
           "file": "node_WebBrowser.md"
@@ -100,7 +95,7 @@
     },
     {
       "id": "nodes_logic",
-      "title": "🧠 逻辑组件节点",
+      "title": "🧠 逻辑节点",
       "icon": "icon_code.png",
       "children": [
         {
@@ -142,27 +137,17 @@
           "id": "node_varswitch",
           "title": "条件判断",
           "file": "node_VarSwitch.md"
-        },
-        {
-          "id": "node_clipboard",
-          "title": "剪贴板",
-          "file": "node_Clipboard.md"
-        },
-        {
-          "id": "node_notify",
-          "title": "通知",
-          "file": "node_Notify.md"
         }
       ]
     },
     {
       "id": "nodes_execute",
-      "title": "🎯 执行动作节点",
+      "title": "🎯 动作节点",
       "icon": "icon_screenshot.png",
       "children": [
         {
           "id": "node_mouse",
-          "title": "鼠标操作",
+          "title": "鼠标",
           "file": "node_Mouse.md"
         },
         {
@@ -174,12 +159,22 @@
           "id": "node_wait",
           "title": "等待",
           "file": "node_Wait.md"
+        },
+        {
+          "id": "node_notify",
+          "title": "通知",
+          "file": "node_Notify.md"
+        },
+        {
+          "id": "node_clipboard",
+          "title": "剪贴板",
+          "file": "node_Clipboard.md"
         }
       ]
     },
     {
       "id": "nodes_vision",
-      "title": "👁 视觉感知节点",
+      "title": "👁 感知节点",
       "icon": "icon_image.png",
       "children": [
         {
@@ -193,23 +188,18 @@
           "file": "node_IfImageDetect.md"
         },
         {
-          "id": "node_stillnessdetect",
-          "title": "静止检测",
-          "file": "node_StillnessDetect.md"
-        },
-        {
-          "id": "node_sounddetect",
-          "title": "声音检测",
-          "file": "node_SoundDetect.md"
-        },
-        {
           "id": "node_screenshot",
           "title": "截图",
           "file": "node_Screenshot.md"
         },
         {
+          "id": "node_stillnessdetect",
+          "title": "静止",
+          "file": "node_StillnessDetect.md"
+        },
+        {
           "id": "node_ocrrecognize",
-          "title": "文字识别",
+          "title": "文字",
           "file": "node_OcrRecognize.md"
         }
       ]

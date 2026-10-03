@@ -10,19 +10,19 @@ class CoordOverlay(FullscreenOverlayBase):
     """坐标点选全屏遮罩（对齐 _coord_overlay）。
 
     两种模式（构造时传入 hwnd 自动判定）：
-      - 绑定窗口模式（hwnd 有效）：
-          * 蓝色虚线 3px 描整个绑定窗口矩形
-          * 左上角 10,20 写小字 "⚓ 绑定窗口范围：xxx.exe"
-          * 顶部正中央 50px 写大字绿色 "[窗口绑定模式] 坐标已自动扣除窗口左上角偏移（保存为相对坐标）"
+      - 目标窗口模式（hwnd 有效）：
+          * 蓝色虚线 3px 描整个目标窗口矩形
+          * 左上角 10,20 写小字 "⚓ 目标窗口范围：xxx.exe"
+          * 顶部正中央 50px 写大字绿色 "[目标窗口模式] 坐标已自动扣除窗口左上角偏移（保存为相对坐标）"
           * 点击后保存 相对坐标 rel_x = click_abs_x - win_rect.left
-      - 绝对坐标模式（hwnd 无效/None）：
-          * 顶部正中央 50px 写大字黄色 "[绝对坐标模式] 未检测到绑定窗口，将保存为绝对屏幕坐标"
+      - 全屏（绝对坐标）模式（hwnd 无效/None）：
+          * 顶部正中央 50px 写大字黄色 "[全屏（绝对坐标）模式] 未设置/未找到目标窗口，将保存为绝对屏幕坐标"
           * 点击后保存 绝对坐标
 
     Args:
-        hwnd: 可选的已绑定窗口句柄；提供且有效时自动进入绑定模式
-        window_rect: 绑定窗口矩形 (l, t, w, h)；若未提供但 hwnd 有效，会 win32gui 再查
-        exe_name: 绑定窗口所属进程名，提示用
+        hwnd: 可选的目标窗口句柄；提供且有效时自动进入目标窗口模式
+        window_rect: 目标窗口矩形 (l, t, w, h)；若未提供但 hwnd 有效，会 win32gui 再查
+        exe_name: 目标窗口所属进程名，提示用
     """
 
     def __init__(
@@ -109,12 +109,12 @@ class CoordOverlay(FullscreenOverlayBase):
         try:
             # 1. 默认半透明黑背景
             painter.fillRect(self.rect(), QColor(0, 0, 0, 77))
-            # 2. 绑定模式：画蓝色虚线窗口框 + 低 alpha 覆盖（不挖空，避免鼠标穿透）
+            # 2. 目标窗口模式：画蓝色虚线窗口框 + 低 alpha 覆盖（不挖空，避免鼠标穿透）
             if self.is_bound_mode:
                 r = self._bound_rect
                 # 注意：不能用 CompositionMode_Clear 挖空为完全透明！
                 # WA_TranslucentBackground 下 alpha=0 的区域会让鼠标事件穿透到下层窗口，
-                # 导致用户无法在绑定窗口区域内点击拾取。
+                # 导致用户无法在目标窗口区域内点击拾取。
                 # 改用极低 alpha（5/255 ≈ 2%）覆盖：视觉上几乎透明能看清窗口，但鼠标不穿透。
                 painter.fillRect(r, QColor(0, 0, 0, 5))
                 # 蓝色虚线 3px
@@ -127,20 +127,20 @@ class CoordOverlay(FullscreenOverlayBase):
                 painter.setPen(QColor(100, 181, 246))
                 font = QFont("Microsoft YaHei", 10)
                 painter.setFont(font)
-                tip1 = f"⚓ 绑定窗口范围：{self._exe_name or '目标程序'}"
+                tip1 = f"⚓ 目标窗口范围：{self._exe_name or '目标窗口'}"
                 painter.drawText(r.left() + 10, r.top() + 20, tip1)
                 # 顶部中央大字 绿色
                 self._draw_center_banner(
                     painter,
-                    "[窗口绑定模式] 坐标已自动扣除窗口左上角偏移（保存为相对坐标）",
+                    "[目标窗口模式] 坐标已自动扣除窗口左上角偏移（保存为相对坐标）",
                     QColor(129, 199, 132),
                     y_pos=50,
                 )
             else:
-                # 绝对模式：顶部中央 大字黄色
+                # 全屏（绝对坐标）模式：顶部中央 大字黄色
                 self._draw_center_banner(
                     painter,
-                    "[绝对坐标模式] 未检测到绑定窗口，将保存为绝对屏幕坐标",
+                    "[全屏（绝对坐标）模式] 未设置/未找到目标窗口，将保存为绝对屏幕坐标",
                     QColor(255, 213, 79),
                     y_pos=50,
                 )

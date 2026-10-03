@@ -155,7 +155,7 @@
       "id": "1",
       "type": "FindImage",
       "x": 100, "y": 200,
-      "data": { "temp_target_title": "...", "threshold": 0.85 }
+      "data": { "range_mode": "window", "target_title": "...", "threshold": 0.85 }
     }
   },
   "links": [

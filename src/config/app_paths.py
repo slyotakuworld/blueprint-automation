@@ -254,7 +254,7 @@ def _default_user_config_content() -> Dict[str, Any]:
                 "pause_blueprint": "<f6>",
                 "stop_blueprint": "<f7>",
             },
-            "ui": {"theme": "dark"},
+            "ui": {"theme": "dark", "start_maximized": True},
         }
     base["recent_projects"] = []
     return base

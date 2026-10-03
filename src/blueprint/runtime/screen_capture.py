@@ -89,10 +89,11 @@ def capture_window_bgr(hwnd):
 
 
 class ScreenCapture:
-    """独立的屏幕截图服务，BGR格式输出。"""
+    """独立的屏幕截图服务，BGR格式输出。
 
-    def __init__(self, hwnd=None):
-        self.hwnd = hwnd
+    只做整屏/区域截图；「截某个窗口」用模块级 capture_window_bgr(hwnd)。
+    （旧版这里有个 hwnd 字段给「全局目标窗口」用，已随该机制一起删除。）
+    """
 
     def capture_full_bgr(self):
         try:

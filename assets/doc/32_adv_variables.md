@@ -47,11 +47,10 @@ PressKey.text = "今天 {name} 想吃 {food}，一共 {count} 个苹果 🍎"
 
 | 节点 | 写入的变量 | 说明 |
 |------|-----------|------|
-| **BindWindow** | `target`、`target_hwnd`、`target_title`、`target_x/y/w/h` | 绑定窗口后自动写入 8 个变量 |
 | **Clipboard** | `{output_var_name}`（默认 `clip_text`） | read 模式读到的文本自动存为指定变量名 |
 | **HttpRequest** | `web_` + JSON 响应的每个 key | 勾选 save_json_to_vars 时自动拆 JSON |
 
-> 🐺 这三个节点的变量不需要手动 SetVariable，执行完直接 `{target_title}`、`{clip_text}`、`{web_token}` 就能用啦~
+> 🐺 这两个节点的变量不需要手动 SetVariable，执行完直接 `{clip_text}`、`{web_token}` 就能用啦~
 
 ---
 
@@ -217,7 +216,7 @@ Inspector「➕ 添加子流」一行一行加，每个子流对应一个 `in_N 
 
 ### 套路 1：血量监视（循环 + 分支）
 ```
-Start → BindWindow → Loop(infinite)
+Start → OpenApp → Loop(infinite)
   loop_body →
     IfImageDetect（或其他手段获取 hp 变量）
     VarSwitch：
@@ -229,7 +228,7 @@ Start → BindWindow → Loop(infinite)
 
 ### 套路 2：每天签到 5 次（计数循环 + 找图点击）
 ```
-Start → OpenApp → BindWindow →
+Start → OpenApp →
   Loop(count=5)
     loop_body →
       FindImage("签到按钮", after_action=click)

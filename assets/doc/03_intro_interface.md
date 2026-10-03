@@ -46,8 +46,8 @@
 | 📚 文档攻略 | 打开内置使用手册 |
 
 > ℹ️ 本版本已**移除**主界面右上角那个「🎯 截图目标」下拉（含旁边的 ↻ 刷新）。
-> 目标窗口 100% 由蓝图自身决定：**BindWindow 节点**或各节点的**「临时目标」**参数——
-> 这样编辑器里点▶运行与导出后的独立 EXE 行为完全一致。
+> 目标窗口 100% 由蓝图里各节点**自身的「目标窗口」定位参数**决定（找图/检测/截图/文字/鼠标节点上，
+> 填标题 / 程序名 / 类名即可）——这样编辑器里点▶运行与导出后的独立 EXE 行为完全一致。
 
 ---
 
@@ -74,10 +74,10 @@
 ## ② 节点库面板（左侧，固定宽度）
 
 所有可用节点按 4 大类分组：
-- 🚀 **应用控制**：OpenApp / BindWindow / WebBrowser / Command / HttpRequest
-- 🧠 **逻辑组件**：Start / End / Loop / Sequence / SetVariable / VarSwitch / Clipboard / Notify
-- 🎯 **执行动作**：Mouse / PressKey / Wait
-- 👁 **视觉感知**：FindImage / IfImageDetect / StillnessDetect / SoundDetect
+- 🚀 **应用控制**：OpenApp / WebBrowser / Command / HttpRequest
+- 🧠 **逻辑**：Start / End / Component / Loop / Sequence / Parallel / SetVariable / VarSwitch
+- 🎯 **动作**：Mouse / PressKey / Wait / Notify / Clipboard
+- 👁 **感知**：FindImage / IfImageDetect / Screenshot / StillnessDetect / OcrRecognize
 
 **操作**：点中节点 → 按住左键 → 拖到画布 → 松开
 
@@ -121,7 +121,7 @@
 1. 先选好目标窗口、配好模板图
 2. 点「测试匹配」
 3. 会弹出进度条，赫萝会按照实际运行时的算法去屏幕上找
-4. 结果会告诉你：用了哪层算法（彩色/灰度/特征）、得分多少、坐标在哪
+4. 结果会告诉你：用了哪层算法（彩色/灰度）、得分多少、坐标在哪
 5. 方便你调阈值，不用每次都跑完整蓝图
 
 ---

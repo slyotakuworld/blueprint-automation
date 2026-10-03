@@ -66,7 +66,7 @@ RUNTIME_SOURCES = [
 RUNTIME_HIDDEN_IMPORTS = [
     "win32gui", "win32process", "win32clipboard", "win32con", "win32api",
     "pythoncom", "pywintypes", "psutil", "pyautogui", "pyperclip",
-    "pydirectinput", "pynput", "pynput.keyboard", "soundcard",
+    "pydirectinput", "pynput", "pynput.keyboard",
     "cv2", "numpy", "PIL",
 ]
 

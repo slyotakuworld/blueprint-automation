@@ -87,6 +87,19 @@ def _b64_to_qpixmap_safe(b64_text: str, size: int = 64) -> Optional[QPixmap]:
         return None
 
 
+def _fit_preview_pixmap(b64_text: str, box_w: int, box_h: int) -> Optional[QPixmap]:
+    """把预览图等比缩放到「填满 box_w×box_h」，尽量铺满显示区域（失败返回 None）。
+
+    取图时按 box 的 2 倍尺寸解码，避免 _b64_to_qpixmap_safe 先把图缩到很小再放大（糊）。
+    """
+    if not b64_text:
+        return None
+    pix = _b64_to_qpixmap_safe(b64_text, size=max(int(box_w), int(box_h)) * 2)
+    if pix is None or pix.isNull():
+        return None
+    return pix.scaled(int(box_w), int(box_h), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+
 def color_for_data(dt: str) -> QColor:
     return {
         "bool": COL_BOOL,
@@ -110,6 +123,15 @@ NODE_PORT_H = 22
 NODE_ROUND = 8
 PORT_RADIUS = 6
 PORT_MARGIN_X = 8
+
+# 预览图区域（FindImage 模板 / StillnessDetect ROI 预览）：
+# 「铺满」而不是「缩到 72px 塞进去」—— 原来固定 size=72，在 176 宽的框里只用到约 41%，很浪费。
+# 现在按原分辨率取图后等比缩放到填满这个框（SmoothTransformation），居中绘制。
+# ⚠ 改 PREVIEW_BAND_H 必须同步 _preview_extra_height()：那边少算了高度，
+#   boundingRect 就比实际绘制矮，拖动节点会留下拖影（QGraphicsView 用 BoundingRectViewportUpdate）。
+PREVIEW_BAND_W = NODE_WIDTH - 24   # 176
+PREVIEW_BAND_H = 100
+PREVIEW_BAND_PAD = 4               # 图片与深色底框之间的留白
 
 
 # ============================================================
@@ -343,18 +365,6 @@ class NodeItem(QGraphicsObject):
             name = os.path.basename(path)
             args = str(p.get("args", "") or "").strip()
             return f"▶ {name} {args}".strip()
-        if t == "BindWindow":
-            parts = []
-            title = str(p.get("title", "") or "").strip()
-            exe = str(p.get("exe_name", "") or "").strip()
-            cls = str(p.get("class_name", "") or "").strip()
-            if title:
-                parts.append(f"标题:{title}")
-            if exe:
-                parts.append(f"程序:{exe}")
-            if cls:
-                parts.append(f"类:{cls}")
-            return " | ".join(parts) if parts else ""
         if t == "WebBrowser":
             url = str(p.get("url", "") or "").strip()
             if not url:
@@ -430,8 +440,8 @@ class NodeItem(QGraphicsObject):
             mode_map = {"read": "读取", "write": "写入", "clear": "清空"}
             return f"[{mode_map.get(mode, mode)}]"
         if t == "Mouse":
-            coord_mode = str(p.get("coord_mode", "relative") or "relative")
-            coord_txt = "相对" if coord_mode == "relative" else "绝对"
+            range_mode = str(p.get("range_mode", "window") or "window")
+            coord_txt = "窗口" if range_mode == "window" else "全屏"
             action = str(p.get("action", "click") or "click")
             action_map = {
                 "click": "点击",
@@ -540,37 +550,32 @@ class NodeItem(QGraphicsObject):
             return lines
         if t == "FindImage":
             algo = str(p.get("match_strategy", "hybrid") or "hybrid")
-            algo_map = {"hybrid": "智能混合", "template": "模板匹配", "gray": "灰度匹配", "feature": "特征匹配"}
+            algo_map = {"hybrid": "智能混合", "template": "模板匹配", "gray": "灰度匹配"}
             algo_txt = algo_map.get(algo, algo)
-            thr = float(p.get("threshold", 0.9) or 0.9)
-            tout = float(p.get("timeout_seconds", 10.0) or 10.0)
-            auto = (int(p.get("scroll_dy", 0) or 0) != 0)
-            # 显示 scroll_dy 具体数值
-            if auto:
-                sdy = int(p.get("scroll_dy", 0) or 0)
-                scroll_note = f"滚动:ON(Δy{sdy})"
+            # 目标窗口（只读定位三件套；全屏模式直接写「全屏」）
+            rm = str(p.get("range_mode", "window") or "window")
+            if rm == "fullscreen":
+                win_txt = "全屏"
             else:
-                scroll_note = "滚动:OFF"
+                win_txt = (str(p.get("target_title", "") or "").strip()
+                           or str(p.get("target_exe", "") or "").strip()
+                           or str(p.get("target_class", "") or "").strip()
+                           or "未设置")
+            # 找到后执行
             act = str(p.get("after_action", "none") or "none")
             act_map = {
-                "none": "动作:无", "click": "动作:单击", "double_click": "动作:双击",
-                "right_click": "动作:右键",
+                "none": "不执行", "click": "单击", "double_click": "双击",
+                "right_click": "右键",
             }
             act_txt = act_map.get(act, act)
-            # 展示 offset 数值
-            if act != "none":
-                try:
-                    off = p.get("offset", (0, 0))
-                    ox, oy = int(off[0] or 0), int(off[1] or 0)
-                except Exception:
-                    ox, oy = 0, 0
-                if ox != 0 or oy != 0:
-                    act_txt += f"(+{ox},+{oy})"
-                else:
-                    act_txt += "(+0,+0)"
+            # 特征识别辅助
+            feat = str(p.get("use_feature_assist", "off") or "off")
+            feat_map = {"off": "关", "verify": "验证", "fallback": "兜底"}
+            feat_txt = feat_map.get(feat, feat)
             lines = [
-                f"算法:{algo_txt}  相似度≥{thr:.2f}  超时{tout:g}s",
-                f"{scroll_note}  {act_txt}",
+                f"🎯 {win_txt}",
+                f"算法:{algo_txt}  找到后:{act_txt}",
+                f"特征:{feat_txt}",
             ]
             # 如果有模板b64预览，加预览占位
             tb = str(p.get("template_b64", "") or "")
@@ -586,7 +591,7 @@ class NodeItem(QGraphicsObject):
             else:
                 mode_txt = "短路模式"
             algo = str(p.get("match_strategy", "hybrid") or "hybrid")
-            algo_map = {"hybrid": "智能混合", "template": "模板匹配", "gray": "灰度匹配", "feature": "特征匹配"}
+            algo_map = {"hybrid": "智能混合", "template": "模板匹配", "gray": "灰度匹配"}
             algo_txt = algo_map.get(algo, algo)
             thr = float(p.get("threshold", 0.9) or 0.9)
             # 图片数
@@ -610,17 +615,6 @@ class NodeItem(QGraphicsObject):
             # 如果有图片，加预览标记行（用于高度计算；实际图像由paint绘制）
             if img_count > 0:
                 lines.append("[__PREVIEW__:ifimg]")
-            return lines
-        if t == "SoundDetect":
-            mode = str(p.get("judge_mode", "detect_sound") or "detect_sound")
-            mode_cn = "检测声音" if mode in ("detect_sound", "sound") else "检测静音"
-            tout = float(p.get("timeout_seconds", 5.0) or 5.0)
-            sample_ms = int(p.get("sample_ms", 500) or 500)
-            thr = float(p.get("threshold_db", -30.0) or -30.0)
-            lines = [
-                f"🎧 {mode_cn}  |  ⏰ 超时{tout:g}s",
-                f"采样{sample_ms}ms  |  阈值{thr:g}dB",
-            ]
             return lines
         if t == "SetVariable":
             batch = str(p.get("batch_text", "") or "").strip()
@@ -681,10 +675,10 @@ class NodeItem(QGraphicsObject):
         （Component / Parallel 之前就是漏登记的两种，已补上。）
         """
         return self.node.type in (
-            "OpenApp", "BindWindow", "WebBrowser", "Command", "HttpRequest",
+            "OpenApp", "WebBrowser", "Command", "HttpRequest",
             "Loop", "Sequence", "Notify", "VarSwitch", "Clipboard", "SetVariable",
             "Mouse", "PressKey", "Wait",
-            "StillnessDetect", "IfImageDetect", "FindImage", "SoundDetect",
+            "StillnessDetect", "IfImageDetect", "FindImage",
             "Component", "Parallel",
         )
 
@@ -696,7 +690,7 @@ class NodeItem(QGraphicsObject):
             b64 = str(p.get("roi_preview_b64", "") or "")
             if not b64:
                 return 0
-            return 92  # 单张预览图高度 + 上下padding
+            return PREVIEW_BAND_H + 16  # 预览框高度 + 上下padding（必须与 paint() 一致）
         if t == "FindImage":
             # 仅模板预览（搜索区域功能已移除）
             tb64 = str(p.get("template_b64", "") or "")
@@ -706,7 +700,7 @@ class NodeItem(QGraphicsObject):
                 import os as _os
                 if isinstance(path, str) and path and _os.path.exists(path):
                     has_tpl = True
-            return 92 if has_tpl else 0
+            return (PREVIEW_BAND_H + 16) if has_tpl else 0
         if t == "IfImageDetect":
             raw = p.get("images_json", "[]")
             imgs = []
@@ -887,20 +881,22 @@ class NodeItem(QGraphicsObject):
             painter.setFont(f3)
             painter.setPen(QPen(QColor("#8B949E")))
             cursor_y = sy
+            _fm_sum = painter.fontMetrics()
+            _sum_w = NODE_WIDTH - 16
             if text_lines:
-                # 多行摘要：逐行绘制
+                # 多行摘要：逐行绘制（超宽自动省略，避免长标题溢出节点）
                 for i, line in enumerate(text_lines):
                     painter.drawText(
-                        QRectF(8, cursor_y, NODE_WIDTH - 16, 16),
+                        QRectF(8, cursor_y, _sum_w, 16),
                         Qt.AlignVCenter | Qt.AlignLeft,
-                        line,
+                        _fm_sum.elidedText(line, Qt.ElideRight, _sum_w),
                     )
                     cursor_y += 16
             else:
                 painter.drawText(
-                    QRectF(8, cursor_y, NODE_WIDTH - 16, 22),
+                    QRectF(8, cursor_y, _sum_w, 22),
                     Qt.AlignVCenter | Qt.AlignLeft,
-                    summary,
+                    _fm_sum.elidedText(str(summary), Qt.ElideRight, _sum_w),
                 )
                 cursor_y += 22
             # 预览图绘制（StillnessDetect / FindImage / IfImageDetect）
@@ -910,10 +906,15 @@ class NodeItem(QGraphicsObject):
                 b64 = str(p.get("roi_preview_b64", "") or "")
                 if b64:
                     cursor_y += 8
-                    pix = _b64_to_qpixmap_safe(b64, size=72)
+                    box_w = PREVIEW_BAND_W - PREVIEW_BAND_PAD * 2
+                    box_h = PREVIEW_BAND_H - PREVIEW_BAND_PAD * 2
+                    band_x = (NODE_WIDTH - PREVIEW_BAND_W) // 2
+                    painter.fillRect(band_x, cursor_y - 2, PREVIEW_BAND_W, PREVIEW_BAND_H, QColor("#0D1117"))
+                    pix = _fit_preview_pixmap(b64, box_w, box_h)
                     if pix is not None:
-                        px = (NODE_WIDTH - pix.width()) // 2
-                        painter.drawPixmap(px, cursor_y, pix)
+                        px = band_x + (PREVIEW_BAND_W - pix.width()) // 2
+                        py = (cursor_y - 2) + (PREVIEW_BAND_H - pix.height()) // 2
+                        painter.drawPixmap(px, py, pix)
             elif t == "FindImage":
                 # 模板预览（template_b64 或有 template 路径）
                 tb64 = str(p.get("template_b64", "") or "")
@@ -934,11 +935,15 @@ class NodeItem(QGraphicsObject):
                             tb64 = ""
                 if tb64:
                     cursor_y += 8
-                    pix = _b64_to_qpixmap_safe(tb64, size=72)
+                    box_w = PREVIEW_BAND_W - PREVIEW_BAND_PAD * 2
+                    box_h = PREVIEW_BAND_H - PREVIEW_BAND_PAD * 2
+                    # 深色底框先铺，再把等比放大到铺满的模板图画在正中间
+                    painter.fillRect(12, cursor_y - 2, PREVIEW_BAND_W, PREVIEW_BAND_H, QColor("#0D1117"))
+                    pix = _fit_preview_pixmap(tb64, box_w, box_h)
                     if pix is not None:
-                        painter.fillRect(12, cursor_y - 2, NODE_WIDTH - 24, 76, QColor("#0D1117"))
-                        px = (NODE_WIDTH - pix.width()) // 2
-                        painter.drawPixmap(px, cursor_y, pix)
+                        px = 12 + (PREVIEW_BAND_W - pix.width()) // 2
+                        py = (cursor_y - 2) + (PREVIEW_BAND_H - pix.height()) // 2
+                        painter.drawPixmap(px, py, pix)
             elif t == "IfImageDetect":
                 raw = p.get("images_json", "[]")
                 imgs = []
@@ -1061,8 +1066,59 @@ class NodeItem(QGraphicsObject):
                 scene.removeItem(pi)
         self._port_items.clear()
         self._build_ports()
+        self.refresh_geometry()
+
+    def mark_geometry_dirty(self) -> Optional[QRectF]:
+        """在修改 node.params **之前**调用：返回当前（旧的）几何在场景中的矩形。
+
+        为什么必须「提前」拿：
+        QGraphicsItem::update(rect) 传进去的 rect 会被 Qt 裁剪到调用时刻的
+        boundingRect 内（实测确认：传一个超大矩形，scene 也只按当前 boundingRect 记脏区）。
+        而 node_height() 是**即时计算**的——一旦写进新的 params，boundingRect() 立刻
+        变成缩小后的尺寸，此时再想标记「旧的那块」已经晚了，那块区域永远进不了脏区，
+        视图不会重绘它 → 画布上留下一片残影。
+
+        因此正确顺序是：
+            old = item.mark_geometry_dirty()   # 改参数前
+            node.params[...] = new_value       # 改参数
+            item.refresh_geometry(old)         # 刷新几何 + 重绘旧区域
+        """
+        old_scene_rect = None
+        try:
+            old_scene_rect = self.mapToScene(self.boundingRect()).boundingRect()
+        except Exception:
+            old_scene_rect = None
+        try:
+            self.update(self.boundingRect())
+        except Exception:
+            self.update()
+        return old_scene_rect
+
+    def refresh_geometry(self, old_scene_rect: Optional[QRectF] = None):
+        """参数变化后刷新节点几何（高度随摘要行数 / 预览图变化）+ 重绘。
+
+        配合 mark_geometry_dirty() 使用（见那里的完整说明）。做三件事：
+          · prepareGeometryChange()：作废旧几何，让场景索引 / 命中判定 / 连线吸附
+            跟着新尺寸走（否则节点变矮后旧区域仍被索引，点上去会命中空处）；
+          · update()：把新几何记为待重绘；
+          · 把 old_scene_rect 映射回每个视图的视口并显式 update：
+            这一步是清残影的关键——只靠 scene 的脏区合并，节点变矮时旧区域
+            经常被收缩掉、不参与重绘；直接点名让视口重画那块，才一定干净。
+        """
         self.prepareGeometryChange()
         self.update()
+        if old_scene_rect is not None and not old_scene_rect.isEmpty():
+            try:
+                sc = self.scene()
+                if sc is not None:
+                    for v in sc.views():
+                        try:
+                            r = v.mapFromScene(old_scene_rect).boundingRect()
+                            v.viewport().update(r)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
 
     # ---------------- 数据接口 ----------------
     def set_running(self, running: bool):

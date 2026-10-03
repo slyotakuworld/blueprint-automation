@@ -458,7 +458,7 @@ class RuntimeWindow(QWidget):
         token = self._run_seq
         self._pending_restart = False
 
-        runner = BlueprintRunner(graph, self, initial_hwnd=None)
+        runner = BlueprintRunner(graph, self)
         runner.log_message.connect(self._append)
         runner.progress_step.connect(lambda step, ntype, t=token: self._on_progress(t, step, ntype))
         runner.finished_ok.connect(lambda t=token: self._on_finished_ok(t))

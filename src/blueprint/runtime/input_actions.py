@@ -194,13 +194,9 @@ class InputActions:
     def __init__(self, log_fn=None, is_running_fn=None):
         self._log = log_fn or (lambda *a, **k: None)
         self._is_running = is_running_fn or (lambda: True)
-        self.safe_region = None
 
     def _running(self):
         return bool(self._is_running())
-
-    def set_safe_region(self, region_xywh):
-        self.safe_region = region_xywh
 
     def _send_key_event(self, key, is_down):
         # 别名转换

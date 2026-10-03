@@ -26,10 +26,10 @@ CLICK_MODE_OPTIONS = ["position", "region", "key"]
 # ============================================================
 # 节点分类（四大类节点分类）
 # ============================================================
-CATEGORY_APP       = "应用控制"     # 第一类：打开程序/绑定窗口/系统命令/网页
-CATEGORY_LOGIC     = "逻辑组件"     # 第二类：开始/结束/循环/序列/变量/条件判断/剪贴板/提示
-CATEGORY_EXECUTE   = "执行动作"     # 第三类：鼠标/键盘/延时
-CATEGORY_VISION    = "视觉、感知"   # 第四类：找图/检索/静止/声音
+CATEGORY_APP       = "应用控制"     # 第一类：打开程序/系统命令/网页/网络请求
+CATEGORY_LOGIC     = "逻辑"         # 第二类：开始/结束/组件/循环/序列/并行/变量/条件判断
+CATEGORY_EXECUTE   = "动作"         # 第三类：鼠标/键盘/延时/提示/剪贴板
+CATEGORY_VISION    = "感知"         # 第四类：找图/检索/截图/静止/文字
 
 CATEGORIES_ORDER = [
     CATEGORY_APP,
@@ -43,10 +43,9 @@ CATEGORIES_ORDER = [
 CATEGORY_NODE_ORDER: Dict[str, List[str]] = {
     CATEGORY_APP: [
         "OpenApp",       # 1、打开程序
-        "BindWindow",    # 2、绑定窗口
-        "WebBrowser",    # 3、打开网页（浏览器打开URL）
-        "Command",       # 4、系统命令
-        "HttpRequest",   # 5、HTTP请求（接口调用：GET/POST/PUT/DELETE/Header/Body/超时）
+        "WebBrowser",    # 2、打开网页（浏览器打开URL）
+        "Command",       # 3、系统命令
+        "HttpRequest",   # 4、HTTP请求（接口调用：GET/POST/PUT/DELETE/Header/Body/超时）
     ],
     CATEGORY_LOGIC: [
         "Start",         # 1、开始
@@ -57,21 +56,20 @@ CATEGORY_NODE_ORDER: Dict[str, List[str]] = {
         "Parallel",      # 6、并行执行（多分支并发，子画布容器）
         "SetVariable",   # 7、变量
         "VarSwitch",     # 8、条件判断 → AND 多条件判断，每行 变量名 运算符 值，全部同时满足 → yes / 任一不满足 → no
-        "Clipboard",     # 9、剪贴板
-        "Notify",        # 10、提示
     ],
     CATEGORY_EXECUTE: [
         "Mouse",         # 1、鼠标
         "PressKey",      # 2、键盘
         "Wait",          # 3、延时
+        "Notify",        # 4、提示
+        "Clipboard",     # 5、剪贴板
     ],
     CATEGORY_VISION: [
         "FindImage",     # 1、找图 → 单图Find
         "IfImageDetect", # 2、检索 → 多图AND
-        "StillnessDetect",# 3、静止
-        "SoundDetect",   # 4、声音
-        "Screenshot",    # 5、截图 → 截目标窗口 ROI 输出图像
-        "OcrRecognize",  # 6、文字/数字识别 → 内置 OCR 引擎
+        "Screenshot",    # 3、截图 → 截目标窗口 ROI 输出图像
+        "StillnessDetect",# 4、静止
+        "OcrRecognize",  # 5、文字/数字识别 → 内置 OCR 引擎
     ],
 }
 
@@ -392,7 +390,7 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         # 端口固定（完成/失败），无需动态端口机制
         has_dynamic_ports=False,
     ),
-    # ---------------- 场景/窗口绑定（拆分后OpenApp + BindWindow） ----------------
+    # ---------------- 应用控制 ----------------
     "OpenApp": NodeMeta(
         type="OpenApp",
         category=CATEGORY_APP,
@@ -414,84 +412,63 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         ],
         type_short_name="open_app",
     ),
-    "BindWindow": NodeMeta(
-        type="BindWindow",
-        category=CATEGORY_APP,
-        title="绑定窗口",
-        description="告诉咱要操作哪个窗口~标题、程序名、类名这仨条件填了就得全对上才算配对成功，绑好之后后面的截图、点击、找图都会自动对准这个窗口的坐标哒。",
-        color="#8957E5",
-        accent="#A371F7",
-        inputs=[_exec_in()],
-        outputs=[
-            _exec_out("success", label="成功"),
-            _exec_out("fail", label="失败"),
-        ],
-        params=[
-            ParamDef(name="title", editor=EDITOR_STRING, default="", label="窗口标题"),
-            ParamDef(name="exe_name", editor=EDITOR_STRING, default="", label="程序名"),
-            ParamDef(name="class_name", editor=EDITOR_STRING, default="", label="窗口类名"),
-            ParamDef(name="resolution_w", editor=EDITOR_INT, default=0, label="分辨率宽",
-                     help="0=自动探测窗口实际宽；填了就按这个像素做屏幕坐标归一化"),
-            ParamDef(name="resolution_h", editor=EDITOR_INT, default=0, label="分辨率高",
-                     help="0=自动探测窗口实际高；填了就按这个像素做屏幕坐标归一化"),
-        ],
-        type_short_name="bind_win",
-    ),
     # ---------------- 动作 / 识别 ----------------
     "FindImage": NodeMeta(
         type="FindImage",
         category=CATEGORY_VISION,
         title="找图",
-        description="给咱一张参考图就在屏幕上找~在超时时间里反复试，找不到还能滚动鼠标页面后继续找；找到了可以顺手点一下，就算最后没找到，也会继续往下跑，下游靠「找到」信号自己判断就行啦。",
+        description="给咱一张参考图就在屏幕上找~在超时时间里反复试，找不到还能滚动鼠标页面后继续找；找到了可以顺手点一下再从「成功找到」往下走，一直没找到就走「没有找到」，「执行」出口则是找没找到都能继续；要是范围选了目标窗口却没能定位到窗口，那就只走「失败」。",
         color="#0969DA",
         accent="#58A6FF",
         inputs=[
             _exec_in(),
-            _data_in("in_template", "path", label="模板"),
-            _data_in("in_threshold", "float", label="阈值"),
         ],
         outputs=[
             _exec_out("out_exec", label="执行"),
+            _exec_out("err", label="失败"),
+            _exec_out("found", label="成功找到"),
+            _exec_out("not_found", label="没有找到"),
             _data_out("out_pos", "tuple2", label="位置"),
-            _data_out("out_found", "bool", label="找到"),
         ],
         params=[
+            # 范围模式
+            ParamDef(name="range_mode", editor=EDITOR_ENUM, default="window",
+                     options=["window", "fullscreen"],
+                     option_labels={"window": "目标窗口", "fullscreen": "全屏"},
+                     label="找图范围",
+                     help="目标窗口(window)：只在下面「目标窗口」定位到的那个窗口范围内找图，输出坐标也是相对该窗口左上角的（配合鼠标节点「目标窗口」模式使用）；\n"
+                          "全屏(fullscreen)：在整块屏幕上找图，输出坐标为绝对屏幕坐标（配合鼠标节点「全屏」模式使用）。\n"
+                          "选「目标窗口」时，窗口没找到会直接走「失败」出口，不会退化成全屏去找。"),
+            # 目标窗口定位（仅 range_mode=window 时生效）
+            ParamDef(name="target_title", editor=EDITOR_STRING, default="",
+                     label="目标窗口·标题",
+                     help="仅「目标窗口」范围生效。窗口标题子串匹配。\n三个条件（标题/程序名/类名）至少填一个；支持 {变量} 插值。\n点上方「🎯 拾取目标窗口」按钮可自动填充。"),
+            ParamDef(name="target_exe", editor=EDITOR_STRING, default="",
+                     label="目标窗口·程序名",
+                     help="仅「目标窗口」范围生效。程序名子串匹配（如 notepad.exe）。留空=不按程序名匹配。"),
+            ParamDef(name="target_class", editor=EDITOR_STRING, default="",
+                     label="目标窗口·类名",
+                     help="仅「目标窗口」范围生效。窗口类名精确匹配。留空=不按类名匹配。"),
+            # 匹配参数（算法 + 阈值相邻，便于一起调）
             ParamDef(
                 name="match_strategy",
                 editor=EDITOR_ENUM,
                 default="hybrid",
-                options=["hybrid", "template", "gray", "feature"],
+                options=["hybrid", "template", "gray"],
                 option_labels={
                     "hybrid": "智能混合",
                     "template": "模板匹配",
                     "gray": "灰度匹配",
-                    "feature": "特征匹配",
                 },
                 label="匹配算法",
                 help='各算法优缺点：\n'
-                     '● 智能混合(hybrid)【推荐】：彩色模板→灰度模板→AKAZE特征点，三层级联兜底。兼顾准确性、颜色容忍和抗形变，大多数场景首选。\n'
+                     '● 智能混合(hybrid)【推荐】：彩色模板→灰度模板，两级级联兜底。先按颜色找，找不到再用灰度找（吃下颜色变化），大多数场景首选。\n'
                      '● 模板匹配(template)：彩色像素归一化相关。速度最快，精度最高；但对缩放、旋转、颜色变化敏感。适合尺寸固定、画面清晰的UI按钮/图标。\n'
                      '● 灰度匹配(gray)：灰度像素归一化相关。容忍颜色变化（如选中态/高亮态），适合颜色可能变化但形状不变的场景。\n'
-                     '● 特征匹配(feature)：提取AKAZE局部特征点做匹配，经RANSAC几何验证。抗颜色变化、光照变化、局部遮挡、轻微旋转/缩放；但对纯色/少纹理图片会失败，速度稍慢。',
+                     '三种算法都自带多尺度搜索（约 0.45~1.8），可覆盖一定程度的缩放；但都不抗旋转与局部遮挡。',
             ),
-            # 找图范围模式
-            ParamDef(name="search_mode", editor=EDITOR_ENUM, default="relative",
-                     options=["relative", "absolute"],
-                     option_labels={"relative": "相对目标程序", "absolute": "全屏模式"},
-                     label="找图范围",
-                     help="相对目标程序(relative)：仅在目标程序窗口范围内截图找图，输出坐标也是相对窗口的（配合鼠标节点「相对绑定窗口」模式使用）；\n全屏模式(absolute)：截取整个屏幕找图，输出坐标为绝对屏幕坐标（配合鼠标节点「绝对屏幕坐标」模式使用）。"),
-            # 临时目标程序（仅 search_mode=relative 时生效）
-            ParamDef(name="temp_target_title", editor=EDITOR_STRING, default="",
-                     label="临时目标·标题",
-                     help="仅「相对目标程序」模式生效。\n填了就用这个窗口作为截图范围和坐标基准（不影响全局目标程序），留空=用全局目标程序。\n支持 {变量} 插值。\n点上方「🎯 拾取临时窗口」按钮可自动填充。"),
-            ParamDef(name="temp_target_exe", editor=EDITOR_STRING, default="",
-                     label="临时目标·程序名",
-                     help="仅「相对目标程序」模式生效。程序名子串匹配（如 notepad.exe）。\n留空=不按程序名匹配。"),
-            ParamDef(name="temp_target_class", editor=EDITOR_STRING, default="",
-                     label="临时目标·类名",
-                     help="仅「相对目标程序」模式生效。窗口类名精确匹配。\n留空=不按类名匹配。"),
             ParamDef(name="threshold", editor=EDITOR_FLOAT, default=0.9, label="匹配阈值", min=0.3, max=1.0, step=0.01,
-                     help="相似度阈值，越高越严格。模板匹配/混合模式=相关系数；特征匹配=内点比例。"),
+                     help="相似度阈值，越高越严格。模板匹配/灰度匹配/混合模式均为相关系数。"),
             ParamDef(name="timeout_seconds", editor=EDITOR_FLOAT, default=10.0, label="超时(秒)", min=0.5, max=600.0, step=0.5,
                      help="在超时时间内会根据自动滚动设置反复重试，直到找到或超时。"),
             ParamDef(name="template", editor=EDITOR_PATH, default="", label="模板路径",
@@ -499,8 +476,13 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
             ParamDef(name="template_b64", editor=EDITOR_STRING, default="", label="模板预览图(只读)",
                      help="通过「📸 截取目标」/「📂 导入图片」时会写入b64缩略图，便于画布节点直接预览。"),
             # 未找到时滚动重试
-            ParamDef(name="scroll_dy", editor=EDITOR_INT, default=0, label="滚动量(0=不滚动)", min=-5000, max=5000, step=10,
-                     help="鼠标滚轮滚动量。0=不滚动；负值=向前滚(向下翻页)；正值=向后滚(向上翻页)。\n非0时，找图失败后会将鼠标移到搜索区域中心滚动一次再重试，直到超时。"),
+            ParamDef(name="scroll_dy", editor=EDITOR_INT, default=0, label="滚动量(0=不滚动)", min=-5000, max=5000, step=1,
+                     help="鼠标滚轮滚动量，单位是「滚轮刻度数」（1 刻度 ≈ 滚轮拨一格）。0=不滚动；"
+                          "负值=向下翻页（内容往后滚）；正值=向上翻页。\n"
+                          "【推荐值 1~10】：3~5 通常就能翻动一屏，列表类界面用 3 左右最合适；\n"
+                          "填过头（例如 -300）会一次滚到底，反而跳过目标，看着像「找图失效」。\n"
+                          "非0时，找图失败后会把鼠标移到搜索区域中心滚动一次再重试，直到超时。\n"
+                          "上限 ±5000 只是留给极端场景的余量，日常基本用不到。"),
             # 找到后执行
             ParamDef(
                 name="after_action",
@@ -531,20 +513,38 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
                          "fallback": "兜底模式",
                      },
                      label="特征识别辅助",
-                     help="特征辅助用预存的小特征图做交叉验证：\n"
+                     help="特征辅助用预存的小特征图（点上方「✂ 从模板截取特征」生成）做交叉验证：\n"
                           "● 关闭：不使用特征辅助。\n"
-                          "● 验证模式：模板匹配成功后，再用特征辅助额外验证。特征也通过才算成功，否则判定失败（更严格）。\n"
-                          "● 兜底模式：模板匹配失败后，用特征辅助尝试找。找到了算成功（更宽松）。\n"
-                          "特征辅助内部固定使用彩色模板匹配，不受匹配算法选项影响。"),
+                          "● 验证模式：模板匹配成功后，再逐个验证特征是否还在原位；通过数量不够就判失败（更严格，抗误匹配）。\n"
+                          "● 兜底模式：模板匹配失败后，全屏搜特征并交叉验证位置，反推模板中心（更宽松，抗改版/缩放）。\n"
+                          "【特征为空时】没有可用特征图时：开启验证模式且「最少命中特征数」>0 → 直接判失败并打 WARN"
+                          "（不静默降级）；只有把「最少命中特征数」设为 0 才放行。\n"
+                          "【算法】特征小图跟随主算法，层数与主匹配保持一致："
+                          "主算法选「灰度匹配」→用灰度匹配；选「智能混合」→用「彩色→灰度」两级；"
+                          "选「模板匹配」→用彩色匹配。\n"
+                          "【换模板】换了模板图后，旧特征会失效，程序会自动清空特征数据并提示重新截取。"),
             ParamDef(name="features_json", editor=EDITOR_MULTILINE, default="[]",
                      label="特征列表(JSON)",
                      help="特征数据JSON数组，每项包含: b64(特征图base64), rel_x/rel_y(相对模板左上角), w/h(特征宽高)。\n通常通过面板上方「✂ 从模板截取特征」按钮自动生成，无需手填。"),
             ParamDef(name="feature_tolerance", editor=EDITOR_INT, default=15, min=1, max=200, step=1,
                      label="位置容差(像素)",
-                     help="特征位置验证的允许误差。实际位置与推算位置的欧几里得距离在此值内算通过。\n值越小越严格，建议 10-20。"),
-            ParamDef(name="feature_min_hits", editor=EDITOR_INT, default=2, min=1, max=20, step=1,
+                     help="两种模式下含义不同，别混用：\n"
+                          "● 兜底模式（模板没找到、靠特征反推位置）：这是「位置交叉验证」的允许误差。"
+                          "以第一个命中特征为基准，推算其他特征应该出现的位置，实际位置与推算位置的欧几里得距离"
+                          "超过此值就丢弃该特征；偏差大的特征被丢光、剩余命中数不够，就判本次失败。值越小越严格。\n"
+                          "● 验证模式（模板已找到、在命中位置附近验证特征）：不参与「通过与否」的判定。"
+                          "它只用来决定搜索窗口开多大：窗口宽 = 特征宽×缩放 + 容差×2（最小 30px）。"
+                          "因此这里调大 = 搜索范围更宽松、更容易验证通过，但太宽松就失去了「验证」的收紧作用。\n"
+                          "建议 10-20。"),
+            ParamDef(name="feature_min_hits", editor=EDITOR_INT, default=2, min=0, max=20, step=1,
                      label="最少命中特征数",
-                     help="至少多少个特征同时命中且位置验证通过才算整体匹配成功。\n至少需要2个才能做位置交叉验证。设1则退化为单特征匹配（不推荐）。"),
+                     help="判定口径（验证模式/兜底模式一致）：**命中并通过位置验证的特征数量 ≥ 此值**才算成功，"
+                          "小于它一律算失败。\n"
+                          "● 2（默认，推荐）：至少两个特征互相印证，能靠位置关系排除误匹配。\n"
+                          "● 1：退化为单特征匹配，失去交叉验证，误匹配概率明显升高（不推荐）。\n"
+                          "● 0：不要求任何特征命中。此时连「特征列表为空」也直接放行，等效于不做特征校验"
+                          "（仅用于临时放宽，比如刚开验证模式还没截特征），运行时会打 WARN 提醒。\n"
+                          "若此值大于实际可用特征数，本次运行必然失败，日志会明确提示。"),
             ParamDef(name="feature_capture_width", editor=EDITOR_INT, default=0, min=0, max=99999, step=1,
                      label="截图时窗口宽",
                      help="截取特征时目标窗口的宽度，用于分辨率不匹配时的缩放回退计算。通常自动记录，无需手填。"),
@@ -597,7 +597,7 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
     "Mouse": NodeMeta(
         type="Mouse",
         category=CATEGORY_EXECUTE,
-        title="鼠标操作",
+        title="鼠标",
         description="鼠标交给咱啦~点击、按住、释放、移动、拖拽、滚轮随便选，坐标既能去屏幕上点着选，也能从上游找图节点直接连线传过来更省心哟。",
         color="#ef6c00",
         accent="#ff9800",
@@ -610,22 +610,24 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
             _exec_out("err", label="失败"),
         ],
         params=[
-            # 1) 坐标参考系（第一位）
-            ParamDef(name="coord_mode", editor=EDITOR_ENUM, default="relative",
-                     options=["relative", "absolute"],
-                     option_labels={"relative": "相对绑定窗口", "absolute": "绝对屏幕坐标"},
-                     label="坐标参考系",
-                     help="相对绑定窗口(relative)：坐标基于绑定窗口左上角，拾取时自动扣除窗口偏移；\n绝对屏幕坐标(absolute)：坐标基于屏幕左上角。"),
-            # 1.5) 临时目标程序（仅 coord_mode=relative 时生效）
-            ParamDef(name="temp_target_title", editor=EDITOR_STRING, default="",
-                     label="临时目标·标题",
-                     help="仅「相对绑定窗口」模式生效。\n填了就用这个窗口作为坐标偏移基准（不影响全局目标程序），留空=用全局目标程序。\n支持 {变量} 插值。\n点上方「🎯 拾取临时窗口」按钮可自动填充标题/程序名/类名。"),
-            ParamDef(name="temp_target_exe", editor=EDITOR_STRING, default="",
-                     label="临时目标·程序名",
-                     help="仅「相对绑定窗口」模式生效。程序名子串匹配（如 notepad.exe）。\n留空=不按程序名匹配。"),
-            ParamDef(name="temp_target_class", editor=EDITOR_STRING, default="",
-                     label="临时目标·类名",
-                     help="仅「相对绑定窗口」模式生效。窗口类名精确匹配。\n留空=不按类名匹配。"),
+            # 1) 范围模式（第一位）
+            ParamDef(name="range_mode", editor=EDITOR_ENUM, default="window",
+                     options=["window", "fullscreen"],
+                     option_labels={"window": "目标窗口", "fullscreen": "全屏"},
+                     label="坐标基准",
+                     help="目标窗口(window)：坐标基于下方「目标窗口」定位到的那个窗口左上角，拾取时自动扣除窗口偏移（配合找图节点的「目标窗口」范围使用）；\n"
+                          "全屏(fullscreen)：坐标基于屏幕左上角（绝对屏幕坐标）。\n"
+                          "选「目标窗口」时，窗口没找到会直接走「失败」出口，不会按绝对坐标硬点。"),
+            # 1.5) 目标窗口定位（仅 range_mode=window 时生效）
+            ParamDef(name="target_title", editor=EDITOR_STRING, default="",
+                     label="目标窗口·标题",
+                     help="仅「目标窗口」模式生效。窗口标题子串匹配。\n三个条件（标题/程序名/类名）至少填一个；支持 {变量} 插值。\n点上方「🎯 拾取目标窗口」按钮可自动填充。"),
+            ParamDef(name="target_exe", editor=EDITOR_STRING, default="",
+                     label="目标窗口·程序名",
+                     help="仅「目标窗口」模式生效。程序名子串匹配（如 notepad.exe）。留空=不按程序名匹配。"),
+            ParamDef(name="target_class", editor=EDITOR_STRING, default="",
+                     label="目标窗口·类名",
+                     help="仅「目标窗口」模式生效。窗口类名精确匹配。留空=不按类名匹配。"),
             # 2) 动作类型（第二位）
             ParamDef(name="action", editor=EDITOR_ENUM, default="click",
                      options=["click", "move", "drag", "scroll"],
@@ -709,7 +711,7 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
     # ---------------- 通知 ----------------
     "Notify": NodeMeta(
         type="Notify",
-        category=CATEGORY_LOGIC,
+        category=CATEGORY_EXECUTE,
         title="通知",
         description="想提醒点啥就用咱~要么写在日志里，要么弹系统小窗口，还能放提示音，内容里塞变量也没问题哟。",
         color="#0B3A5C",
@@ -747,7 +749,7 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
     # ---------------- 系统交互 ----------------
     "Clipboard": NodeMeta(
         type="Clipboard",
-        category=CATEGORY_LOGIC,
+        category=CATEGORY_EXECUTE,
         title="剪贴板",
         description="管系统剪贴板的小助手~要么读出来存变量还顺带给下游数据线；要么把汝写的（或上游传进来的）内容写进去；也能一键清空剪贴板哟。",
         color="#4527a0",
@@ -813,13 +815,13 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         type="WebBrowser",
         category=CATEGORY_APP,
         title="打开网页",
-        description="帮汝开浏览器访问指定网址，默认浏览器或者Chrome/Edge/Firefox随便汝选。",
+        description="帮汝开浏览器访问指定网址，默认浏览器或者Chrome/Edge/Firefox随便汝选。指定了哪家就必须用哪家，找不到直接走「失败」，绝不偷偷换成默认浏览器哟。",
         color="#01579b",
         accent="#29b6f6",
         inputs=[_exec_in()],
         outputs=[
             _exec_out("out_done", label="完成"),
-            _exec_out("err", label="失败/超时"),
+            _exec_out("err", label="失败"),
         ],
         params=[
             ParamDef(name="url", editor=EDITOR_STRING,
@@ -828,8 +830,21 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
                      ),
             ParamDef(name="browser", editor=EDITOR_ENUM, default="默认",
                      options=["默认", "Chrome", "Edge", "Firefox"],
-                     label="浏览器"
-                     ),
+                     label="浏览器",
+                     help="默认(默认)：用系统默认浏览器打开；\n"
+                          "指定 Chrome/Edge/Firefox：必须已安装，找不到可执行文件会直接走「失败」出口，"
+                          "不会改用默认浏览器顶替（有些操作是绑定浏览器的，兜底会悄悄做错事）。"),
+            ParamDef(name="browser_path", editor=EDITOR_PATH, default="",
+                     label="浏览器完整路径",
+                     help="留空=按「浏览器」下拉自动查找；\n"
+                          "填了就只用这个 exe（绿色版、装在 D 盘等非标准位置的浏览器用这个）。\n"
+                          "填了但文件不存在 → 直接走「失败」（严格模式，不偷偷换成别的浏览器）。\n"
+                          "填了此项时「浏览器」下拉仅用于显示名称，实际启动以本路径为准。"),
+            ParamDef(name="wait_sec_after_open", editor=EDITOR_FLOAT, default=5.0, label="打开后等待(s)",
+                     min=0.0, max=120.0, step=0.1,
+                     help="浏览器启动命令下发后，本节点再等这么多秒才走下一节点。\n"
+                          "打开网页不是一瞬间的事（起窗口/页面加载都要时间），等一会儿更稳。\n"
+                          "填 0 = 不等（立即走下一节点）。"),
         ],
         type_short_name="web_browser",
     ),
@@ -879,49 +894,52 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         type="IfImageDetect",
         category=CATEGORY_VISION,
         title="检测",
-        description="当下就检查好几张图是不是都在屏幕上~完全求值全中才走是，短路缺一张就立马否决，一真即真（逻辑或）只要撞见任意一张中就喊是；只瞅当下这一眼，不会等太久哟。\n注意：完全模式下如果未添加任何检测图片，将直接走「否」分支（空集视为未匹配）。",
+        description="当下就检查好几张图是不是都在屏幕上~完全求值全中才走「检测到」，短路缺一张就立马否决，一真即真（逻辑或）只要撞见任意一张中就喊「检测到」；只瞅当下这一眼，不会等太久哟。\n注意：完全模式下如果未添加任何检测图片，将直接走「未检测到」分支（空集视为未匹配）。",
         color="#ef6c00",
         accent="#ff9800",
         inputs=[_exec_in()],
         outputs=[
-            _exec_out("yes", label="是"),
-            _exec_out("no", label="否"),
+            _exec_out("yes", label="检测到"),
+            _exec_out("no", label="未检测到"),
+            _exec_out("err", label="失败"),
         ],
         params=[
+            # 检测范围模式
+            ParamDef(name="range_mode", editor=EDITOR_ENUM, default="window",
+                     options=["window", "fullscreen"],
+                     option_labels={"window": "目标窗口", "fullscreen": "全屏"},
+                     label="检测范围",
+                     help="目标窗口(window)：只在下面「目标窗口」定位到的那个窗口范围内检测，确保所有模板都在同一个窗口内找到，避免跨窗口误匹配；\n"
+                          "全屏(fullscreen)：在整块屏幕上检测，可能把不同窗口的相似图案误判为同一目标。\n"
+                          "选「目标窗口」时，窗口没找到会直接走「失败」出口，不会退化成全屏去检测。"),
+            # 目标窗口定位（仅 range_mode=window 时生效）
+            ParamDef(name="target_title", editor=EDITOR_STRING, default="",
+                     label="目标窗口·标题",
+                     help="仅「目标窗口」范围生效。窗口标题子串匹配。\n三个条件（标题/程序名/类名）至少填一个；支持 {变量} 插值。"),
+            ParamDef(name="target_exe", editor=EDITOR_STRING, default="",
+                     label="目标窗口·程序名",
+                     help="仅「目标窗口」范围生效。程序名子串匹配（如 notepad.exe）。留空=不按程序名匹配。"),
+            ParamDef(name="target_class", editor=EDITOR_STRING, default="",
+                     label="目标窗口·类名",
+                     help="仅「目标窗口」范围生效。窗口类名精确匹配。留空=不按类名匹配。"),
+            # 匹配参数（算法 + 阈值相邻，便于一起调）
             ParamDef(
                 name="match_strategy",
                 editor=EDITOR_ENUM,
                 default="hybrid",
-                options=["hybrid", "template", "gray", "feature"],
+                options=["hybrid", "template", "gray"],
                 option_labels={
                     "hybrid": "智能混合",
                     "template": "模板匹配",
                     "gray": "灰度匹配",
-                    "feature": "特征匹配",
                 },
                 label="匹配算法",
                 help='各算法优缺点：\n'
-                     '● 智能混合(hybrid)【推荐】：彩色模板→灰度模板→AKAZE特征点，三层级联兜底。兼顾准确性、颜色容忍和抗形变，大多数场景首选。\n'
+                     '● 智能混合(hybrid)【推荐】：彩色模板→灰度模板，两级级联兜底。先按颜色找，找不到再用灰度找（吃下颜色变化），大多数场景首选。\n'
                      '● 模板匹配(template)：彩色像素归一化相关。速度最快，精度最高；但对缩放、旋转、颜色变化敏感。适合尺寸固定、画面清晰的UI按钮/图标。\n'
                      '● 灰度匹配(gray)：灰度像素归一化相关。容忍颜色变化（如选中态/高亮态），适合颜色可能变化但形状不变的场景。\n'
-                     '● 特征匹配(feature)：提取AKAZE局部特征点做匹配，经RANSAC几何验证。抗颜色变化、光照变化、局部遮挡、轻微旋转/缩放；但对纯色/少纹理图片会失败，速度稍慢。',
+                     '三种算法都自带多尺度搜索（约 0.45~1.8），可覆盖一定程度的缩放；但都不抗旋转与局部遮挡。',
             ),
-            # 检测范围模式
-            ParamDef(name="search_mode", editor=EDITOR_ENUM, default="relative",
-                     options=["relative", "absolute"],
-                     option_labels={"relative": "相对目标程序", "absolute": "全屏模式"},
-                     label="检测范围",
-                     help="相对目标程序(relative)：仅在目标程序窗口范围内截图检测，确保所有模板都在同一个窗口内找到，避免跨窗口误匹配；\n全屏模式(absolute)：截取整个屏幕检测，可能把不同窗口的相似图案误判为同一目标。"),
-            # 临时目标程序（仅 search_mode=relative 时生效）
-            ParamDef(name="temp_target_title", editor=EDITOR_STRING, default="",
-                     label="临时目标·标题",
-                     help="仅「相对目标程序」模式生效。\n填了就用这个窗口作为检测范围（不影响全局目标程序），留空=用全局目标程序。\n支持 {变量} 插值。"),
-            ParamDef(name="temp_target_exe", editor=EDITOR_STRING, default="",
-                     label="临时目标·程序名",
-                     help="仅「相对目标程序」模式生效。程序名子串匹配（如 notepad.exe）。\n留空=不按程序名匹配。"),
-            ParamDef(name="temp_target_class", editor=EDITOR_STRING, default="",
-                     label="临时目标·类名",
-                     help="仅「相对目标程序」模式生效。窗口类名精确匹配。\n留空=不按类名匹配。"),
             ParamDef(
                 name="threshold",
                 editor=EDITOR_FLOAT,
@@ -930,7 +948,7 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
                 min=0.3,
                 max=1.0,
                 step=0.01,
-                help="相似度阈值，越高越严格。模板匹配/混合模式=相关系数；特征匹配=内点比例。",
+                help="相似度阈值，越高越严格。模板匹配/灰度匹配/混合模式均为相关系数。",
             ),
             ParamDef(
                 name="eval_mode",
@@ -960,7 +978,7 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
     "StillnessDetect": NodeMeta(
         type="StillnessDetect",
         category=CATEGORY_VISION,
-        title="静止检测",
+        title="静止",
         description="盯着屏幕上一块区域看~画面安安静静不变就走yes，等太久还在动就超时走no，用来等加载结束最合适啦。",
         color="#d84315",
         accent="#ff7043",
@@ -968,24 +986,27 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         outputs=[
             _exec_out("yes", label="静止"),
             _exec_out("no", label="超时"),
+            _exec_out("err", label="失败"),
         ],
         params=[
-            # 截图范围模式
-            ParamDef(name="search_mode", editor=EDITOR_ENUM, default="relative",
-                     options=["relative", "absolute"],
-                     option_labels={"relative": "相对目标程序", "absolute": "全屏模式"},
-                     label="截图范围",
-                     help="相对目标程序(relative)：ROI 坐标基于目标窗口左上角，窗口移动ROI跟着移动；\n全屏模式(absolute)：ROI 坐标基于屏幕左上角，固定不变。"),
-            # 临时目标程序（仅 search_mode=relative 时生效）
-            ParamDef(name="temp_target_title", editor=EDITOR_STRING, default="",
-                     label="临时目标·标题",
-                     help="仅「相对目标程序」模式生效。\n填了就用这个窗口作为 ROI 坐标基准（不影响全局目标程序），留空=用全局目标程序。\n支持 {变量} 插值。"),
-            ParamDef(name="temp_target_exe", editor=EDITOR_STRING, default="",
-                     label="临时目标·程序名",
-                     help="仅「相对目标程序」模式生效。程序名子串匹配。\n留空=不按程序名匹配。"),
-            ParamDef(name="temp_target_class", editor=EDITOR_STRING, default="",
-                     label="临时目标·类名",
-                     help="仅「相对目标程序」模式生效。窗口类名精确匹配。\n留空=不按类名匹配。"),
+            # 检测范围模式
+            ParamDef(name="range_mode", editor=EDITOR_ENUM, default="window",
+                     options=["window", "fullscreen"],
+                     option_labels={"window": "目标窗口", "fullscreen": "全屏"},
+                     label="检测范围",
+                     help="目标窗口(window)：ROI 坐标基于下方「目标窗口」定位到的那个窗口左上角，窗口移动 ROI 跟着移动；\n"
+                          "全屏(fullscreen)：ROI 坐标基于屏幕左上角，固定不变。\n"
+                          "选「目标窗口」时，窗口没找到会直接走「失败」出口，不会退化成全屏去检测。"),
+            # 目标窗口定位（仅 range_mode=window 时生效）
+            ParamDef(name="target_title", editor=EDITOR_STRING, default="",
+                     label="目标窗口·标题",
+                     help="仅「目标窗口」范围生效。窗口标题子串匹配。\n三个条件（标题/程序名/类名）至少填一个；支持 {变量} 插值。"),
+            ParamDef(name="target_exe", editor=EDITOR_STRING, default="",
+                     label="目标窗口·程序名",
+                     help="仅「目标窗口」范围生效。程序名子串匹配。留空=不按程序名匹配。"),
+            ParamDef(name="target_class", editor=EDITOR_STRING, default="",
+                     label="目标窗口·类名",
+                     help="仅「目标窗口」范围生效。窗口类名精确匹配。留空=不按类名匹配。"),
             ParamDef(
                 name="stillness_seconds",
                 editor=EDITOR_FLOAT,
@@ -1020,7 +1041,7 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
                 name="roi",
                 editor=EDITOR_STRING,
                 default="[0,0,0,0]",
-                label="静止检测ROI",
+                label="静止ROI",
             ),
             ParamDef(
                 name="roi_preview_b64",
@@ -1042,45 +1063,6 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         ],
         type_short_name="if_static",
     ),
-    "SoundDetect": NodeMeta(
-        type="SoundDetect",
-        category=CATEGORY_VISION,
-        title="声音检测",
-        description="竖起耳朵听声音~要么等提示音响起来就满足，要么等环境彻底安静下来才算数，等太久就超时走no哟。",
-        color="#00838f",
-        accent="#00acc1",
-        inputs=[_exec_in()],
-        outputs=[
-            _exec_out("yes", label="满足"),
-            _exec_out("no", label="超时/不满足"),
-        ],
-        params=[
-            ParamDef(name="device", editor=EDITOR_STRING, default="default_loopback",
-                     label="音频设备ID",
-                     help='default_loopback=当前默认扬声器（录制系统播放的声音）；可从下拉框直接选择扬声器环回或麦克风设备'),
-            ParamDef(
-                name="judge_mode", editor=EDITOR_ENUM, default="detect_sound",
-                options=["detect_sound", "detect_silence"],
-                option_labels={
-                    "detect_sound": "检测声音",
-                    "detect_silence": "检测静音",
-                },
-                label="判断模式",
-                help='检测声音：只要采样期间出现一次超阈值声音就判定满足（适合等提示音）；\n'
-                     '检测静音：采样期间全部低于阈值才判定满足（适合等环境安静下来）。',
-            ),
-            ParamDef(name="sample_ms", editor=EDITOR_INT, default=500, min=50, max=10000,
-                     label="单次采样时长(ms)", help="越长越准，但单次检测越慢；「检测静音」建议设 500~2000ms"),
-            ParamDef(name="threshold_db", editor=EDITOR_FLOAT, default=-30.0, min=-90.0, max=0.0, step=0.5,
-                     label="振幅阈值(dBFS)", help="默认 -30dB≈人耳清晰可闻；调大(如-10)必须很响才算；调小(如-60)轻微响声也触发"),
-            ParamDef(name="timeout_seconds", editor=EDITOR_FLOAT, default=5.0, min=0.0, max=600.0, step=0.5,
-                     label="超时(秒)", help="0=永不超时(慎用)；默认5秒内一直不满足条件就走 no"),
-            ParamDef(name="debug_visual", editor=EDITOR_BOOL, default=False,
-                     label="调试可视化",
-                     help="仅debug时勾；会在日志用ASCII字符画绘制采样波形+阈值线"),
-        ],
-        type_short_name="if_sound",
-    ),
     "Screenshot": NodeMeta(
         type="Screenshot",
         category=CATEGORY_VISION,
@@ -1097,20 +1079,22 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
             _data_out("image_path", "str", label="保存路径"),
         ],
         params=[
-            ParamDef(name="capture_mode", editor=EDITOR_ENUM, default="target",
-                     options=["target", "fullscreen"],
-                     option_labels={"target": "目标窗口", "fullscreen": "全屏"},
+            ParamDef(name="range_mode", editor=EDITOR_ENUM, default="window",
+                     options=["window", "fullscreen"],
+                     option_labels={"window": "目标窗口", "fullscreen": "全屏"},
                      label="截取范围",
-                     help="目标窗口(target)：截「临时目标」窗口（用下面的标题/程序名/类名定位）；\n全屏(fullscreen)：截整个虚拟桌面。"),
-            ParamDef(name="temp_target_title", editor=EDITOR_STRING, default="",
-                     label="临时目标·标题",
-                     help="窗口标题子串匹配（仅截取范围=目标窗口时生效）。留空=不按标题匹配。支持 {var} 插值。"),
-            ParamDef(name="temp_target_exe", editor=EDITOR_STRING, default="",
-                     label="临时目标·程序名",
-                     help="程序名子串匹配（如 notepad.exe）。留空=不按程序名匹配。支持 {var} 插值。"),
-            ParamDef(name="temp_target_class", editor=EDITOR_STRING, default="",
-                     label="临时目标·类名",
-                     help="窗口类名精确匹配。留空=不按类名匹配。支持 {var} 插值。"),
+                     help="目标窗口(window)：截「目标窗口」定位到的那个窗口；\n"
+                          "全屏(fullscreen)：截整个虚拟桌面。\n"
+                          "选「目标窗口」时，窗口没找到会直接走「失败」出口，不会退化成截全屏。"),
+            ParamDef(name="target_title", editor=EDITOR_STRING, default="",
+                     label="目标窗口·标题",
+                     help="窗口标题子串匹配（仅截取范围=目标窗口时生效）。三个条件至少填一个；支持 {var} 插值。"),
+            ParamDef(name="target_exe", editor=EDITOR_STRING, default="",
+                     label="目标窗口·程序名",
+                     help="程序名子串匹配（仅截取范围=目标窗口时生效）。留空=不按程序名匹配。支持 {var} 插值。"),
+            ParamDef(name="target_class", editor=EDITOR_STRING, default="",
+                     label="目标窗口·类名",
+                     help="窗口类名精确匹配（仅截取范围=目标窗口时生效）。留空=不按类名匹配。支持 {var} 插值。"),
             ParamDef(name="roi", editor=EDITOR_TUPLE4, default=(0, 0, 0, 0),
                      label="ROI区域(x,y,w,h)",
                      help="相对窗口/屏幕左上角的区域，格式 (x, y, w, h)。全 0 = 截整个范围。"),
@@ -1126,37 +1110,40 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
     "OcrRecognize": NodeMeta(
         type="OcrRecognize",
         category=CATEGORY_VISION,
-        title="文字识别",
-        description="用内置 OCR 引擎识别图像里的文字和数字~可以自己截 ROI，也能直接吃上游截图节点给的图像，识别结果存成变量、还能按整行/逐条输出。",
+        title="文字",
+        description="用内置 OCR 引擎识别屏幕上的文字和数字~按「识别范围」现场截图（目标窗口 / 全屏），输出整屏文本和逐条识别结果；还能填一段文本或正则表达式去匹配整屏文本，命中走「匹配到」、没命中走「未匹配到」，一条文字都没识别到则单独走「无文字」。",
         color="#0b3d61",
         accent="#29b6f6",
         inputs=[
             _exec_in(),
-            _data_in("in_image", "image", label="图像(BGR)"),
         ],
         outputs=[
             _exec_out("out_done", label="完成"),
-            _exec_out("err", label="失败/无文字"),
+            _exec_out("no_text", label="无文字"),
+            _exec_out("matched", label="匹配到"),
+            _exec_out("not_matched", label="未匹配到"),
+            _exec_out("err", label="失败"),
             _data_out("text", "str", label="整屏文本"),
             _data_out("items", "list", label="识别条目(列表)"),
-            _data_out("first_text", "str", label="第一条文字"),
-            _data_out("count", "int", label="识别条数"),
         ],
         params=[
-            ParamDef(name="source_mode", editor=EDITOR_ENUM, default="roi",
-                     options=["roi", "input_image"],
-                     option_labels={"roi": "自己截 ROI", "input_image": "用输入图像"},
-                     label="图片来源",
-                     help="自己截 ROI(roi)：按下面临时目标+ROI 现场截图识别；\n用输入图像(input_image)：直接识别上游截图节点连进来的图像。"),
-            ParamDef(name="temp_target_title", editor=EDITOR_STRING, default="",
-                     label="临时目标·标题",
-                     help="图片来源=自己截ROI时生效。窗口标题子串匹配。支持 {var} 插值。"),
-            ParamDef(name="temp_target_exe", editor=EDITOR_STRING, default="",
-                     label="临时目标·程序名",
-                     help="图片来源=自己截ROI时生效。程序名子串匹配。支持 {var} 插值。"),
-            ParamDef(name="temp_target_class", editor=EDITOR_STRING, default="",
-                     label="临时目标·类名",
-                     help="图片来源=自己截ROI时生效。窗口类名精确匹配。支持 {var} 插值。"),
+            ParamDef(name="range_mode", editor=EDITOR_ENUM, default="window",
+                     options=["window", "fullscreen"],
+                     option_labels={"window": "目标窗口", "fullscreen": "全屏"},
+                     label="识别范围",
+                     help="目标窗口(window)：只在下面「目标窗口」定位到的那个窗口内截图识别，ROI 坐标相对该窗口左上角；\n"
+                          "全屏(fullscreen)：在整块屏幕上截图识别，ROI 坐标相对屏幕左上角。\n"
+                          "选「目标窗口」时，窗口没找到会直接走「失败」出口，不会退化成截全屏。"),
+            # 目标窗口定位（仅 range_mode=window 时生效）
+            ParamDef(name="target_title", editor=EDITOR_STRING, default="",
+                     label="目标窗口·标题",
+                     help="仅「识别范围=目标窗口」生效。窗口标题子串匹配。三个条件至少填一个；支持 {var} 插值。"),
+            ParamDef(name="target_exe", editor=EDITOR_STRING, default="",
+                     label="目标窗口·程序名",
+                     help="仅「识别范围=目标窗口」生效。程序名子串匹配。留空=不按程序名匹配。支持 {var} 插值。"),
+            ParamDef(name="target_class", editor=EDITOR_STRING, default="",
+                     label="目标窗口·类名",
+                     help="仅「识别范围=目标窗口」生效。窗口类名精确匹配。留空=不按类名匹配。支持 {var} 插值。"),
             ParamDef(name="roi", editor=EDITOR_TUPLE4, default=(0, 0, 0, 0),
                      label="ROI区域(x,y,w,h)",
                      help="相对窗口/屏幕左上角的区域，全 0 = 识别整个范围。"),
@@ -1168,12 +1155,19 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
                      option_labels={"ch": "中文(含数字)", "en": "英文(含数字)"},
                      label="识别语言",
                      help="中文模型同时覆盖中文+数字；英文模型更快，适合纯数字/英文场景。"),
-            ParamDef(name="save_to_var", editor=EDITOR_STRING, default="ocr_text",
-                     label="整屏文本存到变量",
-                     help="识别出的整屏文本（多行换行连接）写入这个变量名。留空=不写变量。"),
-            ParamDef(name="first_to_var", editor=EDITOR_STRING, default="",
-                     label="第一条存到变量",
-                     help="识别出的第一条文字写入这个变量名（常用来存单个数字/词）。留空=不写。"),
+            # 文本匹配（填了「匹配文本」才会做匹配）
+            ParamDef(name="match_mode", editor=EDITOR_ENUM, default="contains",
+                     options=["contains", "regex"],
+                     option_labels={"contains": "包含文本", "regex": "正则表达式"},
+                     label="匹配方式",
+                     help="包含文本：整屏文本里出现「匹配文本」这几个字就算命中（区分大小写）；\n"
+                          "正则表达式：把「匹配文本」当成正则去匹配整屏文本，例如 [Hh]ello、金币\\s*(\\d+)、error|失败。\n"
+                          "两种方式都只在填了「匹配文本」时才生效。"),
+            ParamDef(name="match_text", editor=EDITOR_STRING, default="",
+                     label="匹配文本",
+                     help="要在整屏文本里查找的内容（此处不做 {变量} 插值，避免与正则的 {} 冲突）。\n"
+                          "留空 = 不做匹配：识别到文字时只走「完成」出口；\n"
+                          "填了 = 命中走「匹配到」、没命中走「未匹配到」（两者都会同时触发「完成」）。"),
         ],
         type_short_name="ocr_recognize",
     ),

@@ -66,6 +66,9 @@ _DEFAULT_SETTINGS: Dict[str, Any] = {
     },
     "ui": {
         "theme": "dark",
+        # 启动后主窗口是否自动最大化铺满屏幕（保留标题栏与任务栏，可随时还原）。
+        # 想要普通窗口启动，把 config.json 里 ui.start_maximized 改成 false。
+        "start_maximized": True,
     },
 }
 

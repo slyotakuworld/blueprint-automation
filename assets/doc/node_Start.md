@@ -6,7 +6,7 @@
 
 ## 节点外观
 
-- **分类**：🧠 逻辑组件
+- **分类**：🧠 逻辑
 - **配色**：GitHub 绿 (#238636 / #3FB950)
 - **短名**：`start`
 
@@ -42,7 +42,7 @@
    - Start 的 ▶ 输出 → 接到第一个执行节点
    - 典型链路：
      ```
-     Start → OpenApp → Wait → BindWindow → FindImage → Mouse → PressKey → End
+     Start → OpenApp → Wait → FindImage → Mouse → PressKey → End
      ```
 
 3. **调试时想从中间开始？**

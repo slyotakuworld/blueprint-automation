@@ -2,7 +2,7 @@
 
 蓝图自动化工具有时会运行在"不希望被一眼看出是机器人"的场景（比如游戏日常任务挂机）。这一节整理几个让操作更像真人的小技巧，以及节点里对应的参数。
 
-> 🍎 提示：工具本身不会绕过任何游戏的反作弊驱动程序（如 EAC、BattlEye），它们是内核级的，请自行评估在某个具体软件里是否允许自动化。这里的技巧只针对「通过图像/声音识别做界面级 RPA」的行为检测。
+> 🍎 提示：工具本身不会绕过任何游戏的反作弊驱动程序（如 EAC、BattlEye），它们是内核级的，请自行评估在某个具体软件里是否允许自动化。这里的技巧只针对「通过图像识别做界面级 RPA」的行为检测。
 
 ---
 
@@ -91,7 +91,7 @@ VarSwitch(today 存的 != 已完成日期 → 跑日常；默认 → 蓝图睡 1
 ```
 Start
  ├─ 1. OpenApp（游戏路径，等待 15 秒）
- ├─ 2. BindWindow（绑游戏窗口，resolution 1280×720 方便坐标）
+ ├─ 2. 各视觉/鼠标节点里填「目标窗口」定位（如 程序名=game.exe），坐标基准选「目标窗口」
  ├─ 3. Loop(count=10)   ← 假设 10 个每日任务
  │     loop_body →
  │       FindImage(接取任务按钮, click)
@@ -115,5 +115,5 @@ Start
 |------|------|
 | 更像真人 | Wait 全用 random 模式；Mouse hold/post_delay 设 min≠max |
 | 更快 | Wait 设 fixed 0.1s；drag_duration_ms 调小；Mouse hold_min/max 调小 |
-| 更稳定（找图） | FindImage 阈值 0.9+；模板图截紧凑；search_mode 绑窗口减少误判 |
+| 更稳定（找图） | FindImage 阈值 0.9+；模板图截紧凑；「找图范围」选目标窗口减少误判 |
 | 更稳（点击） | FindImage after_action=click 比单独 FindImage→Mouse 更不容易坐标错位 |

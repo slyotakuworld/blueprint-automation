@@ -6,7 +6,7 @@
 
 ## 节点外观
 
-- **分类**：🧠 逻辑组件
+- **分类**：🧠 逻辑
 - **配色**：蓝 (#1F6FEB / #58A6FF)
 - **短名**：`component`
 
@@ -105,7 +105,7 @@
 
 ```
 1. 在工程里把「登录流程.bp.json」标为组件蓝图（右键 → 🧩 设为组件蓝图），内容：
-     Start(num_params=1) → OpenApp → BindWindow → SetVariable(logged_in=true) → End(num_returns=1)
+     Start(num_params=1) → OpenApp → FindImage(登录按钮, click) → SetVariable(logged_in=true) → End(num_returns=1)
 
 2. 主蓝图拖一个 Component 节点，下拉选择「登录流程.bp.json」。
 

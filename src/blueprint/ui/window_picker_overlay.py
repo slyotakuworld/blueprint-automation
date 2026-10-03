@@ -93,21 +93,30 @@ def get_exe_name_by_pid(pid: int) -> str:
     return ""
 
 
-def _is_window_valid_target(hwnd: int, my_pid: int) -> bool:
-    """过滤无效窗口的逻辑。"""
+def _is_window_valid_target(hwnd: int, my_pid: int, include_minimized: bool = False) -> bool:
+    """过滤无效窗口的逻辑。
+
+    include_minimized=False（拾取遮罩用）：排除最小化窗口——鼠标点不到它，列出来只会误导。
+    include_minimized=True（「从列表选择」用）：**保留最小化窗口**，且跳过只对"正常显示"
+    才有意义的检查（DWM cloaked / 尺寸过小 / 矩形有效性）：
+      · 最小化窗口的 GetWindowRect 只有图标大小（实测 160×28），尺寸门槛会误杀；
+      · UWP 应用最小化时会被 DWM 标记为 cloaked，不跳过就永远列不出来。
+    """
     if not _user32.IsWindowVisible(hwnd):
         return False
-    if _user32.IsIconic(hwnd):
+    minimized = bool(_user32.IsIconic(hwnd))
+    if minimized and not include_minimized:
         return False
     if _user32.GetWindow(hwnd, GW_OWNER) != 0:
         return False
-    is_cloaked = ctypes.c_int(0)
-    _dwmapi.DwmGetWindowAttribute(
-        hwnd, DWMWA_CLOAKED,
-        ctypes.byref(is_cloaked), ctypes.sizeof(is_cloaked),
-    )
-    if is_cloaked.value != 0:
-        return False
+    if not minimized:
+        is_cloaked = ctypes.c_int(0)
+        _dwmapi.DwmGetWindowAttribute(
+            hwnd, DWMWA_CLOAKED,
+            ctypes.byref(is_cloaked), ctypes.sizeof(is_cloaked),
+        )
+        if is_cloaked.value != 0:
+            return False
     pid = wintypes.DWORD()
     _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
     if pid.value == my_pid:
@@ -116,12 +125,13 @@ def _is_window_valid_target(hwnd: int, my_pid: int) -> bool:
     _user32.GetClassNameW(hwnd, cls_buff, 256)
     if cls_buff.value in _EXCLUDED_CLASSES:
         return False
-    rect = wintypes.RECT()
-    _user32.GetWindowRect(hwnd, ctypes.byref(rect))
-    w = rect.right - rect.left
-    h = rect.bottom - rect.top
-    if w < 10 or h < 10:
-        return False
+    if not minimized:
+        rect = wintypes.RECT()
+        _user32.GetWindowRect(hwnd, ctypes.byref(rect))
+        w = rect.right - rect.left
+        h = rect.bottom - rect.top
+        if w < 10 or h < 10:
+            return False
     length = _user32.GetWindowTextLengthW(hwnd)
     if length == 0 and cls_buff.value == "ApplicationFrameWindow":
         return False
@@ -150,16 +160,23 @@ def _get_window_info(hwnd: int) -> Optional[Dict[str, Any]]:
         "exe_name": get_exe_name_by_pid(pid.value),
         "pid": int(pid.value),
         "rect": (int(rect[0]), int(rect[1]), int(rect[2]), int(rect[3])),
+        # 最小化的窗口：矩形只有图标大小，别拿 rect 当窗口范围用
+        "minimized": bool(_user32.IsIconic(hwnd)),
     }
 
 
-def enumerate_valid_windows() -> list:
-    """枚举所有有效目标窗口。"""
+def enumerate_valid_windows(include_minimized: bool = False) -> list:
+    """枚举所有有效目标窗口。
+
+    include_minimized=False：只列正常显示的窗口（拾取遮罩用，点得到）。
+    include_minimized=True ：连最小化的窗口一起列（「从列表选择」用 ——
+        常见场景就是目标窗口还最小化着，想先把定位条件填好）。
+    """
     my_pid = os.getpid()
     results = []
 
     def _cb(hwnd, _lparam):
-        if _is_window_valid_target(hwnd, my_pid):
+        if _is_window_valid_target(hwnd, my_pid, include_minimized=include_minimized):
             info = _get_window_info(hwnd)
             if info:
                 results.append(info)

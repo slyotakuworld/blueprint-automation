@@ -6,24 +6,23 @@
 
 ## 一、找图慢？这些地方可以提速
 
-### 1. 搜索范围 search_mode 务必用 relative
-- relative 模式：只截目标窗口大小（可能 1280×720 = 92 万像素）
-- absolute 全屏模式：截 2560×1440 = 368 万像素（慢 4 倍！）
-→ 除非找的是桌面/任务栏图标，否则**优先 BindWindow 一次，后面全部 relative**。
+### 1. 找图范围优先用「目标窗口」
+- 「目标窗口」模式：只截目标窗口大小（可能 1280×720 = 92 万像素）
+- 「全屏」模式：截 2560×1440 = 368 万像素（慢 4 倍！）
+→ 除非找的是桌面/任务栏图标，否则**优先给节点填「目标窗口」定位（标题/程序名/类名），找图范围用「目标窗口」**。
 
 ### 2. 模板图别截太大
 模板图 200×100 像素和 50×30 像素，对"是这个按钮"的辨识度没差多少，但：
 - 匹配时间 ≈ (屏幕像素 / 模板像素) × 算法耗时
 → 把模板图截得紧凑一点（按钮本体就行，别把大片背景包进去）。
 
-### 3. match_strategy 能选简单就别选 feature
+### 3. match_strategy 能选简单就别选 hybrid
 ```
-速度排序（从快到慢）：template > gray > hybrid > feature
+速度排序（从快到慢）：template > gray > hybrid
 ```
 - 按钮颜色永远是一个颜色不会变 → 直接 template
 - 按钮颜色会变但形状不变 → gray
-- 不确定 → hybrid（大多数场景够了）
-- 只有在画面复杂/变形/光照不稳的时候才单独用 feature
+- 不确定 → hybrid（大多数场景够了，最多两层）
 
 ### 4. IfImageDetect 参考图太多？用短路模式
 20 张 AND 判断，但其实只要第一张没过立刻否决：
@@ -46,8 +45,8 @@ eval_mode = short_circuit（短路）
 [Start] 触发 out_done
   → [OpenApp] in_exec 被触发
   OpenApp: 启动 D:\Games\xxx.exe 成功 PID=12345
-  → [BindWindow] in_exec 被触发
-  BindWindow: 已绑定窗口 0x123456 赫萝的苹果摊
+  → [FindImage] in_exec 被触发
+  FindImage: 目标窗口内找图 region=(0,0,1280,720) → 命中 (320,180) score=0.94
   ...
 ```
 → **看最后执行到哪一行**，就知道卡住的节点是谁。
@@ -65,9 +64,8 @@ eval_mode = short_circuit（短路）
 2️⃣ 看结果弹窗里的「级联路径」和「得分」
 3️⃣ 决定是调阈值还是换算法还是换模板图
 
-### 4. StillnessDetect / SoundDetect 调试开关
-- StillnessDetect：先把 stillness_seconds 调得很小（0.2 秒），看能不能过；把 diff_threshold 从 0.01 改到 0.05 试试
-- SoundDetect：**开 debug_visual** ✅，看 ASCII 波形里实际 dB 多大
+### 4. StillnessDetect 调试开关
+- 先把 stillness_seconds 调得很小（0.2 秒），看能不能过；把 diff_threshold 从 0.01 改到 0.05 试试
 
 ---
 
@@ -92,15 +90,15 @@ PressKey / Notify / SetVariable compute 表达式里写了 `{xxx}` 或变量名 
    - 有得分但低：调阈值
    - 完全没分：算法不适配 → 换算法或重截图
    - 窗口被挡住/最小化
-   - search_mode 错（relative/absolute 绑错窗口了
-3. 截图是不是 BindWindow 没绑对窗口
+   - 「找图范围」选目标窗口，但「目标窗口」定位条件（标题/程序名/类名）填错了
+3. 模板图是不是从别的窗口/别的分辨率截来的，和目标窗口对不上
 
 ### 「Mouse 点歪了点在错地方」
-- 90% 是 search_mode（Mouse / coord_mode 错配：
+- 90% 是两边坐标口径错配（找图范围 vs 鼠标坐标基准）：
   ```
-  FindImage.relative + Mouse.absolute → 必定点歪！
+  FindImage.范围=目标窗口 + Mouse.坐标基准=全屏 → 必定点歪！
   ```
-→ 保持两个节点模式一致，都是 relative 或都是 absolute。
+→ 保持两个节点口径一致：都是「目标窗口」，或者都是「全屏」。
 
 ---
 
@@ -110,6 +108,6 @@ PressKey / Notify / SetVariable compute 表达式里写了 `{xxx}` 或变量名 
 |------|-----------|---------|
 | 蓝图一跑就秒停，只跑了 Start 没跑别的 | Start 没接下游 in_exec | 连一条线：Start.out_done → 下一节点.in_exec |
 | 跑着跑着不动了 | FindImage 在等超时 / Loop infinite 没 break | 日志看到哪停的 → 调小 timeout / 加 break 分支 |
-| 跑很快，但没效果（点了像没点） | Mouse/PressKey 没绑窗口，点到别的地方去了 | 先 BindWindow，后面全 relative |
+| 跑很快，但没效果（点了像没点） | Mouse 坐标基准和上游找图口径不一致，点到别的地方去了 | 给节点填「目标窗口」定位，坐标基准/找图范围都选「目标窗口」 |
 | Notify 弹了，但没消息 | text 写的 {变量}，上游没设 | 用 SetVariable 先设，或者直接写死文字 |
 | HTTP 500/401 | 接口地址或 token 错 | 用 Postman/curl 先确定接口本身是通的 |

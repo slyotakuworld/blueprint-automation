@@ -213,6 +213,9 @@ class BlueprintMainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("蓝图自动化工具")
+        # 初始尺寸 = 「还原」时的窗口大小（正常几何）。启动时默认走 showMaximized()
+        # 直接最大化铺满屏幕（见 main()）；用户点「还原」就回到这个尺寸，
+        # 所以这里必须保留一个合理的默认值，删掉的话还原会变成一个很小的裸窗口。
         self.resize(1560, 920)
         self._toasts: List[_NotifyToastCard] = []
         self._current_path: Optional[str] = None
@@ -2798,8 +2801,27 @@ class BlueprintMainWindow(QMainWindow):
         # 实际应用修改
         # ================================================================
         node = self._graph.nodes[node_id]
-        node.params[param_name] = value
+        # 改参数**之前**先把节点当前（旧的）整块区域标记为待重绘：
+        # 摘要行数/预览图变化会让节点变高变矮，变矮时旧区域必须重绘才不会留残影。
+        # 必须在改之前——update() 的矩形会被裁剪到当时的 boundingRect，
+        # 等 params 写进去后 boundingRect 已经变小，旧区域就再也标不上了。
         ni = self._scene.node_item(node_id)
+        _old_scene_rect = None
+        if ni is not None:
+            try:
+                _old_scene_rect = ni.mark_geometry_dirty()
+            except Exception:
+                _old_scene_rect = None
+        node.params[param_name] = value
+        # ---- 换模板 → 级联清空「特征识别辅助」里与旧模板绑定的数据 ----
+        # 特征的 rel_x/rel_y、特征图、模板总宽高都是按「截取时那张模板」记录的：
+        # 换了模板，旧特征既不可能命中（验证模式 100% 失败），还会让兜底模式推算的模板原点整体错位。
+        # 这里清空，并把清空动作并入刚压入的那条撤销记录（Ctrl+Z 可一起还原）。
+        if param_name == "template" and not applying_undo:
+            try:
+                self._cascade_clear_feature_assist(node, cur)
+            except Exception as e:
+                print(f"[WARN] 换模板时清空特征数据失败: {e}")
         if ni is not None:
             # 动态端口节点：关键参数变化时，重建端口集（输入/输出都可能变）
             # 注意：每次端口变化后，必须延迟刷新 inspector，退出当前信号栈再重建 UI，防止 sender 控件被中途删除导致 0xC0000005 ACCESS_VIOLATION
@@ -2921,9 +2943,81 @@ class BlueprintMainWindow(QMainWindow):
             except Exception as e:
                 print(f"[WARN] _on_param_changed 端口刷新异常: {e}")
                 import traceback; traceback.print_exc()
-            # 任何参数变化 → 强制节点卡重绘（刷新标题三段式显示 + 摘要文本）
-            ni.update()
+            # 任何参数变化 → 刷新节点几何 + 重绘（标题三段式 + 摘要文本）
+            # 传入改参数前采样的旧几何：节点变矮时显式让视口重绘旧区域，否则留残影
+            ni.refresh_geometry(_old_scene_rect)
         self._scene.graph_changed.emit()
+
+    # 与「模板图」绑定的特征辅助参数：模板一换，这些值全部失效
+    _FEATURE_BOUND_PARAMS = (
+        "features_json",          # 特征图 + 相对模板左上角的 rel_x/rel_y
+        "feature_template_w",     # 旧模板总宽
+        "feature_template_h",     # 旧模板总高
+        "feature_capture_width",  # 截取特征时的窗口宽（缩放回退用）
+    )
+
+    def _cascade_clear_feature_assist(self, node, old_template):
+        """换模板时清空与旧模板绑定的特征数据，并把本次清空并入同一条撤销记录。
+
+        old_template 是改参数之前的旧值（用于「路径没真变」的短路）。
+        """
+        import copy as _copy
+        try:
+            if str(node.params.get("template", "") or "") == str(old_template or ""):
+                return
+            old_vals = {}
+            new_vals = {}
+            changed = False
+            for k in self._FEATURE_BOUND_PARAMS:
+                old_v = _copy.deepcopy(node.params.get(k, None))
+                new_v = "[]" if k == "features_json" else 0
+                if old_v != new_v:
+                    changed = True
+                old_vals[k] = old_v
+                new_vals[k] = new_v
+                node.params[k] = new_v
+            if not changed:
+                return
+            # 并入刚压入的那条 change_param 记录，保证 Ctrl+Z 一次性还原「模板+特征」
+            if self._undo_stack:
+                top = self._undo_stack[-1]
+                if (isinstance(top, dict) and top.get("kind") == "change_param"
+                        and top.get("node_id") == node.id and top.get("param_name") == "template"):
+                    top["cascade"] = {
+                        "node_id": node.id,
+                        "old_values": old_vals,
+                        "new_values": new_vals,
+                    }
+            try:
+                self._log.append_log(
+                    "[找图] 模板已更换 → 原特征数据已自动清空"
+                    "（特征图与相对位置都是相对旧模板记录的，留着必然误判）；"
+                    "若仍需特征辅助，请重新点「✂ 从模板截取特征」。",
+                    "WARN",
+                )
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"[WARN] _cascade_clear_feature_assist 异常: {e}")
+
+    def _apply_cascade_params(self, action, which: str):
+        """撤销/重做 change_param 时，把附带记录的级联参数（如特征数据）一并应用。
+
+        which = "old_values"（撤销）/ "new_values"（重做）。
+        调用时 _applying_undo_redo=True，所以不会再次压栈、也不会再次触发清空逻辑。
+        """
+        try:
+            casc = action.get("cascade")
+            if not isinstance(casc, dict):
+                return
+            nid = casc.get("node_id") or action.get("node_id")
+            vals = casc.get(which)
+            if not nid or not isinstance(vals, dict):
+                return
+            for k, v in vals.items():
+                self._on_param_changed(nid, k, v)
+        except Exception as e:
+            print(f"[WARN] 应用级联参数失败: {e}")
 
     def _on_pick_template(self, node_id: str, param_name: str):
         if not self._ensure_project_open("裁剪模板保存到工程resource/"):
@@ -2953,11 +3047,11 @@ class BlueprintMainWindow(QMainWindow):
             self._log.append_log(f"裁图失败: {e}", "ERROR")
             traceback.print_exc()
 
-    # ---------- 临时目标窗口解析（Inspector 框选范围 / Mouse 坐标拾取 共用） ----------
-    def _find_temp_target_window(self, node):
-        """按节点「临时目标」参数找窗口，返回 (window_dict, status)。
+    # ---------- 目标窗口解析（Inspector 框选范围 / Mouse 坐标拾取 共用） ----------
+    def _find_node_target_window(self, node):
+        """按节点「目标窗口」参数找窗口，返回 (window_dict, status)。
 
-        status = "none"      未配置临时目标
+        status = "none"      未配置目标窗口定位条件
                = "ok"        已找到（window_dict 含 hwnd/title/exe_name/class_name/rect）
                = "notfound"  配置了但当前找不到
 
@@ -2968,16 +3062,16 @@ class BlueprintMainWindow(QMainWindow):
         改这里必须同步 executor._find_window_3d。
         """
         params = getattr(node, "params", None) or {}
-        title = str(params.get("temp_target_title", "") or "").strip()
-        exe = str(params.get("temp_target_exe", "") or "").strip()
-        cls = str(params.get("temp_target_class", "") or "").strip()
+        title = str(params.get("target_title", "") or "").strip()
+        exe = str(params.get("target_exe", "") or "").strip()
+        cls = str(params.get("target_class", "") or "").strip()
         if not (title or exe or cls):
             return None, "none"
         try:
             from src.blueprint.runtime.executor import _find_window_3d
             hwnd = _find_window_3d(title, exe, cls)
         except Exception as e:
-            self._log.append_log(f"[Target] 临时目标窗口匹配失败: {e}", "WARN")
+            self._log.append_log(f"[Target] 目标窗口匹配失败: {e}", "WARN")
             return None, "notfound"
         if not hwnd:
             return None, "notfound"
@@ -2992,14 +3086,14 @@ class BlueprintMainWindow(QMainWindow):
         return best, "ok"
 
     def _resolve_snip_limit(self, node):
-        """解析节点的「临时目标窗口」，用于把框选范围限定在该窗口内。
+        """解析节点的「目标窗口」，用于把框选范围限定在该窗口内。
 
         返回 (rect, label, status)：
-          status = "none"     未配置临时目标 → 按原逻辑全屏框选
+          status = "none"     未配置目标窗口 → 按原逻辑全屏框选
                  = "ok"       已找到窗口，rect=(x, y, w, h) 为该窗口屏幕矩形
                  = "notfound" 配置了但当前找不到该窗口 → 回退全屏并告警
         """
-        best, status = self._find_temp_target_window(node)
+        best, status = self._find_node_target_window(node)
         if status != "ok" or best is None:
             return None, "", status
         # 把临时目标窗口提到最前，避免截到盖在它上面的其它窗口
@@ -3018,7 +3112,7 @@ class BlueprintMainWindow(QMainWindow):
                     best = fresh
             except Exception:
                 pass
-        # 矩形：DWM 可见边界（与运行时 _resolve_temp_target_rect 同口径），
+        # 矩形：DWM 可见边界（与运行时 _resolve_target_rect 同口径），
         # _get_window_info 返回的 rect 本就是 DWM 口径 (x,y,w,h)
         try:
             lx, ly, lw, lh = (int(v) for v in best.get("rect"))
@@ -3027,10 +3121,10 @@ class BlueprintMainWindow(QMainWindow):
         if lw < 5 or lh < 5:
             return None, "", "notfound"
         params = getattr(node, "params", None) or {}
-        exe = str(params.get("temp_target_exe", "") or "").strip()
-        cls = str(params.get("temp_target_class", "") or "").strip()
+        exe = str(params.get("target_exe", "") or "").strip()
+        cls = str(params.get("target_class", "") or "").strip()
         name = str(best.get("title", "") or "") or exe or cls
-        return (lx, ly, lw, lh), f"临时目标窗口：{name}", "ok"
+        return (lx, ly, lw, lh), f"目标窗口：{name}", "ok"
 
     # ---------- IfImageDetect / StillnessDetect / FindImage 全屏 SnipOverlay 处理 ----------
     def _on_snip_for_node(self, node_id: str, mode: str):
@@ -3269,7 +3363,7 @@ class BlueprintMainWindow(QMainWindow):
 
     # ---------- Mouse 点属性 📍 坐标拾取 ----------
     def _on_pick_coord(self, node_id: str, param_name: str):
-        """启动 CoordOverlay 全屏遮罩拾取坐标，根据节点 coord_mode 决定保存相对/绝对坐标。"""
+        """启动 CoordOverlay 全屏遮罩拾取坐标，根据节点 range_mode 决定保存窗口相对/绝对坐标。"""
         if not self._graph or node_id not in self._graph.nodes:
             return
         node = self._graph.nodes[node_id]
@@ -3279,16 +3373,16 @@ class BlueprintMainWindow(QMainWindow):
             self._start_findimg_offset_pick(node_id)
             return
 
-        coord_mode = str(node.params.get("coord_mode", "relative") or "relative")
+        range_mode = str(node.params.get("range_mode", "window") or "window")
 
-        # 相对坐标的基准窗口 = 节点自身的「临时目标」参数，
-        # 与运行时 _resolve_temp_target_rect 同口径（title子串 / exe子串 / class全等），
-        # 解析不到就退绝对坐标模式 —— 不再读主界面那个已删除的全局下拉。
+        # 相对坐标的基准窗口 = 节点自身的「目标窗口」定位条件，
+        # 与运行时 _resolve_target_rect 同口径（title子串 / exe子串 / class全等），
+        # 解析不到就退绝对坐标模式。
         hwnd = None
         window_rect = None
         exe_name = ""
-        if coord_mode == "relative":
-            best, status = self._find_temp_target_window(node)
+        if range_mode == "window":
+            best, status = self._find_node_target_window(node)
             lx = ly = lw = lh = 0
             if status == "ok" and best is not None:
                 try:
@@ -3308,15 +3402,15 @@ class BlueprintMainWindow(QMainWindow):
                             pass
                 else:
                     self._log.append_log(
-                        f"[📍] 临时目标窗口尺寸异常({lw}x{lh})，本次按绝对坐标拾取", "WARN"
+                        f"[📍] 目标窗口尺寸异常({lw}x{lh})，本次按绝对坐标拾取", "WARN"
                     )
             elif status == "notfound":
                 self._log.append_log(
-                    "[📍] 节点已配置临时目标，但当前找不到该窗口 → 本次按绝对坐标拾取", "WARN"
+                    "[📍] 节点已配置目标窗口，但当前找不到该窗口 → 本次按绝对坐标拾取", "WARN"
                 )
             else:
                 self._log.append_log(
-                    "[📍] 节点未配置「临时目标」→ 本次按绝对屏幕坐标拾取", "INFO"
+                    "[📍] 节点未配置「目标窗口」→ 本次按绝对屏幕坐标拾取", "INFO"
                 )
 
         try:
@@ -3326,7 +3420,7 @@ class BlueprintMainWindow(QMainWindow):
             return
 
         self._log.append_log(
-            f"[📍] 坐标拾取启动（{ '相对绑定窗口' if hwnd else '绝对屏幕坐标'}模式），请在屏幕上点击目标位置...",
+            f"[📍] 坐标拾取启动（{ '窗口相对坐标' if hwnd else '绝对屏幕坐标'}模式），请在屏幕上点击目标位置...",
             "INFO",
         )
 
@@ -3339,14 +3433,14 @@ class BlueprintMainWindow(QMainWindow):
                 delay_ms=300,
             )
             overlay.finished.connect(
-                lambda result, nid=node_id, pn=param_name, cm=coord_mode: self._on_coord_picked(nid, pn, cm, result)
+                lambda result, nid=node_id, pn=param_name, cm=range_mode: self._on_coord_picked(nid, pn, cm, result)
             )
         except Exception as e:
             self._log.append_log(f"[📍] CoordOverlay 启动失败: {e}", "ERROR")
             traceback.print_exc()
 
-    def _on_coord_picked(self, node_id: str, param_name: str, coord_mode: str, result):
-        """CoordOverlay 拾取完成回调：根据 coord_mode 保存 rel 或 abs 坐标。"""
+    def _on_coord_picked(self, node_id: str, param_name: str, range_mode: str, result):
+        """CoordOverlay 拾取完成回调：根据 range_mode 保存窗口相对 或 绝对坐标。"""
         try:
             self.show()
             self.raise_()
@@ -3357,8 +3451,8 @@ class BlueprintMainWindow(QMainWindow):
             self._log.append_log("[📍] 坐标拾取已取消", "INFO")
             return
         # result 包含 abs 和 rel 两个坐标
-        # coord_mode=relative 且有绑定窗口 → 保存 rel；否则保存 abs
-        if coord_mode == "relative" and result.get("mode") == "bound":
+        # range_mode=window 且拿到了基准窗口 → 保存 rel；否则保存 abs
+        if range_mode == "window" and result.get("mode") == "bound":
             x, y = result.get("rel", (0, 0))
             self._log.append_log(
                 f"[📍] 拾取完成：相对坐标 ({x}, {y})  [绝对: {result.get('abs')}]",
@@ -3396,10 +3490,14 @@ class BlueprintMainWindow(QMainWindow):
                 tpl_pil = _PILImg.open(_io.BytesIO(_b64.b64decode(tpl_b64)))
             except Exception:
                 tpl_pil = None
-        if tpl_pil is None and tpl_path and os.path.exists(tpl_path):
+        if tpl_pil is None and tpl_path:
             try:
-                from PIL import Image as _PILImg
-                tpl_pil = _PILImg.open(tpl_path)
+                from src.config.app_paths import get_img_path
+
+                _real = get_img_path(tpl_path)
+                if _real and os.path.exists(_real):
+                    from PIL import Image as _PILImg
+                    tpl_pil = _PILImg.open(_real)
             except Exception:
                 tpl_pil = None
         if tpl_pil is None:
@@ -3590,11 +3688,11 @@ class BlueprintMainWindow(QMainWindow):
             else:
                 self._log.append_log("静态校验提示：\n" + msg, "WARN")
         # 2. 启动 runner（QThread 硬约束 §4）
-        # ⚠ 这里刻意不传 initial_hwnd：
-        #   蓝图跑哪个窗口 100% 由蓝图自身决定（BindWindow 节点 / 各节点「临时目标」），
+        # ⚠ 运行期没有「全局目标窗口」：
+        #   每个节点的操作范围 100% 由它自己的「范围模式」（目标窗口 / 全屏）+ 目标定位条件决定，
         #   这样「编辑器内点▶运行」与「导出后的挂机 EXE」行为完全一致，
         #   避免出现「编辑器里能跑、导出后找不到图」的口径偏差。
-        runner = BlueprintRunner(self._graph, self, initial_hwnd=None)
+        runner = BlueprintRunner(self._graph, self)
         runner.log_message.connect(self._on_runner_log, Qt.QueuedConnection)
         runner.highlight_node.connect(
             lambda nid, s=self._scene: s.set_running_node(nid), Qt.QueuedConnection,
@@ -4169,6 +4267,8 @@ class BlueprintMainWindow(QMainWindow):
                 # _applying_undo_redo=True 会让它跳过压栈的部分，避免递归
                 if self._applying_undo_redo:
                     self._on_param_changed(nid, pname, old_v)
+                # 级联参数（换模板时自动清掉的特征数据）跟着一起还原
+                self._apply_cascade_params(action, "old_values")
                 self._redo_stack.append(action)
                 self._log.append_log(
                     f"[撤销] 恢复参数：节点 {nid} 的 {pname}",
@@ -4250,6 +4350,8 @@ class BlueprintMainWindow(QMainWindow):
                     return
                 if self._applying_undo_redo:
                     self._on_param_changed(nid, pname, new_v)
+                # 级联参数跟着一起重做
+                self._apply_cascade_params(action, "new_values")
                 self._undo_stack.append(action)
                 self._log.append_log(
                     f"[重做] 重新修改参数：节点 {nid} 的 {pname}",
@@ -4778,7 +4880,21 @@ def main() -> int:
         return 1
 
     win = BlueprintMainWindow()
-    win.show()
+    # ============================================================
+    # 启动窗口形态：默认自动最大化铺满屏幕（保留标题栏 + 任务栏，用户可随时「还原」。
+    # 用最大化而不是 showFullScreen()——真全屏会盖住任务栏且无标题栏，编辑器类工具需要
+    # 频繁切窗口/看运行结果，全屏反而碍事）。
+    # 关掉方式：config.json → ui.start_maximized = false
+    # ============================================================
+    try:
+        _ui_prefs = (win._user_settings or {}).get("ui") or {}
+        _start_maximized = bool(_ui_prefs.get("start_maximized", True))
+    except Exception:
+        _start_maximized = True  # 读设置失败也要最大化，保持行为一致
+    if _start_maximized:
+        win.showMaximized()
+    else:
+        win.show()
     return app.exec()
 
 

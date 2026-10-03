@@ -135,7 +135,7 @@ class ExportDialog(QDialog):
         self._uses_ocr = exporter.uses_ocr(self._graph, project_root=project_root)
         if self._uses_ocr:
             ocr_lbl = QLabel(
-                "⚠ 本蓝图包含「文字识别」节点，运行时需要 OCR 引擎（ocr_runtime/ 目录）。\n"
+                "⚠ 本蓝图包含「文字」节点，运行时需要 OCR 引擎（ocr_runtime/ 目录）。\n"
                 "   导出后请把项目里的 ocr_runtime/ 目录放到生成的 EXE 同级目录下，否则识别节点会报「OCR 未安装」。"
             )
             ocr_lbl.setStyleSheet("color:#D29922; font-size:11px; background:#2A2414; padding:6px 8px; border-radius:4px;")
@@ -248,7 +248,7 @@ class ExportDialog(QDialog):
         )
         if self._uses_ocr:
             msg += (
-                "\n\n⚠ 本蓝图包含「文字识别」节点：请把 ocr_runtime/ 目录放到"
+                "\n\n⚠ 本蓝图包含「文字」节点：请把 ocr_runtime/ 目录放到"
                 " EXE 同级目录，否则识别节点无法运行。"
             )
         if res.missing:

@@ -170,7 +170,7 @@ def preflight(graph, project_root: Optional[str] = None) -> List[Dict[str, str]]
             if not any(os.path.isdir(d) for d in _ocr_runtime_dirs()):
                 issues.append({
                     "level": "warn",
-                    "msg": "蓝图包含「文字识别」节点，但没找到 ocr_runtime/ 目录："
+                    "msg": "蓝图包含「文字」节点，但没找到 ocr_runtime/ 目录："
                            "导出后必须把 ocr_runtime/ 放到 EXE 同级目录，否则识别节点会报「OCR 未安装」。",
                 })
     except Exception:

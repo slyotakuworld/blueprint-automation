@@ -35,120 +35,6 @@ MAX_COMPONENT_DEPTH = 32
 
 
 # ============================================================
-# 辅助：目标窗口(HWND) 应用到运行时所有服务
-# ============================================================
-def _apply_target_hwnd(ctx: ExecutionContext, hwnd, res_w=1920, res_h=1080):
-    """
-    把一个 HWND（目标窗口程序）应用到运行时所有下游服务和变量。
-    这就是「设置目标窗口」的统一逻辑：可在蓝图启动时调用（首次初始化），
-    也可在 BindWindow 节点执行时调用（中途切换目标窗口）。
-
-    参数:
-      hwnd   - 窗口句柄(int) 或 None（None=回退为全屏模式）
-      res_w / res_h - 分辨率参考，用于坐标归一化（0=使用窗口实际尺寸）
-    """
-    import win32gui  # type: ignore
-
-    # 1. 激活到前台（仅当 hwnd 有效时）
-    if hwnd:
-        try:
-            from src.tools.window_utils import bring_window_to_front
-
-            bring_window_to_front(hwnd, log_fn=ctx.log)
-        except Exception:
-            try:
-                win32gui.SetForegroundWindow(hwnd)
-            except Exception:
-                pass
-
-    # 2. 读实际窗口尺寸 + 标题
-    win_rect = None
-    win_title = ""
-    if hwnd:
-        try:
-            # DWM 可见边界优先（与编辑器拾取/框选口径一致），失败兜底 GetWindowRect
-            from src.tools.window_utils import get_window_rect_dwm
-            rect_dwm = get_window_rect_dwm(hwnd)
-            if rect_dwm is None:
-                import win32gui as _wg
-                rect_dwm = _wg.GetWindowRect(hwnd)
-            l, t, r, b = (int(v) for v in rect_dwm)
-            win_rect = (l, t, r - l, b - t)
-            win_title = win32gui.GetWindowText(hwnd) or ""
-        except Exception:
-            win_rect = None
-            win_title = ""
-        # 分辨率参考：0=自动用窗口实际尺寸
-        try:
-            if int(res_w or 0) <= 0 and win_rect:
-                res_w = win_rect[2]
-            if int(res_h or 0) <= 0 and win_rect:
-                res_h = win_rect[3]
-        except Exception:
-            pass
-
-    # 3. 应用到 ScreenCapture（目标句柄）
-    if ctx.screen is not None:
-        try:
-            ctx.screen.hwnd = hwnd
-        except Exception:
-            pass
-
-    # 4. 应用到 TemplateMatcher（搜索 ROI + 分辨率参考）
-    if ctx.matcher is not None:
-        try:
-            ctx.matcher.config["resolution_ref"] = (int(res_w or 1920), int(res_h or 1080))
-        except Exception:
-            pass
-        if win_rect is not None:
-            try:
-                ctx.matcher.set_fullscreen_region(win_rect)
-            except Exception:
-                pass
-        else:
-            # None=全屏：删除「全界面」区域，让 matcher 回退全屏
-            try:
-                if "全界面" in getattr(ctx.matcher, "regions", {}):
-                    ctx.matcher.regions.pop("全界面", None)
-            except Exception:
-                pass
-
-    # 5. 应用到 InputActions（安全点击区域）
-    if ctx.input_actions is not None:
-        try:
-            ctx.input_actions.set_safe_region(win_rect)
-        except Exception:
-            pass
-
-    # 6. 保存到 ctx 上的全局变量（VarEngine / 下游逻辑直接用）
-    target_info = {
-        "hwnd": hwnd,
-        "title": win_title,
-        "rect": win_rect,
-        "resolution_ref": (int(res_w or 1920), int(res_h or 1080)),
-    }
-    try:
-        ctx.set_var("target", target_info)
-        ctx.set_var("target_hwnd", hwnd)
-        ctx.set_var("target_title", win_title)
-        if win_rect:
-            ctx.set_var("target_x", win_rect[0])
-            ctx.set_var("target_y", win_rect[1])
-            ctx.set_var("target_w", win_rect[2])
-            ctx.set_var("target_h", win_rect[3])
-        else:
-            for k in ("target_x", "target_y", "target_w", "target_h"):
-                try:
-                    ctx.variables.pop(k, None)
-                except Exception:
-                    pass
-    except Exception:
-        pass
-
-    return win_rect, win_title
-
-
-# ============================================================
 # 辅助：端口/连线 解析
 # ============================================================
 def _resolve_data_inputs(graph: BlueprintGraph, ctx: ExecutionContext, node: Node, id_prefix: str = "") -> Dict[str, Any]:
@@ -858,57 +744,6 @@ def _find_window_3d(
     return int(scored[0][3])
 
 
-def execute_BindWindow(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
-    title = str(node.params.get("title", "") or "")
-    exe_name = str(node.params.get("exe_name", "") or "")
-    class_name = str(node.params.get("class_name", "") or "")
-    res_w = int(node.params.get("resolution_w", 1920) or 1920)
-    res_h = int(node.params.get("resolution_h", 1080) or 1080)
-
-    # ---------- 变量插值（如 title="{game_title}"）----------
-    try:
-        from src.blueprint.core.variable_engine import VariableEngine
-
-        engine = getattr(ctx, "var_engine", None) or VariableEngine(ctx.variables)
-        if engine.has_any_marker(title):
-            title = str(engine.interpolate(title))
-        if engine.has_any_marker(exe_name):
-            exe_name = str(engine.interpolate(exe_name))
-        if engine.has_any_marker(class_name):
-            class_name = str(engine.interpolate(class_name))
-    except Exception:
-        pass
-
-    hwnd = _find_window_3d(
-        title=title,
-        exe_name=exe_name,
-        class_name=class_name,
-    )
-    if hwnd is None:
-        msg = (
-            f"[BindWindow] 未找到匹配窗口。"
-            f"title='{title}'  exe='{exe_name}'  class='{class_name}'"
-        )
-        ctx.log(msg, "WARN")
-        annotate_step(ctx, node, "bind_win", note="FAIL 未找到窗口")
-        return {}, ["fail"], msg
-
-    # ---------- 用统一函数应用目标窗口：切换目标程序 ----------
-    win_rect, win_title = _apply_target_hwnd(ctx, hwnd, res_w, res_h)
-
-    eff_w = (res_w if int(res_w or 0) > 0 else (win_rect[2] if win_rect else 1920))
-    eff_h = (res_h if int(res_h or 0) > 0 else (win_rect[3] if win_rect else 1080))
-    note_parts = [f"HWND={hwnd}", f"res_ref={eff_w}x{eff_h}"]
-    if win_title:
-        note_parts.append(f"title='{win_title[:24]}'")
-    if win_rect:
-        note_parts.append(f"rect={win_rect}")
-    note = "BindWindow (切换目标程序) " + "  ".join(note_parts)
-    ctx.log(f"[BindWindow] ✅ {note}  后续截图/找图/点击均自动对准此窗口。", "SUCCESS")
-    annotate_step(ctx, node, "bind_win", note=note)
-    return {}, ["success"], ""
-
-
 # ---------------- 特征识别辅助 ----------------
 def _findimage_feature_match(ctx, params: Dict[str, Any], region,
                              timeout_s: float, auto_scroll: bool, scroll_dy: int,
@@ -935,11 +770,15 @@ def _findimage_feature_match(ctx, params: Dict[str, Any], region,
     except Exception:
         features = []
     if not features or len(features) < 1:
-        ctx.log("[FindImage·特征] 特征列表为空，跳过特征匹配", "WARN")
-        return None
+        features = []
 
     tolerance = max(1, int(params.get("feature_tolerance", 15) or 15))
-    min_hits = max(1, int(params.get("feature_min_hits", 2) or 2))
+    # 最少命中数允许为 0：0 表示「不要求任何特征命中」，此时特征列表为空也放行
+    try:
+        min_hits = int(params.get("feature_min_hits", 2))
+    except (TypeError, ValueError):
+        min_hits = 2
+    min_hits = max(0, min_hits)
     template_w = int(params.get("feature_template_w", 0) or 0)
     template_h = int(params.get("feature_template_h", 0) or 0)
 
@@ -977,20 +816,14 @@ def _findimage_feature_match(ctx, params: Dict[str, Any], region,
     valid_count = sum(1 for p in feat_paths if p is not None)
     ctx.log(f"[FindImage·特征] 共{len(features)}个特征，有效{valid_count}个，容差={tolerance}px，最少命中={min_hits}", "DEBUG")
 
-    # 阈值计算：验证模式用与主策略相同的阈值（不降低），兜底模式适当降低
-    if strategy == "gray" and ctx.matcher is not None and hasattr(ctx.matcher, "get_calibrated_gray_threshold"):
-        calibrated = ctx.matcher.get_calibrated_gray_threshold(base_threshold)
-        if template_pos is not None:
-            # 验证模式：小窗口搜索，不需要降低阈值
-            feat_threshold = max(0.55, min(0.97, float(calibrated)))
-        else:
-            # 兜底模式：全屏搜索小图，适当降低阈值
-            feat_threshold = max(0.55, min(0.97, float(calibrated) - 0.1))
+    # 阈值计算：只保留「验证模式不降 / 兜底模式降 0.1」这一层。
+    # 灰度策略的「标定偏移」由 matcher 内部统一施加（find_image_gray 自己会调
+    # get_calibrated_gray_threshold），这里**不能再标定一次** —— 否则 offset 被叠加两次，
+    # 特征小图的阈值会被推到上限，出现「模板明明找对了、特征却验不过」的假失败。
+    if template_pos is not None:
+        feat_threshold = max(0.5, float(base_threshold))
     else:
-        if template_pos is not None:
-            feat_threshold = max(0.5, float(base_threshold))
-        else:
-            feat_threshold = max(0.5, float(base_threshold) - 0.1)
+        feat_threshold = max(0.5, float(base_threshold) - 0.1)
 
     def _cleanup():
         for cp in cleanup_paths:
@@ -999,13 +832,52 @@ def _findimage_feature_match(ctx, params: Dict[str, Any], region,
             except Exception:
                 pass
 
+    # ---------------------------------------------------------------
+    # 没有任何可用特征图（列表为空 / 全部解码失败）
+    #   判定口径与「特征命中数」保持一致：命中数(这里固定为 0) >= 最少命中数 才算通过。
+    #   → 只有「验证模式 + 最少命中数=0」才放行（相当于明确表示不需要特征校验）；
+    #     其余情况一律判失败，并给出可操作的提示，不静默降级。
+    # ---------------------------------------------------------------
+    if valid_count == 0:
+        if (template_pos is not None and isinstance(template_pos, dict) and min_hits <= 0):
+            tpl_left0 = int(template_pos.get("left", 0))
+            tpl_top0 = int(template_pos.get("top", 0))
+            tpl_w0 = int(template_pos.get("width", 0))
+            tpl_h0 = int(template_pos.get("height", 0))
+            ctx.log("[FindImage·特征] 验证模式：没有可用特征图，但「最少命中特征数」=0 → 视为无需特征校验，放行", "WARN")
+            _cleanup()
+            return (tpl_left0 + tpl_w0 // 2 + offset_x, tpl_top0 + tpl_h0 // 2 + offset_y, 1.0)
+        ctx.log(
+            f"[FindImage·特征] 没有可用特征图（列表为空或特征图解码失败）→ 判定失败。"
+            f"请重新「✂ 从模板截取特征」；确实不需要特征校验时，把「最少命中特征数」设为 0，"
+            f"或把「特征识别辅助」改为关闭。",
+            "WARN",
+        )
+        _cleanup()
+        return None
+
+    if min_hits > valid_count:
+        ctx.log(
+            f"[FindImage·特征] 可用特征只有{valid_count}个 < 最少命中{min_hits}个 → 本次必然失败；"
+            f"请调低「最少命中特征数」或补足特征。",
+            "WARN",
+        )
+
     def _match_one(fpath, search_region):
-        """在指定区域内匹配单个特征，返回 pos dict 或 None。"""
+        """在指定区域内匹配单个特征，返回 pos dict 或 None。
+
+        跟随主算法，且与主匹配的级联层数保持一致（不再出现「主算法两级、特征辅助只有一层」）：
+          - template → 彩色单层
+          - gray     → 灰度单层
+          - hybrid   → 彩色 → 灰度 两级
+        """
         try:
             if strategy == "gray":
                 return ctx.matcher.find_image_gray(fpath, region=search_region, threshold=feat_threshold, fast_mode=True)
-            else:
-                return ctx.matcher.find_image(fpath, region=search_region, threshold=feat_threshold, fast_mode=True)
+            pos = ctx.matcher.find_image(fpath, region=search_region, threshold=feat_threshold, fast_mode=True)
+            if pos is None and strategy == "hybrid":
+                pos = ctx.matcher.find_image_gray(fpath, region=search_region, threshold=feat_threshold, fast_mode=True)
+            return pos
         except Exception:
             return None
 
@@ -1025,6 +897,8 @@ def _findimage_feature_match(ctx, params: Dict[str, Any], region,
             scale = 1.0
 
         ctx.log(f"[FindImage·特征] 验证模式：模板位置=({tpl_left},{tpl_top},{tpl_w},{tpl_h}) scale={scale:.3f}", "DEBUG")
+        if min_hits <= 0:
+            ctx.log("[FindImage·特征] 「最少命中特征数」=0 → 验证模式不要求任何特征命中，本次校验直接放行（建议改回 ≥1）", "WARN")
 
         verified = 0
         total = 0
@@ -1068,6 +942,15 @@ def _findimage_feature_match(ctx, params: Dict[str, Any], region,
     # ================================================================
     # 兜底模式：模板未找到，全屏搜索特征 + 交叉验证
     # ================================================================
+    def _center_of(hit):
+        """取命中项的屏幕中心（hit = (idx, left, top, w, h, score)）。"""
+        return (hit[1] + hit[3] / 2.0, hit[2] + hit[4] / 2.0)
+
+    def _tpl_center_of(feat_idx):
+        """取特征在**模板坐标系**里的中心（feat_info 存的是左上角偏移）。"""
+        rx_, ry_, fw_, fh_ = feat_info[feat_idx]
+        return (rx_ + fw_ / 2.0, ry_ + fh_ / 2.0)
+
     t0 = time.time()
     while (time.time() - t0) < timeout_s and ctx.is_running:
         wait_if_paused(ctx)
@@ -1075,30 +958,33 @@ def _findimage_feature_match(ctx, params: Dict[str, Any], region,
             break
 
         # 1) 对每个特征在全屏（或指定 region）内独立匹配
-        hits = []  # [(feat_idx, screen_cx, screen_cy, score)]
+        #    matcher 返回的是**绝对屏幕坐标**下的「左上角 + 宽高」（region 模式下已加过 region 偏移），
+        #    因此这里保留左上角原始值，中心需要时现算——后面推算模板原点必须用左上角对左上角。
+        hits = []  # [(feat_idx, left, top, w, h, score)]
         for i, fpath in enumerate(feat_paths):
             if fpath is None:
                 continue
+            fw_i, fh_i = feat_info[i][2], feat_info[i][3]
             fpos = _match_one(fpath, region)
             if fpos is not None:
                 if isinstance(fpos, dict):
                     fl = int(fpos.get("left", 0)); ft = int(fpos.get("top", 0))
-                    fwi = int(fpos.get("width", fw)); fhi = int(fpos.get("height", fh))
+                    fwi = int(fpos.get("width", fw_i) or fw_i); fhi = int(fpos.get("height", fh_i) or fh_i)
                     raw_s = fpos.get("score")
                     fscore = float(raw_s) if isinstance(raw_s, (int, float)) else float(feat_threshold)
                 elif isinstance(fpos, (list, tuple)) and len(fpos) >= 4:
                     fl, ft, fwi, fhi = int(fpos[0]), int(fpos[1]), int(fpos[2]), int(fpos[3])
                     fscore = float(feat_threshold)
                 elif isinstance(fpos, (list, tuple)) and len(fpos) >= 2:
-                    fl, ft, fwi, fhi = int(fpos[0]), int(fpos[1]), fw, fh
+                    fl, ft, fwi, fhi = int(fpos[0]), int(fpos[1]), fw_i, fh_i
                     fscore = float(feat_threshold)
                 else:
                     continue
-                scx = fl + fwi // 2
-                scy = ft + fhi // 2
-                hits.append((i, scx, scy, fscore))
+                hits.append((i, fl, ft, fwi, fhi, fscore))
 
-        if len(hits) < min(2, min_hits):
+        # 至少要 1 个命中才能推算位置；需要交叉验证时至少 2 个（min(2, ...) 保持原语义：
+        # 少于 2 个命中时无法做两两校准，直接等下一轮）
+        if len(hits) < min(2, max(1, min_hits)):
             if auto_scroll and ctx.is_running and (time.time() - t0) < timeout_s:
                 try:
                     import pyautogui
@@ -1116,15 +1002,18 @@ def _findimage_feature_match(ctx, params: Dict[str, Any], region,
             time.sleep(0.15)
             continue
 
-        # 2) 计算缩放比例（自校准）
+        # 2) 计算缩放比例（自校准）：两边都用「中心到中心」的距离比对，
+        #    这样两个特征尺寸不一样时也不会算歪（用左上角相减会差半个尺寸）
         scales = []
         for a in range(len(hits)):
             for b in range(a + 1, len(hits)):
-                idx_a, sxa, sya, _ = hits[a]
-                idx_b, sxb, syb, _ = hits[b]
-                rxa, rya, _, _ = feat_info[idx_a]
-                rxb, ryb, _, _ = feat_info[idx_b]
-                dist_t = _math.sqrt((rxb - rxa) ** 2 + (ryb - rya) ** 2)
+                idx_a = hits[a][0]
+                idx_b = hits[b][0]
+                tax, tay = _tpl_center_of(idx_a)
+                tbx, tby = _tpl_center_of(idx_b)
+                sxa, sya = _center_of(hits[a])
+                sxb, syb = _center_of(hits[b])
+                dist_t = _math.sqrt((tbx - tax) ** 2 + (tby - tay) ** 2)
                 dist_s = _math.sqrt((sxb - sxa) ** 2 + (syb - sya) ** 2)
                 if dist_t > 5:
                     scales.append(dist_s / dist_t)
@@ -1136,15 +1025,6 @@ def _findimage_feature_match(ctx, params: Dict[str, Any], region,
             cur_w = 0
             if region is not None and len(region) >= 3:
                 cur_w = int(region[2])
-            if cur_w <= 0:
-                try:
-                    target = ctx.get_var("target") if hasattr(ctx, "get_var") else None
-                    if isinstance(target, dict):
-                        r = target.get("rect")
-                        if isinstance(r, (tuple, list)) and len(r) >= 3:
-                            cur_w = int(r[2])
-                except Exception:
-                    pass
             if cap_w > 0 and cur_w > 0:
                 scale = cur_w / cap_w
             else:
@@ -1153,15 +1033,17 @@ def _findimage_feature_match(ctx, params: Dict[str, Any], region,
         ctx.log(f"[FindImage·特征] 命中{len(hits)}个特征，scale={scale:.3f}（{len(scales)}对校准）", "DEBUG")
 
         # 3) 位置验证：以第一个命中为基准，验证其他特征
-        base_idx, base_sx, base_sy, _ = hits[0]
-        base_rx, base_ry, _, _ = feat_info[base_idx]
+        #    容差比对的是「屏幕上的实际中心」与「按基准推算出的期望中心」之间的欧氏距离
+        base_tcx, base_tcy = _tpl_center_of(hits[0][0])
+        base_scx, base_scy = _center_of(hits[0])
         valid_hits = [hits[0]]
         for hit in hits[1:]:
-            idx, sx, sy, sc = hit
-            rx, ry, _, _ = feat_info[idx]
-            exp_x = base_sx + (rx - base_rx) * scale
-            exp_y = base_sy + (ry - base_ry) * scale
-            err = _math.sqrt((sx - exp_x) ** 2 + (sy - exp_y) ** 2)
+            idx = hit[0]
+            tcx, tcy = _tpl_center_of(idx)
+            exp_x = base_scx + (tcx - base_tcx) * scale
+            exp_y = base_scy + (tcy - base_tcy) * scale
+            scx, scy = _center_of(hit)
+            err = _math.sqrt((scx - exp_x) ** 2 + (scy - exp_y) ** 2)
             if err <= tolerance:
                 valid_hits.append(hit)
             else:
@@ -1184,24 +1066,29 @@ def _findimage_feature_match(ctx, params: Dict[str, Any], region,
             continue
 
         # 4) 推算模板左上角（取所有有效命中的平均值）
+        #    关系式：屏幕上特征的**左上角** = 模板左上角 + 特征在模板中的**左上角** × scale
+        #    （左边必须用左上角，右边也必须用左上角；拿中心去减左上角偏移会整体偏「半个特征尺寸」）
         origins_x = []
         origins_y = []
         for hit in valid_hits:
-            idx, sx, sy, _ = hit
+            idx = hit[0]
             rx, ry, _, _ = feat_info[idx]
-            origins_x.append(sx - rx * scale)
-            origins_y.append(sy - ry * scale)
+            origins_x.append(hit[1] - rx * scale)
+            origins_y.append(hit[2] - ry * scale)
         origin_x = sum(origins_x) / len(origins_x)
         origin_y = sum(origins_y) / len(origins_y)
 
         if template_w > 0 and template_h > 0:
-            abs_cx = int(origin_x + template_w / 2) + offset_x
-            abs_cy = int(origin_y + template_h / 2) + offset_y
+            # 模板中心 = 模板左上角 + 半个模板尺寸 × scale
+            # （漏乘 scale 时，只要显示比例≠1，中心就会整体偏 (1-scale)/2 个模板尺寸）
+            abs_cx = int(round(origin_x + template_w * scale / 2.0)) + offset_x
+            abs_cy = int(round(origin_y + template_h * scale / 2.0)) + offset_y
         else:
-            abs_cx = valid_hits[0][1] + offset_x
-            abs_cy = valid_hits[0][2] + offset_y
+            _scx, _scy = _center_of(valid_hits[0])
+            abs_cx = int(round(_scx)) + offset_x
+            abs_cy = int(round(_scy)) + offset_y
 
-        avg_score = sum(h[3] for h in valid_hits) / len(valid_hits)
+        avg_score = sum(h[5] for h in valid_hits) / len(valid_hits)
         ctx.log(f"[FindImage·特征] 匹配成功！{len(valid_hits)}/{len(feat_paths)}个特征通过，模板原点=({int(origin_x)},{int(origin_y)}) 中心=({abs_cx},{abs_cy}) score={avg_score:.2f}", "SUCCESS")
         _cleanup()
         return (abs_cx, abs_cy, avg_score)
@@ -1214,31 +1101,31 @@ def _findimage_feature_match(ctx, params: Dict[str, Any], region,
 def execute_FindImage(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
     """
     找图节点：
-      - 匹配策略 match_strategy: hybrid(智能混合) / template(模板匹配) / feature(特征匹配)
+      - 匹配策略 match_strategy: hybrid(智能混合) / template(模板匹配) / gray(灰度匹配)
       - 超时 timeout_seconds：在此时间内循环重试
       - 滚动重试 scroll_dy：非0时，找图失败后将鼠标移到搜索区域中心滚动一次再重试
       - 找到后执行 after_action: none / click / double_click / right_click，带 offset (X,Y)
-      - 命中：out_pos(中心坐标) / out_found=True；未命中：out_found=False 但照常走 out_exec
+      - 出口：out_exec(执行，找没找到都走) + found(成功找到) / not_found(没有找到)；
+              out_pos 输出命中中心坐标（未命中为 None）
+      - 模板无效 -> 走 out_exec + not_found
+      - range_mode=window 时目标窗口没定位到 -> 只走 err（不退化为全屏，也不走 out_exec）
     """
     wait_if_paused(ctx)
     # 1) 读参数
-    template = inputs.get("in_template") or node.params.get("template", "")
+    template = node.params.get("template", "")
     # 支持临时PIL/缓存：优先 runtime_attrs["_pil_template"]
     pil_tpl: Optional[Image.Image] = None
     try:
         pil_tpl = getattr(node, "runtime_attrs", {}).get("_pil_template")  # type: ignore[union-attr]
     except Exception:
         pil_tpl = None
-    # 找图范围模式：relative=相对目标程序窗口截图，absolute=全屏截图
-    search_mode = str(node.params.get("search_mode", "relative") or "relative")
-    threshold = inputs.get("in_threshold")
-    if threshold is None:
-        threshold = float(node.params.get("threshold", 0.9) or 0.9)
+    # 找图范围模式：window=只在目标窗口内找图，fullscreen=在整屏上找图
+    range_mode = str(node.params.get("range_mode", "window") or "window")
+    threshold = float(node.params.get("threshold", 0.9) or 0.9)
     try:
         threshold = float(threshold)
     except (TypeError, ValueError):
         threshold = 0.9
-    akaze_thr = max(0.01, min(1.0, float(threshold)))
     strategy = str(node.params.get("match_strategy", "hybrid") or "hybrid")
     timeout_s = max(0.1, float(node.params.get("timeout_seconds", 10.0) or 10.0))
     auto_scroll = (int(node.params.get("scroll_dy", 0) or 0) != 0)
@@ -1276,41 +1163,38 @@ def execute_FindImage(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any])
                 except Exception:
                     pass
     if not use_path:
-        ctx.log("[FindImage] 模板无效（路径不存在 & 无PIL缓存） -> out_found=False", "WARN")
+        ctx.log("[FindImage] 模板无效（路径不存在 & 无PIL缓存） -> 没有找到", "WARN")
         annotate_step(ctx, node, "find", note="ERROR: invalid template")
         return (
-            {"out_pos": None, "out_found": False},
-            ["out_exec"], "",
+            {"out_pos": None},
+            ["out_exec", "not_found"], "",
         )
 
-    # 3) 超时空转 + 滚动重试 循环
+    # 3) 目标窗口解析：window 模式必须先拿到窗口，找不到直接 err（不退化为全屏）
+    target = None
+    if range_mode == "window":
+        target = _resolve_target_rect(ctx, node.params, tag="FindImage")
+        if target is None:
+            err = _target_err_msg(node.params, "FindImage")
+            ctx.log(f"[FindImage] {err}", "ERROR")
+            annotate_step(ctx, node, "find", note="ERROR: target window not found")
+            return ({"out_pos": None}, ["err"], err)
+
+    # 4) 超时空转 + 滚动重试 循环
     t0 = time.time()
     pos = None
     last_err = ""
 
-    with _temp_window_foreground(ctx, node.params):
+    with _target_window_foreground(ctx, target):
         try:
             # region 在窗口前置之后计算，避免最小化窗口恢复后 rect 失效
             region = None  # None=全屏；(x,y,w,h)=窗口区域
             win_origin = (0, 0)
-            if search_mode == "relative":
-                temp = _resolve_temp_target_rect(ctx, node.params)
-                if temp is not None:
-                    rect = temp[1]  # (left, top, right, bottom)
-                    region = (int(rect[0]), int(rect[1]), int(rect[2]) - int(rect[0]), int(rect[3]) - int(rect[1]))
-                    win_origin = (int(rect[0]), int(rect[1]))
-                    ctx.log(f"[FindImage] 相对目标窗口截图 region={region} (临时目标)", "DEBUG")
-                else:
-                    try:
-                        target = ctx.get_var("target") if hasattr(ctx, "get_var") else None
-                        if isinstance(target, dict):
-                            r = target.get("rect")
-                            if isinstance(r, (tuple, list)) and len(r) >= 4:
-                                region = (int(r[0]), int(r[1]), int(r[2]), int(r[3]))
-                                win_origin = (int(r[0]), int(r[1]))
-                                ctx.log(f"[FindImage] 相对目标窗口截图 region={region} (全局目标)", "DEBUG")
-                    except Exception:
-                        pass
+            if target is not None:
+                rect = target[1]  # (left, top, right, bottom)
+                region = (int(rect[0]), int(rect[1]), int(rect[2]) - int(rect[0]), int(rect[3]) - int(rect[1]))
+                win_origin = (int(rect[0]), int(rect[1]))
+                ctx.log(f"[FindImage] 目标窗口内找图 region={region}", "DEBUG")
 
             while (time.time() - t0) < timeout_s and ctx.is_running:
                 wait_if_paused(ctx)
@@ -1327,21 +1211,13 @@ def execute_FindImage(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any])
                             pos = ctx.matcher.find_image_gray(
                                 str(use_path), region=region, threshold=threshold, fast_mode=True
                             )
-                        elif strategy == "feature":
-                            pos = ctx.matcher.find_image_akaze(
-                                str(use_path), region=region, threshold=akaze_thr
-                            )
-                        else:  # hybrid：彩色 → 灰度 → AKAZE 三层级联
+                        else:  # hybrid：彩色 → 灰度，两级级联
                             pos = ctx.matcher.find_image(
                                 str(use_path), region=region, threshold=threshold, fast_mode=True
                             )
                             if pos is None:
                                 pos = ctx.matcher.find_image_gray(
                                     str(use_path), region=region, threshold=threshold, fast_mode=True
-                                )
-                            if pos is None:
-                                pos = ctx.matcher.find_image_akaze(
-                                    str(use_path), region=region, threshold=akaze_thr
                                 )
                         if pos is not None:
                             pass  # pos 已就绪，score 不再单独提取
@@ -1438,8 +1314,8 @@ def execute_FindImage(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any])
                     # 模板中心 + 偏移 = 实际点击位置（绝对屏幕坐标）
                     abs_cx = left + (w // 2) + offset_x
                     abs_cy = top + (h // 2) + offset_y
-                # out_pos：relative 模式输出相对窗口坐标，absolute 模式输出绝对坐标
-                if search_mode == "relative" and win_origin != (0, 0):
+                # out_pos：window 模式输出相对目标窗口的坐标，fullscreen 模式输出绝对坐标
+                if target is not None:
                     out_pos = (abs_cx - win_origin[0], abs_cy - win_origin[1])
                 else:
                     out_pos = (abs_cx, abs_cy)
@@ -1470,7 +1346,7 @@ def execute_FindImage(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any])
                     "none": "", "click": "|动作=单击", "double_click": "|动作=双击",
                     "right_click": "|动作=右键",
                 }.get(after_action, "")
-                mode_note = "相对窗口" if search_mode == "relative" else "全屏"
+                mode_note = "目标窗口内" if target is not None else "全屏"
                 ctx.log(f"[FindImage] 命中 {display} 命中矩形=({left},{top},{w},{h}) 绝对中心=({abs_cx},{abs_cy}) out_pos={out_pos}({mode_note}) {act_note}", "SUCCESS")
                 annotate_step(
                     ctx, node, "find",
@@ -1478,22 +1354,22 @@ def execute_FindImage(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any])
                     note=f"OK: {display} @({left},{top}) out={out_pos}({mode_note}) {act_note}",
                 )
                 return (
-                    {"out_pos": out_pos, "out_found": True},
-                    ["out_exec"], "",
+                    {"out_pos": out_pos},
+                    ["out_exec", "found"], "",
                 )
             else:
                 msg = f"未找到 {os.path.basename(str(use_path))} threshold={threshold} timeout={timeout_s}s"
                 if last_err:
                     msg += f" err={last_err}"
                 scroll_note = f"（滚动量={scroll_dy}）" if scroll_dy != 0 else ""
-                ctx.log(f"[FindImage] {msg}{scroll_note} -> out_found=False", "WARN")
+                ctx.log(f"[FindImage] {msg}{scroll_note} -> 没有找到", "WARN")
                 annotate_step(
                     ctx, node, "find", region=region,
                     note=f"FAIL: {msg}{scroll_note}",
                 )
                 return (
-                    {"out_pos": None, "out_found": False},
-                    ["out_exec"], "",
+                    {"out_pos": None},
+                    ["out_exec", "not_found"], "",
                 )
         finally:
             # 清理临时文件
@@ -1502,28 +1378,6 @@ def execute_FindImage(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any])
                     os.unlink(tmp_path)
                 except Exception:
                     pass
-
-
-def _find_fail(ctx, node, on_fail: str, reason: str, region=None):
-    """
-    FindImage 已不再使用失败策略逻辑（on_fail已从节点参数中删除）。
-    """
-    annotate_step(
-        ctx, node, "find",
-        region=region, note=f"FAIL: {reason} | on_fail={on_fail}",
-    )
-    outputs = {"out_pos": None, "out_found": False}
-    if on_fail == "stop":
-        ctx.log("[FindImage] 策略=stop: 终止执行。", "ERROR")
-        ctx.is_running = False
-        return outputs, [], ""
-    elif on_fail == "continue":
-        return outputs, ["out_exec"], ""
-    elif on_fail.startswith("retry"):
-        return outputs, ["out_exec"], ""
-    else:
-        ctx.is_running = False
-        return outputs, [], ""
 
 
 def execute_PressKey(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
@@ -1685,12 +1539,31 @@ def execute_PressKey(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
         return {}, ["out_exec"], ""
 
 
-def _resolve_temp_target_rect(ctx, params: Dict[str, Any]):
-    """解析临时目标程序窗口。如果 temp_target 参数非空，查找窗口并返回 (hwnd, rect) 或 None。"""
+def _target_configured(params: Dict[str, Any]) -> bool:
+    """「目标窗口」定位条件是否至少填了一个（标题/程序名/类名）。"""
+    return any(str(params.get(k, "") or "").strip() for k in ("target_title", "target_exe", "target_class"))
+
+
+def _target_err_msg(params: Dict[str, Any], tag: str) -> str:
+    """range_mode=window 但拿不到目标窗口时的统一错误文案（区分「没配」和「没找到」）。"""
+    if _target_configured(params):
+        return (f"{tag}：目标窗口未找到（标题/程序名/类名都没匹配到）——"
+                f"不会退化为全屏，请确认目标窗口已打开，或修正定位条件")
+    return (f"{tag}：范围选了「目标窗口」，但没配置目标窗口（标题/程序名/类名）——"
+            f"请补上定位条件，或把范围改为「全屏」")
+
+
+def _resolve_target_rect(ctx, params: Dict[str, Any], tag: str = "目标窗口"):
+    """解析「目标窗口」窗口：按 target_title / target_exe / target_class 查找，返回 (hwnd, rect)。
+    未配置定位条件、或条件没匹配到窗口，都返回 None（不再有任何全局目标窗口回落）。
+
+    rect 与编辑器框选 ROI / 拾取窗口同口径（DWM 可见边界），返回的是裸的
+    (left, top, right, bottom)，调用方按需换算成 (x, y, w, h)。
+    """
     from src.blueprint.core.variable_engine import VariableEngine
-    title_raw = str(params.get("temp_target_title", "") or "")
-    exe_name = str(params.get("temp_target_exe", "") or "").strip()
-    class_name = str(params.get("temp_target_class", "") or "").strip()
+    title_raw = str(params.get("target_title", "") or "")
+    exe_name = str(params.get("target_exe", "") or "").strip()
+    class_name = str(params.get("target_class", "") or "").strip()
     if not (title_raw.strip() or exe_name or class_name):
         return None
     try:
@@ -1706,7 +1579,7 @@ def _resolve_temp_target_rect(ctx, params: Dict[str, Any]):
     try:
         hwnd = _find_window_3d(title, exe_name, class_name)
         if not hwnd:
-            ctx.log(f"[Mouse] 临时目标窗口未找到: title={title!r} exe={exe_name!r} class={class_name!r}", "WARN")
+            ctx.log(f"[{tag}] 目标窗口未找到: title={title!r} exe={exe_name!r} class={class_name!r}", "WARN")
             return None
         # 窗口最小化时取到的 rect 是 (-32000,...) 垃圾值，先还原再取
         try:
@@ -1726,10 +1599,10 @@ def _resolve_temp_target_rect(ctx, params: Dict[str, Any]):
         if rect is None:
             import win32gui as _wg
             rect = _wg.GetWindowRect(hwnd)  # (left, top, right, bottom)
-        ctx.log(f"[Mouse] 使用临时目标窗口 hwnd={hwnd} rect={rect} title={title!r}", "DEBUG")
+        ctx.log(f"[{tag}] 目标窗口 hwnd={hwnd} rect={rect} title={title!r}", "DEBUG")
         return (hwnd, rect)
     except Exception as e:
-        ctx.log(f"[Mouse] 解析临时目标窗口失败: {type(e).__name__}: {e}", "WARN")
+        ctx.log(f"[{tag}] 解析目标窗口失败: {type(e).__name__}: {e}", "WARN")
         return None
 
 
@@ -1749,88 +1622,44 @@ def _bring_window_to_front_safe(ctx, hwnd):
 
 
 @contextlib.contextmanager
-def _temp_window_foreground(ctx, params: Dict[str, Any]):
-    """临时目标窗口前置上下文管理器。
+def _target_window_foreground(ctx, target):
+    """目标窗口前置上下文管理器。
 
-    如果节点配置了临时目标窗口（temp_target_*），在操作前把临时窗口前置到最前面，
-    操作完成后（无论成功或异常）把全局目标窗口还原到最前面。
+    传入已解析好的 target=(hwnd, rect)（或 None）。操作前把目标窗口前置到最前面，
+    让截图/找图/点击都作用在它身上；操作结束后不做任何「还原」（本项目已没有全局目标窗口，
+    不再需要把某个窗口还原到最前）。
 
     用法：
-        with _temp_window_foreground(ctx, node.params):
+        with _target_window_foreground(ctx, target):
             # 执行操作
     """
-    temp = _resolve_temp_target_rect(ctx, params)
-    if temp is not None:
-        temp_hwnd = temp[0]
-        # 获取全局目标窗口句柄（用于操作后还原）
-        global_hwnd = None
-        try:
-            target = ctx.get_var("target") if hasattr(ctx, "get_var") else None
-            if isinstance(target, dict):
-                global_hwnd = target.get("hwnd")
-        except Exception:
-            pass
-        # 前置临时窗口
-        _bring_window_to_front_safe(ctx, temp_hwnd)
-        time.sleep(0.15)  # 等待窗口切换完成
-        try:
-            yield
-        finally:
-            # 还原全局目标窗口到最前面
-            if global_hwnd:
-                _bring_window_to_front_safe(ctx, global_hwnd)
-                time.sleep(0.1)
-    else:
+    if target is None:
         yield
+        return
+    _bring_window_to_front_safe(ctx, target[0])
+    time.sleep(0.15)  # 等待窗口切换完成
+    yield
 
 
-def _mouse_final_pos(ctx, params: Dict[str, Any], inputs: Dict[str, Any]):
-    """按 coord_mode 把 pos(tuple2) 或 in_pos 转换为屏幕绝对坐标。
-    in_pos 的坐标系取决于 Mouse 节点的 coord_mode：
-      - absolute：in_pos 直接当绝对坐标
-      - relative：in_pos 当相对目标窗口坐标，加上窗口偏移
+def _mouse_final_pos(ctx, params: Dict[str, Any], inputs: Dict[str, Any], target) -> Tuple[int, int]:
+    """按 range_mode 把 pos(tuple2) 或 in_pos 转换为屏幕绝对坐标。
+
+    in_pos / pos 的坐标系取决于 Mouse 节点的 range_mode：
+      - fullscreen：直接当绝对屏幕坐标
+      - window    ：当相对目标窗口坐标，加上窗口左上角偏移
+
+    target：已由 execute_Mouse 解析好的 (hwnd, rect) 或 None。
+    range_mode=window 时 target 必不为 None（找不到窗口的情况在 execute_Mouse 里已走 err）。
     """
+    mode = str(params.get("range_mode", "window") or "window")
     in_pos = inputs.get("in_pos")
     if in_pos is not None and isinstance(in_pos, (tuple, list)) and len(in_pos) == 2:
         x, y = int(in_pos[0]), int(in_pos[1])
-        mode = str(params.get("coord_mode", "relative") or "relative")
-        if mode == "absolute":
-            return (x, y)
-        elif mode == "relative":
-            # in_pos 是相对目标窗口的坐标，需要加上窗口偏移
-            temp = _resolve_temp_target_rect(ctx, params)
-            if temp is not None:
-                rect = temp[1]
-                return (int(rect[0]) + x, int(rect[1]) + y)
-            try:
-                target = ctx.get_var("target") if hasattr(ctx, "get_var") else None
-                if isinstance(target, dict):
-                    rect = target.get("rect")
-                    if isinstance(rect, (tuple, list)) and len(rect) >= 2:
-                        return (int(rect[0]) + x, int(rect[1]) + y)
-            except Exception:
-                pass
-        return (x, y)
-    mode = str(params.get("coord_mode", "relative") or "relative")
-    x, y = _tuple2(params.get("pos", (0, 0)))
-    if mode == "absolute":
-        return (x, y)
-    elif mode == "relative":
-        # 优先使用临时目标窗口
-        temp = _resolve_temp_target_rect(ctx, params)
-        if temp is not None:
-            rect = temp[1]
-            return (int(rect[0]) + x, int(rect[1]) + y)
-        try:
-            target = ctx.get_var("target") if hasattr(ctx, "get_var") else None
-            if isinstance(target, dict):
-                rect = target.get("rect")
-                if isinstance(rect, (tuple, list)) and len(rect) >= 2:
-                    rx = int(rect[0])
-                    ry = int(rect[1])
-                    return (rx + x, ry + y)
-        except Exception:
-            pass
+    else:
+        x, y = _tuple2(params.get("pos", (0, 0)))
+    if mode == "window" and target is not None:
+        rect = target[1]
+        return (int(rect[0]) + x, int(rect[1]) + y)
     return (x, y)
 
 
@@ -1846,28 +1675,12 @@ def _tuple2(val) -> Tuple[int, int]:
     return (0, 0)
 
 
-def _mouse_final_pos_for(ctx, params: Dict[str, Any], point_param_name: str) -> Tuple[int, int]:
-    """按 coord_mode 把指定点参数（from_pos / to_pos）转换为屏幕绝对坐标。"""
-    mode = str(params.get("coord_mode", "relative") or "relative")
+def _mouse_final_pos_for(ctx, params: Dict[str, Any], point_param_name: str, target) -> Tuple[int, int]:
+    """按 range_mode 把指定点参数（from_pos / to_pos）转换为屏幕绝对坐标。"""
     x, y = _tuple2(params.get(point_param_name, (0, 0)))
-    if mode == "absolute":
-        return (x, y)
-    elif mode == "relative":
-        # 优先使用临时目标窗口
-        temp = _resolve_temp_target_rect(ctx, params)
-        if temp is not None:
-            rect = temp[1]
-            return (int(rect[0]) + x, int(rect[1]) + y)
-        try:
-            target = ctx.get_var("target") if hasattr(ctx, "get_var") else None
-            if isinstance(target, dict):
-                rect = target.get("rect")
-                if isinstance(rect, (tuple, list)) and len(rect) >= 2:
-                    rx = int(rect[0])
-                    ry = int(rect[1])
-                    return (rx + x, ry + y)
-        except Exception:
-            pass
+    if str(params.get("range_mode", "window") or "window") == "window" and target is not None:
+        rect = target[1]
+        return (int(rect[0]) + x, int(rect[1]) + y)
     return (x, y)
 
 
@@ -1879,13 +1692,25 @@ def execute_Mouse(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
     btn = str(p.get("button", "left") or "left")
     ia = getattr(ctx, "input_actions", None)
 
+    # 范围解析：range_mode=window 时必须先拿到目标窗口，拿不到直接走 err——
+    # 不按绝对坐标硬点（原来会偷偷退化成绝对坐标，属于静默做错事）。
+    range_mode = str(p.get("range_mode", "window") or "window")
+    target = None
+    if range_mode == "window":
+        target = _resolve_target_rect(ctx, p, tag="Mouse")
+        if target is None:
+            err = _target_err_msg(p, "Mouse")
+            ctx.log(f"[Mouse] {err}", "ERROR")
+            annotate_step(ctx, node, "mouse_err", note=err[:60])
+            return {}, ["err"], err
+
     post_min = max(0, int(p.get("post_delay_min_ms", 30) or 30))
     post_max = max(0, int(p.get("post_delay_max_ms", 80) or 80))
     post_range = (min(post_min, post_max), max(post_min, post_max))
 
-    with _temp_window_foreground(ctx, p):
+    with _target_window_foreground(ctx, target):
         try:
-            pos = _mouse_final_pos(ctx, p, inputs)
+            pos = _mouse_final_pos(ctx, p, inputs, target)
             wait_if_paused(ctx)
 
             if action == "click":
@@ -1913,8 +1738,8 @@ def execute_Mouse(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
                 ctx.log(f"[Mouse] move→{pos}", "SUCCESS")
 
             elif action == "drag":
-                from_pt = _mouse_final_pos_for(ctx, p, "from_pos")
-                to_pt = _mouse_final_pos_for(ctx, p, "to_pos")
+                from_pt = _mouse_final_pos_for(ctx, p, "from_pos", target)
+                to_pt = _mouse_final_pos_for(ctx, p, "to_pos", target)
                 dur = max(0, int(p.get("drag_duration_ms", 300) or 300))
                 from_x, from_y = from_pt
                 to_x, to_y = to_pt
@@ -2325,10 +2150,76 @@ def execute_Command(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
         return {"stdout": "", "stderr": str(e), "exit_code": -1}, ["err"], str(e)
 
 
-def execute_WebBrowser(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
-    """【打开网页】用浏览器打开指定 URL。支持 {var} 插值 + 选择 default/chrome/edge/firefox 浏览器。"""
-    import webbrowser
+# ============================================================
+# 「打开网页」节点用的浏览器清单
+#   严格模式：指定了浏览器就必须用它，找不到就走 err，绝不静默换成默认浏览器。
+#   （用户明确要求：有些操作是绑定浏览器的，兜底会把「本该失败」变成「悄悄做错」。）
+# ============================================================
+_BROWSER_LABELS = {"chrome": "Chrome", "edge": "Edge", "firefox": "Firefox"}
+
+_BROWSER_EXE_CANDIDATES: Dict[str, List[str]] = {
+    "chrome": [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe",
+        "google-chrome", "chrome", "chromium",
+    ],
+    "edge": [
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        r"%LOCALAPPDATA%\Microsoft\Edge\Application\msedge.exe",
+        "msedge", "edge",
+    ],
+    "firefox": [
+        r"C:\Program Files\Mozilla Firefox\firefox.exe",
+        r"C:\Program Files (x86)\Mozilla Firefox\firefox.exe",
+        r"%LOCALAPPDATA%\Microsoft\WindowsApps\firefox.exe",
+        "firefox", "mozilla",
+    ],
+}
+
+
+def _find_browser_exe(browser_name: str) -> Optional[str]:
+    """在标准安装路径 + PATH 里找指定浏览器的可执行文件。
+
+    返回绝对路径或 PATH 命中项；找不到返回 None（调用方必须走 err，不允许兜底）。
+    支持 %LOCALAPPDATA% 这类环境变量写法。
+    """
     import shutil as _shutil
+
+    for cand in _BROWSER_EXE_CANDIDATES.get(browser_name, []):
+        try:
+            expanded = os.path.expandvars(cand)
+            if os.path.isfile(expanded):
+                return expanded
+            hit = _shutil.which(expanded)
+            if hit:
+                return hit
+        except Exception:
+            continue
+    return None
+
+
+def execute_WebBrowser(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
+    """【打开网页】用浏览器打开指定 URL。支持 {var} 插值 + 选择 默认/Chrome/Edge/Firefox。
+
+    严格模式（用户要求，不做任何静默兜底）：
+      · 浏览器=默认   → 用系统默认浏览器打开；
+      · 浏览器=Chrome/Edge/Firefox → 必须找到该浏览器可执行文件，找不到直接走 err；
+      · 浏览器完整路径（browser_path）非空 → 优先用它，文件不存在直接走 err；
+        绿色版/装在非标准位置的浏览器用这个参数，绕开标准路径清单的限制。
+      启动失败也走 err。绝不改用系统默认浏览器顶替。
+      原因：有些操作是绑定浏览器的，静默兜底会把「本该失败」变成「悄悄做错」，
+      而且旧实现的日志还会打着 [chrome] 的旗号，实际是别的浏览器打开的。
+
+    打开后会等待 wait_sec_after_open 秒（默认 5）再走下一节点，等待可被暂停/停止打断。
+
+    启动方式刻意用 Popen 且不 wait：webbrowser.GenericBrowser.open() 内部是
+    Popen(...) 之后 p.wait()，浏览器进程若常驻（首次冷启动时往往如此），
+    这里会一直等到浏览器被关闭才返回，表现为蓝图「卡住」。
+    """
+    import subprocess as _sp
+    import webbrowser
 
     p = dict(node.params or {})
     _BROWSER_MAP = {
@@ -2338,8 +2229,17 @@ def execute_WebBrowser(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]
         "firefox": "firefox",
     }
     url_template = str(p.get("url", "") or "")
-    browser_raw = str(p.get("browser", "default") or "default").strip().lower()
+    browser_raw = str(p.get("browser", "默认") or "默认").strip().lower()
     browser_name = _BROWSER_MAP.get(browser_raw, "default")
+    # 完整路径：去掉首尾空白与可能粘上的引号（用户从资源管理器「复制为路径」会带引号）
+    browser_path_raw = str(p.get("browser_path", "") or "").strip().strip('"').strip("'").strip()
+
+    # 打开后等待秒数：0 = 不等。注意不能用 `x or 默认值` 写法，那样用户填 0 会被吃成默认值。
+    _w = p.get("wait_sec_after_open", 5.0)
+    try:
+        wait_sec = max(0.0, min(float(_w if _w is not None else 5.0), 3600.0))
+    except Exception:
+        wait_sec = 5.0
 
     try:
         wait_if_paused(ctx)
@@ -2348,6 +2248,9 @@ def execute_WebBrowser(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]
         if engine.has_any_marker(url_template):
             url_template = str(engine.interpolate(url_template))
         url = url_template if url_template else ""
+        # 完整路径也允许 {var} 插值（例：{browser_dir}\chrome.exe）
+        if browser_path_raw and engine.has_any_marker(browser_path_raw):
+            browser_path_raw = str(engine.interpolate(browser_path_raw)).strip().strip('"').strip("'").strip()
 
         if not url:
             err = "URL 为空（打开网页必须填 URL）"
@@ -2355,68 +2258,87 @@ def execute_WebBrowser(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]
             ctx.log(f"[WebBrowser] {err}", "ERROR")
             return {}, ["err"], err
 
-        # 按 browser_name 找对应可执行程序 → 注册到 webbrowser；找不到就 fallback 到 default
-        controller = None
-        if browser_name in ("chrome", "edge", "firefox"):
-            exe_candidates = {
-                "chrome": [
-                    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-                    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-                    os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
-                    "google-chrome", "chrome", "chromium",
-                ],
-                "edge": [
-                    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-                    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-                    "msedge", "edge",
-                ],
-                "firefox": [
-                    r"C:\Program Files\Mozilla Firefox\firefox.exe",
-                    r"C:\Program Files (x86)\Mozilla Firefox\firefox.exe",
-                    "firefox", "mozilla",
-                ],
-            }.get(browser_name, [])
-            for cand in exe_candidates:
-                try:
-                    if os.path.exists(cand) or _shutil.which(cand):
-                        try:
-                            controller = webbrowser.get(f'"{cand}" %s')
-                            break
-                        except Exception:
-                            continue
-                except Exception:
-                    continue
-            if controller is None:
-                ctx.log(f"[WebBrowser] 指定浏览器 {browser_name} 未找到可执行文件，fallback 到系统默认浏览器", "WARN")
+        # ---------- 目标浏览器解析（严格模式：找不到就走 err，不做任何兜底） ----------
+        # 优先级：①「浏览器完整路径」显式指定 → 必须存在；
+        #         ②「浏览器」下拉按名字在标准路径/PATH 里查找。
+        # 两条都失败 → err，绝不改用系统默认浏览器顶替。
+        exe_path = None
+        if browser_path_raw:
+            if not os.path.isfile(browser_path_raw):
+                err = (
+                    f"「浏览器完整路径」指向的文件不存在：{browser_path_raw} ——"
+                    f"严格模式不会改用系统默认浏览器。"
+                    f"请检查该路径，或清空本参数改用「浏览器」下拉选择"
+                )
+                annotate_step(ctx, node, "web_browser_err", note="FAIL 完整路径不存在")
+                ctx.log(f"[WebBrowser] {err}", "ERROR")
+                return {}, ["err"], err
+            exe_path = browser_path_raw
+            # 日志写真实启动的程序：优先用下拉里的名字，没选就用 exe 文件名
+            label = _BROWSER_LABELS.get(browser_name) or os.path.basename(exe_path) or exe_path
+            ctx.log(f"[WebBrowser] 使用指定的浏览器完整路径（{label}）→ {exe_path}", "INFO")
+        elif browser_name != "default":
+            label = _BROWSER_LABELS.get(browser_name, browser_name)
+            exe_path = _find_browser_exe(browser_name)
+            if exe_path is None:
+                err = (
+                    f"未找到 {label} 的可执行文件（已检查标准安装路径与 PATH）——"
+                    f"严格模式不会改用系统默认浏览器。"
+                    f"请先安装 {label}，或把「浏览器」参数改成「默认」，"
+                    f"或用「浏览器完整路径」直接指定 exe 位置"
+                )
+                annotate_step(ctx, node, "web_browser_err", note=f"FAIL 未找到 {label}")
+                ctx.log(f"[WebBrowser] {err}", "ERROR")
+                return {}, ["err"], err
+            ctx.log(f"[WebBrowser] 指定浏览器 {label} → {exe_path}", "INFO")
+        else:
+            label = "默认浏览器"
 
+        # ---------- 启动（严格模式：指定了浏览器就只认它） ----------
         opened = False
         last_err = None
-        try:
-            if controller is not None:
-                opened = bool(controller.open(url, new=2, autoraise=True))
-            else:
-                opened = bool(webbrowser.open(url, new=2, autoraise=True))
-        except Exception as e:
-            last_err = e
-            opened = False
-
-        if not opened and os.name == "nt":
-            # Windows 兜底：os.startfile（最鲁棒）
+        if exe_path is not None:
             try:
-                os.startfile(url)
+                _sp.Popen([exe_path, url])  # 不 wait：详见函数头说明
                 opened = True
-            except Exception as e2:
-                last_err = last_err or e2
+            except Exception as e:
+                last_err = e
+                opened = False
+        else:
+            # 「默认」分支：目标本身就是系统默认浏览器，这里的二次尝试不构成「冒充」
+            try:
+                opened = bool(webbrowser.open(url, new=2, autoraise=True))
+            except Exception as e:
+                last_err = e
+                opened = False
+            if not opened and os.name == "nt":
+                try:
+                    os.startfile(url)
+                    opened = True
+                    ctx.log("[WebBrowser] webbrowser 打开失败，改用 os.startfile（同为系统默认浏览器）", "WARN")
+                except Exception as e2:
+                    last_err = last_err or e2
 
         if not opened:
-            err_msg = f"打开浏览器失败: {last_err}" if last_err else "打开浏览器失败（无可用浏览器）"
+            err_msg = f"启动浏览器失败（{label}）: {last_err}" if last_err else f"启动浏览器失败（{label}）"
             annotate_step(ctx, node, "web_browser_err", note=err_msg)
             ctx.log(f"[WebBrowser] {err_msg}", "ERROR")
             return {}, ["err"], err_msg
 
-        note = f"[{browser_name}] 打开 → {url[:100]}"
+        note = f"[{label}] 打开 → {url[:100]}"
         annotate_step(ctx, node, "web_browser_open", note=note)
         ctx.log(f"[WebBrowser] {note}", "SUCCESS")
+
+        # ---------- 打开后等待：浏览器起窗口/页面加载都不是一瞬间，等一会儿再走下一节点 ----------
+        # 等待过程可被「暂停 / 停止」中断（和 Wait 节点同一套机制）。
+        if wait_sec > 0:
+            ctx.log(f"[WebBrowser] 打开后等待 {wait_sec:g}s 再走下一节点", "INFO")
+            _t0 = time.time()
+            while ctx.is_running and (time.time() - _t0) < wait_sec:
+                wait_if_paused(ctx)
+                time.sleep(0.05)
+            wait_if_paused(ctx)
+
         return {}, ["out_done"], ""
     except Exception as e:
         err = f"{type(e).__name__}: {e}"
@@ -3310,10 +3232,9 @@ def execute_IfImageDetect(ctx: ExecutionContext, node: Node, inputs: Dict[str, A
         threshold = float(data.get("threshold", 0.9) or 0.9)
     except (TypeError, ValueError):
         threshold = 0.9
-    akaze_thr = max(0.01, min(1.0, float(threshold)))
     strategy = str(data.get("match_strategy", "hybrid") or "hybrid")
     eval_mode = str(data.get("eval_mode", "complete") or "complete")
-    search_mode = str(data.get("search_mode", "relative") or "relative")
+    range_mode = str(data.get("range_mode", "window") or "window")
 
     if not imgs:
         ctx.log("[IfImg] 没有配置参考图 -> no", "WARN")
@@ -3335,26 +3256,24 @@ def execute_IfImageDetect(ctx: ExecutionContext, node: Node, inputs: Dict[str, A
         hit_all = True
     scores: List[str] = []
 
-    with _temp_window_foreground(ctx, data):
+    # 目标窗口解析：window 模式必须先拿到窗口，找不到直接 err（不退化为全屏）
+    target = None
+    if range_mode == "window":
+        target = _resolve_target_rect(ctx, data, tag="IfImg")
+        if target is None:
+            err = _target_err_msg(data, "IfImg")
+            ctx.log(f"[IfImg] {err}", "ERROR")
+            annotate_step(ctx, node, "find", note="ERROR: target window not found")
+            return {}, ["err"], err
+
+    with _target_window_foreground(ctx, target):
         try:
             # region 在窗口前置之后计算，避免最小化窗口恢复后 rect 失效
             region = None
-            if search_mode == "relative":
-                temp = _resolve_temp_target_rect(ctx, data)
-                if temp is not None:
-                    rect = temp[1]
-                    region = (int(rect[0]), int(rect[1]), int(rect[2]) - int(rect[0]), int(rect[3]) - int(rect[1]))
-                    ctx.log(f"[IfImg] 相对目标窗口检测 region={region} (临时目标)", "DEBUG")
-                else:
-                    try:
-                        target = ctx.get_var("target") if hasattr(ctx, "get_var") else None
-                        if isinstance(target, dict):
-                            r = target.get("rect")
-                            if isinstance(r, (tuple, list)) and len(r) >= 4:
-                                region = (int(r[0]), int(r[1]), int(r[2]), int(r[3]))
-                                ctx.log(f"[IfImg] 相对目标窗口检测 region={region} (全局目标)", "DEBUG")
-                    except Exception:
-                        pass
+            if target is not None:
+                rect = target[1]
+                region = (int(rect[0]), int(rect[1]), int(rect[2]) - int(rect[0]), int(rect[3]) - int(rect[1]))
+                ctx.log(f"[IfImg] 目标窗口内检测 region={region}", "DEBUG")
 
             for i, item in enumerate(imgs):
                 wait_if_paused(ctx)
@@ -3408,14 +3327,10 @@ def execute_IfImageDetect(ctx: ExecutionContext, node: Node, inputs: Dict[str, A
                             pos = ctx.matcher.find_image(use_path, region=region, threshold=threshold, fast_mode=True)
                         elif strategy == "gray":
                             pos = ctx.matcher.find_image_gray(use_path, region=region, threshold=threshold, fast_mode=True)
-                        elif strategy == "feature":
-                            pos = ctx.matcher.find_image_akaze(use_path, region=region, threshold=akaze_thr)
-                        else:  # hybrid：彩色 → 灰度 → AKAZE
+                        else:  # hybrid：彩色 → 灰度，两级级联
                             pos = ctx.matcher.find_image(use_path, region=region, threshold=threshold, fast_mode=True)
                             if pos is None:
                                 pos = ctx.matcher.find_image_gray(use_path, region=region, threshold=threshold, fast_mode=True)
-                            if pos is None:
-                                pos = ctx.matcher.find_image_akaze(use_path, region=region, threshold=akaze_thr)
                 except Exception as e:
                     ctx.log(f"[IfImg] 匹配异常[{i}]: {e}", "WARN")
                 try:
@@ -3522,42 +3437,28 @@ def execute_StillnessDetect(ctx: ExecutionContext, node: Node, inputs: Dict[str,
     stillness_seconds = max(0.1, float(p.get("stillness_seconds", 5.0) or 5.0))
     sample_interval_seconds = max(0.03, float(p.get("sample_interval_seconds", 1.0) or 1.0))
     timeout_seconds = max(1.0, float(p.get("timeout_seconds", 20.0) or 20.0))
-    search_mode = str(p.get("search_mode", "relative") or "relative")
+    range_mode = str(p.get("range_mode", "window") or "window")
 
     if w <= 0 or h <= 0:
         ctx.log("[if_static] 未设置ROI，先点右侧按钮框选区域 -> no", "WARN")
         annotate_step(ctx, node, "static", note="ERROR: ROI empty")
         return {}, ["no"], ""
 
-    # relative 模式：获取窗口偏移（缓存，不每帧枚举窗口）
-    _cached_win_offset = None
-    _cache_ts = 0.0
-    _CACHE_TTL = 2.0  # 缓存有效期2秒
+    # 目标窗口解析：window 模式必须先拿到窗口，找不到直接 err（不退化为全屏）
+    target = None
+    if range_mode == "window":
+        target = _resolve_target_rect(ctx, p, tag="if_static")
+        if target is None:
+            err = _target_err_msg(p, "if_static")
+            ctx.log(f"[if_static] {err}", "ERROR")
+            annotate_step(ctx, node, "static", note="ERROR: target window not found")
+            return {}, ["err"], err
 
-    def _get_win_offset():
-        nonlocal _cached_win_offset, _cache_ts
-        if search_mode != "relative":
-            return (0, 0)
-        # 快路径：优先从 ctx 缓存的全局目标读取（不枚举窗口）
-        try:
-            target = ctx.get_var("target") if hasattr(ctx, "get_var") else None
-            if isinstance(target, dict):
-                r = target.get("rect")
-                if isinstance(r, (tuple, list)) and len(r) >= 2:
-                    return (int(r[0]), int(r[1]))
-        except Exception:
-            pass
-        # 慢路径：临时目标窗口，使用缓存避免每帧枚举
-        now = time.monotonic()
-        if _cached_win_offset is not None and (now - _cache_ts) < _CACHE_TTL:
-            return _cached_win_offset
-        temp = _resolve_temp_target_rect(ctx, p)
-        if temp is not None:
-            rect = temp[1]
-            _cached_win_offset = (int(rect[0]), int(rect[1]))
-            _cache_ts = now
-            return _cached_win_offset
-        return (0, 0)
+    # 窗口偏移：window 模式下 ROI 坐标基于目标窗口左上角；fullscreen 模式基于屏幕左上角
+    _win_offset = (0, 0)
+    if target is not None:
+        _r = target[1]
+        _win_offset = (int(_r[0]), int(_r[1]))
 
     prev_roi: Optional[np.ndarray] = None
     stable_since_ts: Optional[float] = None
@@ -3566,7 +3467,7 @@ def execute_StillnessDetect(ctx: ExecutionContext, node: Node, inputs: Dict[str,
     interval_s = sample_interval_seconds
     last_diff = None  # None=未采样过，float=最近一次帧差
 
-    with _temp_window_foreground(ctx, p):
+    with _target_window_foreground(ctx, target):
         while (time.monotonic() - t0) < timeout_s and getattr(ctx, "is_running", True):
             wait_if_paused(ctx)
             if not getattr(ctx, "is_running", True):
@@ -3574,7 +3475,7 @@ def execute_StillnessDetect(ctx: ExecutionContext, node: Node, inputs: Dict[str,
             shot_bgr = None
             try:
                 if ctx.screen is not None:
-                    ox, oy = _get_win_offset()
+                    ox, oy = _win_offset
                     shot_bgr = ctx.screen.capture_region_bgr((x + ox, y + oy, w, h))
             except Exception:
                 shot_bgr = None
@@ -3630,189 +3531,6 @@ def execute_StillnessDetect(ctx: ExecutionContext, node: Node, inputs: Dict[str,
     return {}, ["no"], ""
 
 
-# ---------------- 检测：声音 if_sound ----------------
-def _capture_sound_blocking(device: str, duration_sec: float, sr: int = 44100):
-    """采集一段系统音频，失败返回 None。
-    使用 soundcard（支持 default_loopback 录系统扬声器自己播放的声音）。
-    """
-    import numpy as np
-    # 1) soundcard 首选（WASAPI loopback 稳定）
-    try:
-        import soundcard as sc
-        if device == "default_loopback":
-            # soundcard 的 Speaker 对象没有 .loopback 属性，需要通过 get_microphone + include_loopback=True 获取环回设备
-            # 先尝试用 default_speaker 的 ID 查找环回麦克风
-            spk = sc.default_speaker()
-            spk_id = str(spk.id)
-            try:
-                loopback = sc.get_microphone(id=spk_id, include_loopback=True)
-            except Exception:
-                # speaker ID 可能不匹配 microphone ID，改为遍历所有 loopback 设备找第一个
-                all_mics = sc.all_microphones(include_loopback=True)
-                lb_mics = [m for m in all_mics if "loopback" in str(getattr(m, "id", "")).lower()
-                           or "Loopback" in str(getattr(m, "name", ""))
-                           or str(getattr(m, "id", "")) == spk_id]
-                if not lb_mics:
-                    # 最后兜底：取第一个带 include_loopback 返回的设备
-                    lb_mics = all_mics
-                if not lb_mics:
-                    raise RuntimeError("找不到任何环回音频设备")
-                loopback = lb_mics[0]
-        else:
-            # 按ID或名查找，包含 loopback 设备
-            loopback = sc.get_microphone(id=device, include_loopback=True)
-        with loopback.recorder(samplerate=sr) as rec:
-            data = rec.record(numframes=int(sr * max(0.01, duration_sec)))
-        if data.ndim == 2:
-            data = data.mean(axis=1)
-        arr = np.asarray(data, dtype=np.float32)
-        # 检查是否为全零数据（静音 = 采集失败的特征）
-        if arr.size > 0 and float(np.max(np.abs(arr))) < 1e-7:
-            return None
-        return arr
-    except Exception:
-        return None
-
-
-def _ascii_waveform(data, peak_marker_db: float = -30.0, width: int = 60, height: int = 7) -> str:
-    """用ASCII字符画绘制音频波形，便于debug_visual日志输出。"""
-    import numpy as np
-    try:
-        arr = np.asarray(data, dtype=np.float32)
-        if arr.size == 0:
-            return "[waveform] (空)"
-        # 降采样到 width 个点
-        step = max(1, arr.size // width)
-        ds = arr[: step * width].reshape(-1, step)
-        env_max = np.max(np.abs(ds), axis=1)
-        env_max_db = 20 * np.log10(env_max + 1e-8)
-        # 刻度：从 height-1（顶部=0dB）到 0（底部=-90dB）
-        thr_line = int(np.clip(height - 1 - (peak_marker_db / (-90.0)) * (height - 1), 0, height - 1))
-        lines: List[str] = []
-        for row in range(height - 1, -1, -1):
-            db_at_row = -((height - 1 - row) / max(1, height - 1)) * 90.0
-            prefix = f"{db_at_row:>5.0f}dB "
-            chars = []
-            for v in env_max_db:
-                row_has = (height - 1 - int(np.clip((-v / 90.0) * (height - 1), 0, height - 1))) <= row
-                mark = "│"
-                if row == thr_line:
-                    mark = "·" if not row_has else "┿"
-                if row_has:
-                    chars.append("█" if mark != "┿" else "▣")
-                else:
-                    chars.append(mark)
-            lines.append(prefix + "".join(chars))
-        thr_annot = " " * 6 + "-" * thr_line + f" ▲阈值({peak_marker_db:.0f}dB)"
-        return "\n".join(lines + [thr_annot])
-    except Exception as e:
-        return f"[waveform render err: {e}]"
-
-
-def execute_SoundDetect(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
-    """
-    if_sound 节点：系统播放/麦克风声音检测。
-    - judge_mode: detect_sound(检测声音) / detect_silence(检测静音)
-    - 采集失败（soundcard 不可用/设备不可用）时 WARN 走 no
-    """
-    import numpy as np
-
-    wait_if_paused(ctx)
-    p = node.params
-    mode_raw = str(p.get("judge_mode", "detect_sound") or "detect_sound")
-    if mode_raw in ("detect_silence", "is_silent", "silence", "detect_mute"):
-        mode = "detect_silence"
-    else:
-        mode = "detect_sound"
-    thr_db = float(p.get("threshold_db", -30.0) or -30.0)
-    sample_ms = max(50, int(p.get("sample_ms", 500) or 500))
-    timeout_s = max(0.0, float(p.get("timeout_seconds", 5.0) or 0.0))
-    device = str(p.get("device", "default_loopback") or "default_loopback")
-    debug_viz = bool(p.get("debug_visual", False))
-    sr = 44100
-
-    mode_cn = "检测声音" if mode == "detect_sound" else "检测静音"
-    ctx.log(f"[if_sound] 模式={mode_cn}(raw={mode_raw}) 阈值={thr_db}dB 采样={sample_ms}ms 设备={device} 超时={timeout_s}s", "INFO")
-
-    t0 = time.time()
-    timeout_cap_s = timeout_s if timeout_s > 0 else (86400.0 * 365)
-    sample_s = sample_ms / 1000.0
-    note = ""
-    # 检测静音：需要累计稳定静音时长，这里简化为「单次采样期间全程静音」即判定；否则一直轮询
-    silence_consec_s = 0.0  # detect_silence 专用累计
-    last_sample_end = t0
-
-    while (time.time() - t0) < timeout_cap_s and ctx.is_running:
-        wait_if_paused(ctx)
-        chunk = _capture_sound_blocking(device, sample_s, sr)
-        if chunk is None:
-            ctx.log(
-                "[if_sound] 音频采集库未安装或设备不可用，自动走 no。请先执行："
-                " pip install soundcard ",
-                "WARN",
-            )
-            annotate_step(ctx, node, "sound", note="采集库不可用→no")
-            return {}, ["no"], ""
-
-        # 计算峰值dB和均值dB
-        peak = float(np.max(np.abs(chunk)) + 1e-8)
-        mean = float(np.mean(np.abs(chunk)) + 1e-8)
-        peak_db = float(20.0 * np.log10(peak))
-        mean_db = float(20.0 * np.log10(mean))
-
-        # 每次采集都输出（INFO），方便排查采集问题
-        ctx.log(f"[if_sound] 采集结果: peak={peak_db:.1f}dB mean={mean_db:.1f}dB thr={thr_db:.0f}dB mode={mode}", "INFO")
-
-        yes = False
-        if mode == "detect_sound":
-            # 检测声音：只要出现一次峰值/均值超过阈值就算满足
-            yes = (peak_db >= thr_db) or (mean_db >= thr_db)
-            note = f"[{mode}] peak={peak_db:.1f}dB mean={mean_db:.1f}dB thr={thr_db:.0f}dB"
-        else:  # detect_silence
-            # 检测静音：整个采样期间 peak 必须低于阈值
-            sample_is_silent = (peak_db < thr_db) and (mean_db < thr_db)
-            now = time.time()
-            dt_last = max(0.0, now - last_sample_end)
-            last_sample_end = now
-            if sample_is_silent:
-                silence_consec_s += sample_s
-            else:
-                silence_consec_s = 0.0
-            # 需要累计静音时长达到采样窗口的 2 倍才判定，避免单次偶然静音误触发
-            yes = sample_is_silent and silence_consec_s >= sample_s * 2
-            note = (
-                f"[{mode}] peak={peak_db:.1f}dB mean={mean_db:.1f}dB thr={thr_db:.0f}dB "
-                f"consec_silence={silence_consec_s:.2f}s"
-            )
-
-        if debug_viz:
-            wave = _ascii_waveform(chunk, peak_marker_db=thr_db)
-            ctx.log(f"[if_sound waveform]\n{wave}\n判定={note} yes={yes}", "DEBUG")
-
-        if yes:
-            mode_cn = "检测声音" if mode == "detect_sound" else "检测静音"
-            ctx.log(f"[if_sound] ✅ {mode_cn} 满足条件：{note}", "DEBUG")
-            annotate_step(ctx, node, "sound", note=f"YES[{mode_cn}] peak={peak_db:.1f}dB")
-            return {}, ["yes"], ""
-
-        # 轮询间隔（避免死循环占CPU）
-        t_slp = time.time()
-        while (time.time() - t_slp) < 0.05 and ctx.is_running:
-            wait_if_paused(ctx)
-            time.sleep(0.01)
-
-    # 超时
-    t_used_ms = int((time.time() - t0) * 1000)
-    mode_cn = "检测声音" if mode == "detect_sound" else "检测静音"
-    ctx.log(
-        f"[if_sound] ⏱ 超时 实际={t_used_ms}ms(要求≤{int(timeout_s*1000)}ms)，"
-        f"模式=[{mode_cn}]，条件未满足 → no（last={note}）",
-        "DEBUG",
-    )
-    annotate_step(ctx, node, "sound", note=f"TIMEOUT[{mode_cn}] last={note[:60]}")
-    return {}, ["no"], ""
-
-
 # ============================================================
 # 节点类型 -> 执行函数 映射
 # ============================================================
@@ -3828,14 +3546,12 @@ EXECUTORS = {
     "VarSwitch": execute_VarSwitch,
     "Notify": execute_Notify,
     "OpenApp": execute_OpenApp,
-    "BindWindow": execute_BindWindow,
     "FindImage": execute_FindImage,
     "Mouse": execute_Mouse,
     "PressKey": execute_PressKey,
     "SetVariable": execute_SetVariable,
     "IfImageDetect": execute_IfImageDetect,
     "StillnessDetect": execute_StillnessDetect,
-    "SoundDetect": execute_SoundDetect,
     "Clipboard": execute_Clipboard,
     "Command": execute_Command,
     "WebBrowser": execute_WebBrowser,
@@ -3867,12 +3583,15 @@ def _crop_roi(img_bgr, roi):
 
 
 def execute_Screenshot(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
-    """截图节点：截目标窗口/全屏的 ROI，输出图像（BGR / PNG 字节 / 可选落盘路径）。"""
+    """截图节点：截目标窗口/全屏的 ROI，输出图像（BGR / PNG 字节 / 可选落盘路径）。
+
+    range_mode=window 时目标窗口没找到 -> 走 err（不退化为全屏截图）。
+    """
     import cv2
 
     wait_if_paused(ctx)
     p = dict(node.params or {})
-    capture_mode = str(p.get("capture_mode", "target") or "target")
+    range_mode = str(p.get("range_mode", "window") or "window")
     roi = p.get("roi", (0, 0, 0, 0))
     save_path = str(p.get("save_path", "") or "")
 
@@ -3896,27 +3615,35 @@ def execute_Screenshot(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]
     if save_path and engine is not None and engine.has_any_marker(save_path):
         save_path = str(engine.interpolate(save_path))
 
-    # 临时目标窗口解析（会还原最小化窗口并取 DWM 可见边界矩形）
-    temp = _resolve_temp_target_rect(ctx, p) if capture_mode == "target" else None
+    # 目标窗口解析（会还原最小化窗口并取 DWM 可见边界矩形）。
+    # 严格模式：选了「目标窗口」就必须真的截到那个窗口，找不到直接走 err——
+    # 绝不退化成全屏截图（下游会把「整屏」当「窗口画面」用，属于静默做错事）。
+    target = None
+    if range_mode == "window":
+        target = _resolve_target_rect(ctx, p, tag="Screenshot")
+        if target is None:
+            err = _target_err_msg(p, "Screenshot")
+            ctx.log(f"[Screenshot] {err}", "ERROR")
+            annotate_step(ctx, node, "screenshot_err", note=err[:60])
+            return {"image_bgr": None, "image_png_bytes": b"", "image_path": ""}, ["err"], err
 
     img = None
-    if capture_mode == "target" and temp is not None:
+    if target is not None:
         # ① 优先后台截窗：PrintWindow(PW_RENDERFULLCONTENT)，
         #    窗口被遮挡时也能拿到实时画面，不前置、不抢焦点、不闪窗
         try:
             from src.blueprint.runtime.screen_capture import capture_window_bgr
-            img = capture_window_bgr(temp[0])
+            img = capture_window_bgr(target[0])
         except Exception:
             img = None
 
     if img is None:
         # ② 回退：还原+置顶目标窗口后全屏截取、按窗口矩形裁剪
-        if capture_mode == "target":
-            if temp is not None:
-                _bring_window_to_front_safe(ctx, temp[0])
-                time.sleep(0.15)  # 等待窗口前置与重绘完成
-            else:
-                ctx.log("[Screenshot] 未找到临时目标窗口（或未配置），退化为全屏", "WARN")
+        #   （注意：这是「同一目标窗口」的取图方式回退，不是改成截全屏——
+        #    window 模式走到这里 target 必不为 None，前面已经拦掉了「找不到窗口」的情况）
+        if target is not None:
+            _bring_window_to_front_safe(ctx, target[0])
+            time.sleep(0.15)  # 等待窗口前置与重绘完成
 
         # 截取
         full = ScreenCapture().capture_full_bgr()
@@ -3926,9 +3653,9 @@ def execute_Screenshot(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]
             return {"image_bgr": None, "image_png_bytes": b"", "image_path": ""}, ["err"], err
 
         img = full
-        if capture_mode == "target" and temp is not None:
-            # 用临时目标窗口限定截图范围
-            rect = temp[1]  # (left, top, right, bottom)
+        if target is not None:
+            # 用目标窗口限定截图范围
+            rect = target[1]  # (left, top, right, bottom)
             l, t, r, b = (int(v) for v in rect)
             H, W = full.shape[:2]
             l = max(0, l)
@@ -3938,7 +3665,10 @@ def execute_Screenshot(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]
             if r > l and b > t:
                 img = full[t:b, l:r]
             else:
-                ctx.log("[Screenshot] 目标窗口矩形无效，退化为全屏", "WARN")
+                err = "目标窗口矩形无效（窗口可能完全在屏幕外、已最小化或被隐藏）"
+                ctx.log(f"[Screenshot] {err}", "ERROR")
+                annotate_step(ctx, node, "screenshot_err", note=err[:60])
+                return {"image_bgr": None, "image_png_bytes": b"", "image_path": ""}, ["err"], err
 
     # 应用 ROI
     img = _crop_roi(img, roi)
@@ -3968,7 +3698,7 @@ def execute_Screenshot(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]
             ctx.log(f"[Screenshot] 保存 PNG 失败: {e}", "WARN")
 
     H, W = img.shape[:2]
-    note = f"{capture_mode} {W}x{H}" + (f" -> {saved_path}" if saved_path else "")
+    note = f"{'目标窗口' if target is not None else '全屏'} {W}x{H}" + (f" -> {saved_path}" if saved_path else "")
     annotate_step(ctx, node, "screenshot", note=note)
     ctx.log(f"[Screenshot] {note}", "SUCCESS")
     return {
@@ -3982,14 +3712,23 @@ def execute_Screenshot(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]
 # 文字/数字识别节点
 # ============================================================
 def execute_OcrRecognize(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
-    """OCR 识别节点：识别图像文字/数字，结果输出为变量 + 端口。"""
+    """OCR 识别节点：现场截图（目标窗口 / 全屏）→ 识别 → 输出整屏文本 + 识别条目列表。
+
+    出口：
+      · `out_done` 完成   —— 识别流程正常跑完（识别到文字时）
+      · `err` 失败        —— 截图失败 / 目标窗口没定位到 / 引擎异常 / 匹配表达式非法
+      · `no_text` 无文字  —— 跑完了但一条文字都没识别到（与「失败」分开）
+      · `matched` / `not_matched` —— 填了「匹配文本」时才有：整屏文本命中 / 未命中
+    range_mode=window 时目标窗口没找到 -> 只走 err（不退化为截全屏）。
+    """
     wait_if_paused(ctx)
     p = dict(node.params or {})
-    source_mode = str(p.get("source_mode", "roi") or "roi")
+    range_mode = str(p.get("range_mode", "window") or "window")
     lang = str(p.get("lang", "ch") or "ch")
     roi = p.get("roi", (0, 0, 0, 0))
-    save_to_var = str(p.get("save_to_var", "ocr_text") or "").strip()
-    first_to_var = str(p.get("first_to_var", "") or "").strip()
+    match_mode = str(p.get("match_mode", "contains") or "contains")
+    match_text = str(p.get("match_text", "") or "")
+    empty_out = {"text": "", "items": []}
 
     try:
         from src.blueprint.core.variable_engine import VariableEngine
@@ -3997,61 +3736,67 @@ def execute_OcrRecognize(ctx: ExecutionContext, node: Node, inputs: Dict[str, An
     except Exception:
         engine = None
 
-    # 取图像
-    img = None
-    if source_mode == "input_image":
-        img = inputs.get("in_image")
-        if img is None:
-            err = "未收到输入图像（in_image 端口未连线或无值）"
+    # ROI 变量插值 + 规范化
+    if isinstance(roi, str) and engine is not None and engine.has_any_marker(roi):
+        roi = engine.interpolate(roi)
+    if not isinstance(roi, (tuple, list)) or len(roi) != 4:
+        roi = (0, 0, 0, 0)
+    try:
+        roi = tuple(int(v) for v in roi)
+    except Exception:
+        roi = (0, 0, 0, 0)
+
+    # 取图像：range_mode=window 时截目标窗口，fullscreen 时截整屏
+    # 目标窗口解析：window 模式必须先拿到窗口，找不到直接 err（不退化为全屏）
+    target = None
+    if range_mode == "window":
+        target = _resolve_target_rect(ctx, p, tag="OCR")
+        if target is None:
+            err = _target_err_msg(p, "OCR")
             ctx.log(f"[OCR] {err}", "ERROR")
-            return {"text": "", "items": [], "first_text": "", "count": 0}, ["err"], err
-    else:
-        # 自己截 ROI
-        if isinstance(roi, str) and engine is not None and engine.has_any_marker(roi):
-            roi = engine.interpolate(roi)
-        if not isinstance(roi, (tuple, list)) or len(roi) != 4:
-            roi = (0, 0, 0, 0)
+            annotate_step(ctx, node, "ocr_err", note=err[:60])
+            return empty_out, ["err"], err
+    img = None
+    if target is not None:
+        # ① 优先后台截窗：窗口被遮挡时也能拿到实时画面，不前置、不抢焦点
         try:
-            roi = tuple(int(v) for v in roi)
+            from src.blueprint.runtime.screen_capture import capture_window_bgr
+            img = capture_window_bgr(target[0])
         except Exception:
-            roi = (0, 0, 0, 0)
-        # 临时目标窗口解析（会还原最小化窗口并取 DWM 可见边界矩形）
-        temp = _resolve_temp_target_rect(ctx, p)
-        img = None
-        if temp is not None:
-            # ① 优先后台截窗：窗口被遮挡时也能拿到实时画面，不前置、不抢焦点
-            try:
-                from src.blueprint.runtime.screen_capture import capture_window_bgr
-                img = capture_window_bgr(temp[0])
-            except Exception:
-                img = None
-        if img is None:
-            # ② 回退：还原+置顶目标窗口后全屏截取、按窗口矩形裁剪
-            if temp is not None:
-                _bring_window_to_front_safe(ctx, temp[0])
-                time.sleep(0.15)  # 等待窗口前置与重绘完成
-            full = ScreenCapture().capture_full_bgr()
-            if full is None:
-                err = "截图失败"
+            img = None
+    if img is None:
+        # ② 回退：还原+置顶目标窗口后全屏截取、按窗口矩形裁剪
+        #   （这是「同一目标窗口」的取图方式回退，不是改成截全屏）
+        if target is not None:
+            _bring_window_to_front_safe(ctx, target[0])
+            time.sleep(0.15)  # 等待窗口前置与重绘完成
+        full = ScreenCapture().capture_full_bgr()
+        if full is None:
+            err = "截图失败"
+            ctx.log(f"[OCR] {err}", "ERROR")
+            return empty_out, ["err"], err
+        img = full
+        if target is not None:
+            rect = target[1]
+            l, t, r, b = (int(v) for v in rect)
+            H, W = full.shape[:2]
+            l = max(0, l)
+            t = max(0, t)
+            r = min(W, r)
+            b = min(H, b)
+            if r > l and b > t:
+                img = full[t:b, l:r]
+            else:
+                err = "目标窗口矩形无效（窗口可能完全在屏幕外、已最小化或被隐藏）"
                 ctx.log(f"[OCR] {err}", "ERROR")
-                return {"text": "", "items": [], "first_text": "", "count": 0}, ["err"], err
-            img = full
-            if temp is not None:
-                rect = temp[1]
-                l, t, r, b = (int(v) for v in rect)
-                H, W = full.shape[:2]
-                l = max(0, l)
-                t = max(0, t)
-                r = min(W, r)
-                b = min(H, b)
-                if r > l and b > t:
-                    img = full[t:b, l:r]
-        img = _crop_roi(img, roi)
+                annotate_step(ctx, node, "ocr_err", note=err[:60])
+                return empty_out, ["err"], err
+    img = _crop_roi(img, roi)
 
     if img is None or getattr(img, "size", 0) == 0:
         err = "待识别图像为空"
         ctx.log(f"[OCR] {err}", "ERROR")
-        return {"text": "", "items": [], "first_text": "", "count": 0}, ["err"], err
+        return empty_out, ["err"], err
 
     # 识别（懒加载引擎，首次较慢，之后复用）
     try:
@@ -4061,38 +3806,44 @@ def execute_OcrRecognize(ctx: ExecutionContext, node: Node, inputs: Dict[str, An
         err = f"OCR 识别失败: {type(e).__name__}: {e}"
         ctx.log(f"[OCR] {err}", "ERROR")
         annotate_step(ctx, node, "ocr", note="ERROR: " + err[:80])
-        return {"text": "", "items": [], "first_text": "", "count": 0}, ["err"], err
+        return empty_out, ["err"], err
 
     items = result.get("items") or []
     text = result.get("text") or ""
     if result.get("error"):
         ctx.log(f"[OCR] 引擎返回异常: {result['error']}", "WARN")
 
-    first_text = items[0]["text"] if items else ""
+    out = {"text": text, "items": items}
 
-    # 写变量
-    if save_to_var:
-        ctx.set_var(save_to_var, text)
-        if engine is not None:
-            engine.set(save_to_var, text)
-    if first_to_var:
-        ctx.set_var(first_to_var, first_text)
-        if engine is not None:
-            engine.set(first_to_var, first_text)
+    # 一条文字都没识别到 -> 走「无文字」（与「失败」分开，也不再往下做匹配）
+    if not items:
+        note = f"lang={lang} items=0 无文字"
+        annotate_step(ctx, node, "ocr", note=note)
+        ctx.log(f"[OCR] {note}", "WARN")
+        return empty_out, ["out_done", "no_text"], ""
 
-    note = f"lang={lang} items={len(items)} text={text[:30]!r}"
+    # 文本匹配（只在填了「匹配文本」时做）：命中 -> matched，未命中 -> not_matched
+    ports = ["out_done"]
+    match_note = "match=off"
+    if match_text:
+        try:
+            if match_mode == "regex":
+                import re as _re
+                hit = _re.search(match_text, text) is not None
+            else:
+                hit = match_text in text
+        except Exception as e:
+            err = f"匹配表达式非法（{match_mode}）：{e}"
+            ctx.log(f"[OCR] {err}", "ERROR")
+            annotate_step(ctx, node, "ocr", note="ERROR: " + err[:80])
+            return out, ["err"], err
+        ports.append("matched" if hit else "not_matched")
+        match_note = f"match[{match_mode}]={match_text!r} -> {'命中' if hit else '未命中'}"
+
+    note = f"lang={lang} items={len(items)} text={text[:30]!r} {match_note}"
     annotate_step(ctx, node, "ocr", note=note)
     ctx.log(f"[OCR] {note}", "SUCCESS")
-
-    if not items:
-        return {"text": "", "items": [], "first_text": "", "count": 0}, ["err"], "无文字"
-
-    return {
-        "text": text,
-        "items": items,
-        "first_text": first_text,
-        "count": len(items),
-    }, ["out_done"], ""
+    return out, ports, ""
 
 
 # 截图 / OCR 节点的执行函数定义在 EXECUTORS 之后，这里补注册
@@ -4200,11 +3951,10 @@ class BlueprintRunner(QThread):
     #  以及命中断点/暂停后快速跳画布
     current_node_changed = Signal(str, str)
 
-    def __init__(self, graph: BlueprintGraph, parent=None, initial_hwnd=None):
+    def __init__(self, graph: BlueprintGraph, parent=None):
         super().__init__(parent)
         self._graph = graph
         self._ctx: Optional[ExecutionContext] = None
-        self._initial_hwnd = initial_hwnd
 
     def request_stop(self):
         if self._ctx is not None:
@@ -4354,25 +4104,9 @@ class BlueprintRunner(QThread):
         self._ctx = ctx
         ctx.last_progress_ts = time.time()
 
-        # 初始化目标窗口（initial_hwnd；None=全屏）
-        #   注意：编辑器内运行与导出的独立 EXE 都传 None。
-        #   运行时目标窗口统一由蓝图自身决定（BindWindow 节点 / 各节点「临时目标」），
-        #   保证「编辑器内点▶运行」与「导出后的独立 EXE」两条运行路径行为一致。
-        init_hwnd = getattr(self, "_initial_hwnd", None)
-        try:
-            if init_hwnd:
-                win_rect, win_title = _apply_target_hwnd(ctx, int(init_hwnd), 0, 0)
-                hwnd_hex = f"0x{int(init_hwnd):08X}" if int(init_hwnd) else "None"
-                _write_log(
-                    f"[Runtime] 初始目标窗口（由调用方指定）：HWND={hwnd_hex}  "
-                    f"title='{(win_title or '')[:32]}'  rect={win_rect}",
-                    "INFO",
-                )
-            else:
-                _apply_target_hwnd(ctx, None, 0, 0)
-                _write_log("[Runtime] 初始目标窗口：未指定（全屏模式），将由 BindWindow 节点或各节点的「临时目标」决定。", "INFO")
-        except Exception as _ie:
-            _write_log(f"[Runtime] 应用初始目标程序失败（不影响后续）: {_ie}", "WARN")
+        # 运行期不再有「全局目标窗口」概念：每个节点的操作范围 100% 由它自己的
+        # range_mode + 目标窗口定位条件决定（window=只在该窗口内操作，fullscreen=整屏）。
+        _write_log("[Runtime] 目标窗口由各节点的「范围模式」决定（目标窗口 / 全屏），无全局绑定。", "INFO")
 
         try:
             self._run_graph(ctx)
