@@ -3,10 +3,12 @@ import io
 import json
 import os
 import re
+import time
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional
 
 from PySide6.QtCore import QEvent, QObject, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QFont, QPixmap
+from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -28,12 +30,13 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSpinBox,
+    QStackedWidget,
     QToolButton,
     QVBoxLayout,
     QWidget,
     QLayout,
 )
-from PySide6.QtCore import QRect, QPoint
+from PySide6.QtCore import QRect, QPoint, QRectF
 
 try:
     from PIL import Image
@@ -189,6 +192,127 @@ def _disable_wheel(widget):
     return widget
 
 
+# ============================================================
+# 「选中节点 → 面板重建」的节奏参数（配合 set_node_deferred 使用）
+# ============================================================
+# 面板重建要 50~250ms（销毁+重建全部控件），是一次**阻塞主线程**的活儿。
+# 若每次点选都立刻重建，连续切换节点时重建就会插在两次点击之间 → 点一次顿一下。
+# 对策：连续点选时把重建延后到「用户停手」之后，期间显示转圈加载页。
+_SEL_RAPID_GAP_MS = 450     # 距上次点选 < 该值 → 认为用户在「连续切换节点」
+_SEL_DEBOUNCE_MAX_MS = 700  # 去抖上限，避免节奏很慢时面板迟迟不刷新
+
+
+# ============================================================
+# 「永不建编辑器的参数」：值由专属 UI（预览图卡片 / 子画布）管理，且**总是被隐藏**
+# ============================================================
+# 这些字段一律是机器托管的 blob（图片 base64 / 图片列表 JSON / 子画布 JSON），
+# 用户从不手敲，节点专属 UI 已经把它们可视化了。
+#
+# ⚠ 为什么必须「不建」而不是「建完再 hide」：这些值动辄几百 KB ~ 几 MB，
+#    而 `QLineEdit(str(huge))` 的构造要按文本长度算 sizeHint，
+#    实测耗时与长度**成正比、约 1ms/KB**（1 万字 7.7ms / 10 万字 79ms / 60 万字 568ms）。
+#    历史上这里是「先 addRow 再 _hide_param_row」，hide 发生在建完之后，
+#    于是这笔钱白付了——「找图/检测节点带模板图、参考图时属性面板极慢」就是这么来的。
+#    （IfImageDetect 带 6 张 640×480 参考图：set_node 实测 1964ms，其中 ~1.9s 是白付的。）
+#
+# 这些名字都**只可能**出现在「一定会隐藏它们」的节点类型上（已逐个核对）：
+#   template_b64/features_json → FindImage；images_json → IfImageDetect；
+#   roi_preview_b64 → StillnessDetect/Screenshot/OcrRecognize；*_body → Loop/Sequence/Parallel。
+# ⚠ 反例：PressKey 的 key_combo 只在「按键模式」隐藏、切到「文本模式」要显示，故**不能**进这个集合。
+_NO_EDITOR_PARAMS = frozenset({
+    "template_b64", "template", "features_json",
+    "images_json", "roi_preview_b64",
+    "feature_capture_width", "feature_template_w", "feature_template_h",
+    "loop_body", "seq_body", "par_body",
+})
+
+
+# ============================================================
+# b64 → 缩略图 QPixmap 的**内容级 LRU 缓存**
+# ============================================================
+# 图片解码（尤其 PNG）是纯 CPU 活儿：实测 640×480 一张要 ~7ms，
+# 而面板每次「切节点 / 重建 / 重跑专属 UI」都会把**同一批**参考图、模板图、ROI 再解一遍。
+# Qt 自带解码并不比 PIL 快（实测 6.85ms vs 6.80ms/张），所以换库没用——**缓存才是解法**。
+# key 用「内容本身 + 目标尺寸」，内容变自然换 key（无需手动失效）。
+_PIX_CACHE: "OrderedDict[tuple, QPixmap]" = OrderedDict()
+_PIX_CACHE_MAX = 64
+
+
+def _b64_thumb(b64: str, size: int) -> Optional[QPixmap]:
+    """b64 图片 → 等比缩放到 size 以内的 QPixmap（带 LRU 缓存）。失败返回 None。
+
+    ⚠ 返回的是**缓存里的共享对象**（QPixmap 隐式共享，赋值给 QLabel 安全），
+      调用方不得就地修改它。
+    """
+    if not b64 or not isinstance(b64, str):
+        return None
+    key = (size, b64)
+    hit = _PIX_CACHE.get(key)
+    if hit is not None:
+        _PIX_CACHE.move_to_end(key)
+        return hit
+    try:
+        raw = base64.b64decode(b64)
+        qimg = QImage.fromData(raw)
+        if qimg.isNull():
+            return None
+        pm = QPixmap.fromImage(qimg).scaled(
+            size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation
+        )
+    except Exception:
+        return None
+    _PIX_CACHE[key] = pm
+    while len(_PIX_CACHE) > _PIX_CACHE_MAX:
+        _PIX_CACHE.popitem(last=False)
+    return pm
+
+
+class _Spinner(QWidget):
+    """转圈加载指示器（纯 QPainter 绘制，不依赖任何图片资源）。"""
+
+    def __init__(self, diameter: int = 30, color: str = "#58A6FF", parent=None):
+        super().__init__(parent)
+        self._d = int(diameter)
+        self._color = QColor(color)
+        self._track = QColor("#30363D")
+        self._angle = 0
+        self.setFixedSize(self._d, self._d)
+        self._timer = QTimer(self)
+        # 40ms ≈ 25fps：视觉上够顺滑，开销可以忽略（只在加载页可见时跑）
+        self._timer.setInterval(40)
+        self._timer.timeout.connect(self._tick)
+
+    def start(self):
+        if not self._timer.isActive():
+            self._timer.start()
+
+    def stop(self):
+        self._timer.stop()
+
+    def _tick(self):
+        self._angle = (self._angle + 30) % 360
+        self.update()
+
+    def paintEvent(self, _ev):
+        p = QPainter(self)
+        try:
+            p.setRenderHint(QPainter.Antialiasing, True)
+            d = self._d
+            rect = QRectF(2.0, 2.0, d - 4.0, d - 4.0)
+            track = QPen(self._track)
+            track.setWidth(3)
+            track.setCapStyle(Qt.RoundCap)
+            p.setPen(track)
+            p.drawArc(rect, 0, 360 * 16)
+            arc = QPen(self._color)
+            arc.setWidth(3)
+            arc.setCapStyle(Qt.RoundCap)
+            p.setPen(arc)
+            p.drawArc(rect, -self._angle * 16, 100 * 16)
+        finally:
+            p.end()
+
+
 class InspectorPanel(QWidget):
     """右侧属性面板：选中节点后动态生成参数表单。"""
 
@@ -207,6 +331,20 @@ class InspectorPanel(QWidget):
         self._widgets: Dict[str, QWidget] = {}
         self._ifimg_host: Optional[QWidget] = None
         self._ifstatic_host: Optional[QWidget] = None
+        # 「选中节点 → 刷新面板」的延迟入口（见 set_node_deferred 的说明）
+        self._pending_node: Optional[Node] = None
+        self._last_select_at = 0.0    # 上次「点选节点」的时间戳，用于识别连续切换
+        # 同类型节点复用控件（见 _try_reuse_form）：
+        self._built_type: Optional[str] = None   # 当前表单是按哪个节点类型建的（复用判据）
+        self._built_rows: List[str] = []         # 参数行名清单（复用路径重跑专属 UI 时要用）
+        self._aux_conns: Dict[str, Any] = {}     # 专属信号的幂等连接表（见 _connect_aux）
+        self._aux_widgets: List[QWidget] = []    # 专属 UI 新增的控件（复用前按它整段删行）
+        self._apply_timer = QTimer(self)
+        self._apply_timer.setSingleShot(True)
+        # 间隔由 set_node_deferred 动态决定：单击 → 0ms（立刻重建，面板不拖拍）；
+        # 连续点选 → 跟随点击节奏去抖（见该方法的说明）。
+        self._apply_timer.setInterval(0)
+        self._apply_timer.timeout.connect(self._apply_pending_node)
         self._build_ui()
         self.set_node(None)
 
@@ -249,7 +387,13 @@ class InspectorPanel(QWidget):
             self._action_layout.setColumnStretch(_c, 0)
         self._action_layout.setColumnStretch(self._action_max_cols, 1)
         self._action_host.hide()
-        outer.addWidget(self._action_host)
+
+        # ---- 正文区（动作条 + 参数表单），与「加载页」一起放进堆叠容器 ----
+        self._body = QWidget()
+        body_lay = QVBoxLayout(self._body)
+        body_lay.setContentsMargins(0, 0, 0, 0)
+        body_lay.setSpacing(8)
+        body_lay.addWidget(self._action_host)
 
         self._form_host = QWidget()
         self._form_host.setStyleSheet("background-color: transparent;")
@@ -267,7 +411,249 @@ class InspectorPanel(QWidget):
             "QScrollArea { background: #1C2128; border: 1px solid #2D333B; border-radius: 6px; }"
             "QScrollBar:vertical { width: 10px; }"
         )
-        outer.addWidget(scroll, 1)
+        body_lay.addWidget(scroll, 1)
+
+        # ---- 加载页：面板正在重建参数表单时显示（转圈 + 文案） ----
+        # 用堆叠页而不是「半透明浮层」，是为了让旧节点的参数彻底消失，
+        # 免得上一个节点的值留在屏幕上被误读；背景显式设成与表单一致的黑灰，
+        # 否则独立渲染/父级未指定底色时会露出默认浅色窗口底，切换时闪一下白。
+        self._loading_page = QWidget()
+        self._loading_page.setStyleSheet("background-color: #1C2128;")
+        lp = QVBoxLayout(self._loading_page)
+        lp.setContentsMargins(0, 0, 0, 0)
+        lp.setSpacing(10)
+        lp.addStretch(1)
+        self._spinner = _Spinner(30, "#58A6FF", self._loading_page)
+        spin_row = QHBoxLayout()
+        spin_row.addStretch(1)
+        spin_row.addWidget(self._spinner)
+        spin_row.addStretch(1)
+        lp.addLayout(spin_row)
+        self._loading_label = QLabel("正在加载参数…")
+        self._loading_label.setAlignment(Qt.AlignCenter)
+        self._loading_label.setStyleSheet("color: #8B949E; font-size: 10px;")
+        lp.addWidget(self._loading_label)
+        lp.addStretch(1)
+
+        self._stack = QStackedWidget()
+        self._stack.addWidget(self._body)          # index 0
+        self._stack.addWidget(self._loading_page)  # index 1
+        outer.addWidget(self._stack, 1)
+
+    # ---------------- 加载页辅助 ----------------
+    def _show_loading(self, text: str = "正在加载参数…"):
+        """切换到加载页并启动转圈。重复调用无副作用。"""
+        self._loading_label.setText(text)
+        if self._stack.currentWidget() is self._loading_page:
+            self._spinner.start()
+            return
+        self._stack.setCurrentWidget(self._loading_page)
+        self._spinner.start()
+
+    def _hide_loading(self):
+        """收起加载页（停在当前页时也应调用：确保转圈定时器停掉、不空转）。"""
+        self._spinner.stop()
+        if self._stack.currentWidget() is not self._body:
+            self._stack.setCurrentWidget(self._body)
+
+    # ================================================================
+    # 同类型节点复用控件：辅助方法
+    # ================================================================
+    def _nid(self) -> str:
+        """当前正在编辑的节点 id。
+
+        ⚠ 构建期**不要**把 node.id 捕获进闭包（别写 `nid=nid`）：同类型节点会复用控件，
+        捕获下来的 id 会停在上一个节点上 —— 改一个 SpinBox 却写进了别的节点。
+        统一在回调触发时用本方法取。
+        """
+        n = self._current_node
+        return n.id if n is not None else ""
+
+    def _connect_aux(self, key: str, signal, slot):
+        """连接「节点专属 UI」的辅助信号，同 key 重复连接时先断开上一次。
+
+        为什么需要：专属 UI 每次刷新都会重新走一遍（`_apply_node_specific_ui`），
+        而它要连的却是**被复用**的参数控件。直接 connect 会越连越多 ——
+        例如 range_mode 变化回调被连 3 次，切一次模式就重算三遍、
+        +/- 按钮一次点击加 3 个端口。
+        """
+        old = self._aux_conns.pop(key, None)
+        if old is not None:
+            old_sig, old_slot = old
+            try:
+                old_sig.disconnect(old_slot)
+            except (RuntimeError, TypeError):
+                pass  # 控件已销毁：连接随对象一起没了
+        try:
+            signal.connect(slot)
+        except Exception:
+            return
+        self._aux_conns[key] = (signal, slot)
+
+    @staticmethod
+    def _set_silently(widget, fn):
+        """在屏蔽信号的前提下改控件值。
+
+        复用路径是「把新节点的值写进已有控件」，这不是用户编辑，
+        绝不能触发 param_changed 回写（否则会把 A 节点的值写进 B 节点）。
+        """
+        if widget is None:
+            return
+        old = widget.blockSignals(True)
+        try:
+            fn()
+        finally:
+            widget.blockSignals(old)
+
+    def _push_one_value(self, w: QWidget, value: Any) -> None:
+        """把单个参数值写进已有控件（按控件类型分派；复合容器按子控件分派）。"""
+        try:
+            if isinstance(w, QDoubleSpinBox):
+                self._set_silently(w, lambda: w.setValue(float(value if value is not None else 0.0)))
+            elif isinstance(w, QSpinBox):
+                self._set_silently(w, lambda: w.setValue(int(value if value is not None else 0)))
+            elif isinstance(w, QComboBox):
+                def _set_combo():
+                    idx = w.findData(value)
+                    if idx < 0 and isinstance(value, str):
+                        idx = w.findText(value)
+                    w.setCurrentIndex(idx if idx >= 0 else 0)
+                self._set_silently(w, _set_combo)
+            elif isinstance(w, QCheckBox):
+                self._set_silently(w, lambda: w.setChecked(bool(value)))
+            elif isinstance(w, QLineEdit):
+                self._set_silently(w, lambda: w.setText(str(value if value is not None else "")))
+            elif isinstance(w, QPlainTextEdit):
+                self._set_silently(w, lambda: w.setPlainText(str(value if value is not None else "")))
+            else:
+                # 复合容器（文件选择行 / 模板行 / 坐标行 / +/- 按钮行）
+                val_lbl = getattr(w, "_val_label", None)   # num_paths / num_data_inputs 的 ± 行
+                if val_lbl is not None:
+                    self._set_silently(val_lbl, lambda: val_lbl.setText(str(value)))
+                    return
+                # ⚠ 顺序不能反：QSpinBox 内部**自带**一个 QLineEdit，
+                #   `findChildren(QLineEdit)` 会把它查出来 —— 先查 QLineEdit 的话，
+                #   坐标行（X/Y/W/H）会被当成文本框，整个元组被塞进第一个自旋框里。
+                spins = w.findChildren(QSpinBox)
+                if spins:
+                    vals = list(value) if isinstance(value, (list, tuple)) else []
+                    for i, s in enumerate(spins):
+                        v = vals[i] if i < len(vals) else 0
+                        try:
+                            iv = int(v)
+                        except Exception:
+                            iv = 0
+                        self._set_silently(s, lambda s=s, iv=iv: s.setValue(iv))
+                    return
+                les = w.findChildren(QLineEdit)
+                if les:
+                    self._set_silently(les[0], lambda: les[0].setText(str(value if value is not None else "")))
+        except Exception:
+            pass  # 单个控件写值失败不该拖垮整个面板刷新
+
+    def _push_param_values(self, node: Node) -> None:
+        """把 node 的参数值推进**已有**控件（同类型复用路径专用，不重建任何控件）。"""
+        meta = NODE_LIBRARY.get(node.type)
+        params = meta.params if meta else []
+        cn = self._widgets.get("custom_name")
+        if isinstance(cn, QLineEdit):
+            v = str(node.params.get("custom_name", "") or "")
+            self._set_silently(cn, lambda: cn.setText(v))
+        for pd in params:
+            w = self._widgets.get(pd.name)
+            if w is None:
+                continue
+            self._push_one_value(w, node.params.get(pd.name, pd.default))
+
+    def _form_widgets(self) -> List[QWidget]:
+        """当前表单里出现在布局上的全部控件（Label / Field / Spanning 三种角色都算）。"""
+        roles = (QFormLayout.LabelRole, QFormLayout.FieldRole, QFormLayout.SpanningRole)
+        out: List[QWidget] = []
+        seen = set()
+        for i in range(self._form.rowCount()):
+            for role in roles:
+                it = self._form.itemAt(i, role)
+                w = it.widget() if it is not None else None
+                if w is not None and id(w) not in seen:
+                    seen.add(id(w))
+                    out.append(w)
+        return out
+
+    def _run_node_specific_ui(self, node: Node) -> None:
+        """跑一遍节点专属 UI，并记下它这次新增了哪些控件（供 `_clear_aux_rows` 精确清理）。
+
+        为什么用「新增控件」而不是「行里没有参数控件」来判定专属行：
+        无参数节点（Continue/Break/Branch）有一行「（该节点无可编辑参数）」占位，
+        它也不含参数控件，会被误判成专属行删掉。而 `_replace_*` 换进参数行的新控件
+        （± 容器、组件下拉、新标签）会被 `_widgets` 认领，不算专属 —— 它们所在的行
+        因为「不是整行都属于专属区」而被保留。
+        """
+        before = self._form_widgets()          # 持强引用：防止对象被回收后 id 复用
+        before_ids = {id(w) for w in before}
+        self._apply_node_specific_ui(node)
+        param_ids = {id(v) for v in self._widgets.values() if v is not None}
+        self._aux_widgets = [w for w in self._form_widgets()
+                             if id(w) not in before_ids and id(w) not in param_ids]
+
+    def _clear_aux_rows(self) -> None:
+        """删掉上次记录的「节点专属 UI」那些行 —— 复用路径里它们要整段重建。
+
+        判据：整行的控件都落在专属集合里（参数行总会含一个参数控件，不会被误删）。
+        ⚠ 不能按「行号 ≥ N 就删」：Mouse 的分组提示是 `insertRow(0, …)` 插到表单最
+        顶部的（参数行上面），按行号切会把最后几个参数行当成专属行删掉。
+        """
+        if self._aux_widgets:
+            aux_ids = {id(w) for w in self._aux_widgets}
+            roles = (QFormLayout.LabelRole, QFormLayout.FieldRole, QFormLayout.SpanningRole)
+            for row_i in range(self._form.rowCount() - 1, -1, -1):
+                ids = set()
+                for role in roles:
+                    it = self._form.itemAt(row_i, role)
+                    if it is not None and it.widget() is not None:
+                        ids.add(id(it.widget()))
+                if ids and ids <= aux_ids:
+                    self._form.removeRow(row_i)
+        self._aux_widgets = []
+        self._ifimg_host = None
+        self._ifstatic_host = None
+
+    def _set_header(self, node: Optional[Node]) -> None:
+        if node is None:
+            self._header.setText("未选择节点 · 点击画布上的节点以编辑参数")
+            return
+        meta = NODE_LIBRARY.get(node.type)
+        title = meta.title if meta else node.type
+        # 名称 / 类型 / ID 压在一行，省一行垂直空间（面板宽度固定，够放下）
+        self._header.setText(
+            f"<b style='color:#58A6FF'>{title}</b>"
+            f" <span style='color:#8B949E'>[{node.type}]</span>"
+            f" <span style='color:#6E7681; font-size:9px'>ID: {node.id}</span>"
+        )
+        self._header.setTextFormat(Qt.RichText)
+
+    def _try_reuse_form(self, node: Optional[Node]) -> bool:
+        """同类型节点切过来时，复用已有控件、只刷新值 —— 命中返回 True。
+
+        为什么值得单开一条路径：`set_node` 的全量重建里，最贵的不是「创建控件」
+        （`_build_editor` 实测仅 1.2ms），而是 QFormLayout 的 `removeRow`/`addRow`
+        与**每控件单独 setStyleSheet**（子控件带样式表插入时会触发父级样式缓存重算）
+        —— 25 行表单加起来 30ms 上下。同类型切换时这些控件的**结构完全一样**，
+        唯一变的是值、预览图和专属面板内容，所以：
+          · 参数行 → 原地写值（blockSignals，不触发回写）
+          · 专属 UI（预览图/按键选择器/端口提示…）→ 整段删掉重建（很快，也就几个控件）
+          · 动作条 → 照常重建（按钮集依赖 range_mode 等参数，可能不同）
+        """
+        if node is None or self._built_type is None or node.type != self._built_type:
+            return False
+        if not self._widgets:
+            return False
+        self._current_node = node            # 必须先设：后面的写入/专属 UI 都读它
+        self._populate_action_bar(node)
+        self._set_header(node)
+        self._push_param_values(node)
+        self._clear_aux_rows()
+        self._run_node_specific_ui(node)
+        return True
 
     # ---------------- 动作条辅助 ----------------
     def _clear_action_bar(self):
@@ -373,8 +759,7 @@ class InspectorPanel(QWidget):
                 "框选一张参考图，追加到下方列表\n"
                 "若已设置「目标窗口」，框选范围将自动限定在该窗口内"
             )
-            nid = node.id
-            btn_add.clicked.connect(lambda _=False, n=nid: self.request_snip_for_node.emit(n, "if_img_add"))
+            btn_add.clicked.connect(lambda _=False: self.request_snip_for_node.emit(self._nid(), "if_img_add"))
             self._add_action_btn(btn_add)
             btn_import = QPushButton("📂 导入图片")
             btn_import.setStyleSheet(self._btn_style("#238636", "#2EA043"))
@@ -408,8 +793,7 @@ class InspectorPanel(QWidget):
                 "框选一个目标区域，自动保存为PNG到templates文件夹并回填模板路径+预览图\n"
                 "若已设置「目标窗口」，框选范围将自动限定在该窗口内，避免截到窗口外的画面"
             )
-            nid = node.id
-            btn_snip.clicked.connect(lambda _=False, n=nid: self.request_snip_for_node.emit(n, "findimg_target"))
+            btn_snip.clicked.connect(lambda _=False: self.request_snip_for_node.emit(self._nid(), "findimg_target"))
             self._add_action_btn(btn_snip)
             btn_import = QPushButton("📂 导入图片")
             btn_import.setStyleSheet(self._btn_style("#238636", "#2EA043"))
@@ -492,8 +876,7 @@ class InspectorPanel(QWidget):
             btn_roi = QPushButton("🖱 框选ROI")
             btn_roi.setStyleSheet(self._btn_style("#0e3a5c", "#1f8dd6"))
             btn_roi.setToolTip("框选一个矩形区域作为截图 ROI\n若截取范围=目标窗口，框选范围将自动限定在该窗口内")
-            nid = node.id
-            btn_roi.clicked.connect(lambda _=False, n=nid: self.request_snip_for_node.emit(n, "screenshot_roi"))
+            btn_roi.clicked.connect(lambda _=False: self.request_snip_for_node.emit(self._nid(), "screenshot_roi"))
             self._add_action_btn(btn_roi)
             # 仅 range_mode=window 时显示目标窗口拾取按钮
             if str(node.params.get("range_mode", "window") or "window") == "window":
@@ -513,8 +896,7 @@ class InspectorPanel(QWidget):
             btn_roi = QPushButton("🖱 框选ROI")
             btn_roi.setStyleSheet(self._btn_style("#0b3d61", "#29b6f6"))
             btn_roi.setToolTip("框选一个矩形区域作为识别 ROI\n若已设置「目标窗口」，框选范围将自动限定在该窗口内")
-            nid = node.id
-            btn_roi.clicked.connect(lambda _=False, n=nid: self.request_snip_for_node.emit(n, "ocr_roi"))
+            btn_roi.clicked.connect(lambda _=False: self.request_snip_for_node.emit(self._nid(), "ocr_roi"))
             self._add_action_btn(btn_roi)
             btn_test = QPushButton("🔍 测试识别")
             btn_test.setStyleSheet(self._btn_style("#0B3A5C", "#0F4A77"))
@@ -794,7 +1176,8 @@ class InspectorPanel(QWidget):
         tip = QLabel("在模板图片上拖动鼠标框选特征区域。可框选多个。选完后点「✅ 确认保存」。\n"
                       "特征会记录在模板中的相对位置，运行时用于交叉验证。\n"
                       "模板太大/太小看不清时：用下面的「➕ 放大 / ➖ 缩小 / 🖥 适应窗口」，"
-                      "或按住 Ctrl 滚滚轮缩放（不按 Ctrl 时滚轮用于滚动查看）。" + tpl_note)
+                      "或按住 Ctrl 滚滚轮缩放（不按 Ctrl 时滚轮用于滚动查看）。\n"
+                      "🔍 想看画面某个角落：在图片上按住鼠标右键拖动即可平移（放大后特别好用）。" + tpl_note)
         tip.setStyleSheet("color: #8B949E; font-size: 10px; margin-bottom: 4px;")
         tip.setWordWrap(True)
         lay.addWidget(tip)
@@ -806,6 +1189,10 @@ class InspectorPanel(QWidget):
             支持缩放查看：显示尺寸 = 原图尺寸 × `_scale`，
             框选得到的矩形**始终换算回原图像素坐标**后再存进 `_rects`，
             所以缩放不影响最终特征数据的正确性。
+
+            鼠标：
+              - 左键拖动 = 框选特征区域
+              - 右键按住拖动 = 平移画面（放大后看局部用，靠在 QScrollArea 上拨滚动条实现）
             """
             MIN_SCALE = 0.05
             MAX_SCALE = 8.0
@@ -818,6 +1205,10 @@ class InspectorPanel(QWidget):
                 self._drawing = False
                 self._start = QPointF()
                 self._current = QPointF()
+                self._panning = False          # 右键平移中
+                self._pan_origin = None        # 平移起点（全局坐标）
+                self._pan_h0 = 0               # 平移开始时的水平滚动值
+                self._pan_v0 = 0               # 平移开始时的垂直滚动值
                 self._scale = 1.0   # 显示像素 / 原图像素
                 self._sx = 1.0      # 原图像素 / 显示像素（画框时用）
                 self._sy = 1.0
@@ -885,18 +1276,51 @@ class InspectorPanel(QWidget):
                     return
                 ev.ignore()
 
+            def _scroll_area(self):
+                """找到外层 QScrollArea（右键平移靠它拨滚动条）。找不到就返回 None。"""
+                w = self.parentWidget()
+                while w is not None and not isinstance(w, QScrollArea):
+                    w = w.parentWidget()
+                return w
+
             def mousePressEvent(self, ev):
                 if ev.button() == Qt.LeftButton:
                     self._drawing = True
                     self._start = ev.position()
                     self._current = ev.position()
+                elif ev.button() == Qt.RightButton:
+                    # 右键按住 = 平移画面（方便放大后查看图片局部再截图）
+                    sa = self._scroll_area()
+                    if sa is None:
+                        return
+                    self._panning = True
+                    self._pan_origin = ev.globalPosition().toPoint()
+                    self._pan_h0 = sa.horizontalScrollBar().value()
+                    self._pan_v0 = sa.verticalScrollBar().value()
+                    self.setCursor(Qt.ClosedHandCursor)
 
             def mouseMoveEvent(self, ev):
                 if self._drawing:
                     self._current = ev.position()
                     self._redraw()
+                elif self._panning:
+                    sa = self._scroll_area()
+                    if sa is None:
+                        return
+                    cur = ev.globalPosition().toPoint()
+                    # 鼠标往右拖 → 画面往右走 → 滚动条值减小（反向位移）
+                    sa.horizontalScrollBar().setValue(
+                        self._pan_h0 - (cur.x() - self._pan_origin.x()))
+                    sa.verticalScrollBar().setValue(
+                        self._pan_v0 - (cur.y() - self._pan_origin.y()))
 
             def mouseReleaseEvent(self, ev):
+                if ev.button() == Qt.RightButton:
+                    if self._panning:
+                        self._panning = False
+                        self._pan_origin = None
+                        self.unsetCursor()
+                    return
                 if ev.button() == Qt.LeftButton and self._drawing:
                     self._drawing = False
                     self._current = ev.position()
@@ -944,9 +1368,12 @@ class InspectorPanel(QWidget):
                 self._rects.clear()
                 self._redraw()
 
-        # 将 PIL -> QPixmap
-        qimg = QImage(tpl_img.tobytes(), tw, th, QImage.Format_RGBA8888)
-        pixmap = QPixmap.fromImage(qimg)
+        # 将 PIL -> QPixmap（统一 RGBA：QImage 按 4 字节对齐读行，
+        # RGB 的 3 字节/像素在「宽×3 非 4 倍数」时会让行错位 → 图像斜切、色彩错乱）
+        if tpl_img.mode != "RGBA":
+            tpl_img = tpl_img.convert("RGBA")
+        qimg = QImage(tpl_img.tobytes("raw", "RGBA"), tw, th, QImage.Format_RGBA8888)
+        pixmap = QPixmap.fromImage(qimg.copy())
 
         scroll = QScrollArea()
         canvas = FeatureCanvas(pixmap)
@@ -1272,24 +1699,88 @@ class InspectorPanel(QWidget):
         lay.addWidget(btns)
         dlg.exec()
 
+    # ------------------------------------------------------------
+    # 选中节点 → 面板刷新：延迟入口
+    # ------------------------------------------------------------
+    def set_node_deferred(self, node: Optional[Node]):
+        """「选中节点」专用的刷新入口：把面板重建推迟出鼠标事件那一帧。
+
+        为什么需要它：set_node() 会销毁并重建面板里的全部控件（实测 50~250ms，
+        随节点类型 / 模板图大小浮动）。如果直接在 selectionChanged 的信号链里同步跑，
+        用户看到的就是「点下去之后画面顿一下才亮」——节点选中高亮、连线联动高亮
+        全被压在面板重建后面，那就是「选中节点有卡顿感」的来源。
+
+        推迟一轮事件循环后：选中高亮当帧就画出来，面板随后刷新。
+
+        两档节奏：
+        * **同类型节点**（面板已按该类型建过表）→ 走复用控件路径（~10ms），直接 0ms 刷新，
+          不去抖也不亮菊花，面板始终跟手；
+        * **跨类型**（必须全量重建，~50ms+）→ 见下面的去抖说明。
+
+        **连续切换（图快时挨个点节点）另做去抖**：重建是阻塞主线程的，若每点一次都
+        重建，重建就会插在两次点击之间——点一次顿一下，连点尤其明显。所以当「距上次点选
+        不足 _SEL_RAPID_GAP_MS」时，把重建的等待时间设为「刚才那次点选间隔 + 100ms」：
+        只要还按同样的节奏点，下一次点击总会赶在定时器之前到达并把它重启，重建就不会
+        插进连点中间；等用户停手，才重建最后一次。等待期间显示转圈加载页。
+        单击（间隔够久）仍走 0ms，面板不拖拍。
+
+        注：其他调用方（新建节点后自动选中、参数变更后刷新等）仍用同步的 set_node()，
+        那些场景用户就在等面板更新，不该再拖一拍。
+        """
+        now = time.monotonic()
+        if node is self._current_node:
+            # 又点回当前节点：排队请求作废，面板本来就是对的，不用重建
+            self._pending_node = None
+            self._apply_timer.stop()
+            self._hide_loading()
+            self._last_select_at = now
+            return
+        # 同类型节点走「复用控件」路径，刷新只要 ~10ms —— 没必要去抖、也不用亮菊花，
+        # 直接下一轮事件循环刷新，面板始终跟手（连点也一直是同步的）。
+        if node is not None and node.type == self._built_type and self._widgets:
+            self._pending_node = node
+            self._apply_timer.start(0)
+            self._last_select_at = now
+            return
+        gap_ms = (now - self._last_select_at) * 1000.0
+        self._last_select_at = now
+        self._pending_node = node
+        if gap_ms < _SEL_RAPID_GAP_MS:
+            # 连续切换：跟随用户点击节奏去抖 + 亮出加载页
+            wait = int(min(_SEL_DEBOUNCE_MAX_MS, max(200.0, gap_ms + 100.0)))
+            self._apply_timer.start(wait)
+            self._show_loading()
+        else:
+            self._apply_timer.start(0)  # 单击：下一轮事件循环立刻重建
+
+    def _apply_pending_node(self):
+        node, self._pending_node = self._pending_node, None
+        # 先切回正文页再重建：重建是阻塞的，若留着加载页，用户会看到「转圈 → 顿住 →
+        # 新内容」两段跳；先切页则重绘被推迟到重建之后，新旧直接一步到位。
+        self._hide_loading()
+        self.set_node(node)
+
     def set_node(self, node: Optional[Node]):
+        # 同步刷新优先：作废排队中的延迟刷新，避免「先删了节点/切了蓝图，
+        # 随后被一个更早排队的选中请求又把面板刷回去」。
+        self._pending_node = None
+        self._apply_timer.stop()
+        self._hide_loading()
+        # 同类型节点：复用已有控件、只刷新值（约 10ms，对比全量重建约 50ms）
+        if self._try_reuse_form(node):
+            return
+        self._built_type = None
+        self._built_rows = []
         self._clear_form()
         self._populate_action_bar(node)  # 内部已含等宽排布
         self._current_node = node
         if node is None:
-            self._header.setText("未选择节点 · 点击画布上的节点以编辑参数")
+            self._set_header(None)
             self._form.addRow(QLabel("（无）"))
             return
 
         meta = NODE_LIBRARY.get(node.type)
-        title = meta.title if meta else node.type
-        # 名称 / 类型 / ID 压在一行，省一行垂直空间（面板宽度固定，够放下）
-        self._header.setText(
-            f"<b style='color:#58A6FF'>{title}</b>"
-            f" <span style='color:#8B949E'>[{node.type}]</span>"
-            f" <span style='color:#6E7681; font-size:9px'>ID: {node.id}</span>"
-        )
-        self._header.setTextFormat(Qt.RichText)
+        self._set_header(node)
         params = meta.params if meta else []
         rows_added: List[str] = []
 
@@ -1302,7 +1793,7 @@ class InspectorPanel(QWidget):
         except Exception:
             pass
         cn_edit.editingFinished.connect(
-            lambda w=cn_edit, n=node: self.param_changed.emit(n.id, "custom_name", w.text())
+            lambda w=cn_edit: self.param_changed.emit(self._nid(), "custom_name", w.text())
         )
         cn_lbl = QLabel("额外名称")
         cn_lbl.setStyleSheet("color: #FFA657; font-size: 9px; font-weight: bold;")
@@ -1312,6 +1803,11 @@ class InspectorPanel(QWidget):
         rows_added.append("custom_name")
 
         for pd in params:
+            if pd.name in _NO_EDITOR_PARAMS:
+                # 总是隐藏的机器托管字段（图片 base64 / 列表 JSON / 子画布 JSON）：
+                # 干脆不建控件——建了再 hide 的话，那笔「按文本长度算 sizeHint」的
+                # 构造成本（≈1ms/KB）已经付出去了。详见 _NO_EDITOR_PARAMS 的注释。
+                continue
             current = node.params.get(pd.name, pd.default)
             w = self._build_editor(pd, current)
             if w is None:
@@ -1331,9 +1827,22 @@ class InspectorPanel(QWidget):
         if not params:
             self._form.addRow(QLabel("（该节点无可编辑参数）"))
 
-        # ================================================================
-        # 节点专属后处理：参数渲染完成后，追加增强 UI
-        # ================================================================
+        # 参数行到此结束：记下类型与行清单，「同类型复用」靠它判断与重跑专属 UI。
+        # 下面 `_apply_node_specific_ui` 追加的行都会被 `_clear_aux_rows()` 识别出来重建。
+        self._built_type = node.type
+        self._built_rows = rows_added
+        self._run_node_specific_ui(node)
+
+    def _apply_node_specific_ui(self, node: Node):
+        """追加/刷新「节点专属 UI」：动态端口列表、预览图、按键选择器、显隐规则…
+
+        ⚠ 这个方法会被调用多次（全量重建后一次；之后每次同类型切换一次），所以：
+          · 它追加的行会被 `_clear_aux_rows()` 按「不含参数控件」判据整段识别出来
+          · 它给**参数控件**连信号必须走 `_connect_aux()`，否则会越连越多
+          · 它读节点/端口/预览一律走 `self._current_node`（或入参 node），不吃构建期快照
+        """
+        meta = NODE_LIBRARY.get(node.type)
+        rows_added = self._built_rows
         # 1) 通用：动态端口节点 → 追加"当前输入/输出端口列表"Label
         # 注意：Sequence虽然 has_dynamic_ports=True（为了画布刷新端口），但不要求在 Inspector 里显示端口Label、+/-按钮 等UI，所以这里排除它。
         is_dynamic = bool(meta is not None and getattr(meta, "has_dynamic_ports", False))
@@ -1374,7 +1883,8 @@ class InspectorPanel(QWidget):
                 # 绑定 range_mode 下拉框变化，切换目标窗口参数显隐 + 工具栏按钮
                 w_sm = self._widgets.get("range_mode")
                 if isinstance(w_sm, QComboBox):
-                    w_sm.currentIndexChanged.connect(lambda *_: self._on_ifimg_range_mode_changed())
+                    self._connect_aux("ifimg.range_mode", w_sm.currentIndexChanged,
+                                      lambda *_: self._on_ifimg_range_mode_changed())
                 self._apply_ifimg_range_visibility()
             except Exception as e:
                 print(f"[Inspector] IfImageDetect UI 出错: {e}")
@@ -1387,7 +1897,8 @@ class InspectorPanel(QWidget):
                 # 绑定 range_mode 下拉框变化，切换目标窗口参数显隐 + 工具栏按钮
                 w_sm = self._widgets.get("range_mode")
                 if isinstance(w_sm, QComboBox):
-                    w_sm.currentIndexChanged.connect(lambda *_: self._on_ifstatic_range_mode_changed())
+                    self._connect_aux("ifstatic.range_mode", w_sm.currentIndexChanged,
+                                      lambda *_: self._on_ifstatic_range_mode_changed())
                 self._apply_ifstatic_range_visibility()
             except Exception as e:
                 print(f"[Inspector] StillnessDetect UI 出错: {e}")
@@ -1402,21 +1913,23 @@ class InspectorPanel(QWidget):
                 self._hide_param_row("feature_template_w")
                 self._hide_param_row("feature_template_h")
                 self._append_findimage_panel()
-                # 注意：每次 set_node 创建的是全新控件（_clear_form 已销毁旧控件），
-                # 不存在重复连接问题，所以不需要 disconnect()。
-                # 如果 disconnect()，会断掉 _build_editor 中连接的 param_changed.emit 信号，
-                # 导致用户切换 after_action 时新值无法写入 node.params！
+                # 这三个专属连接给的是**参数控件**（复用路径下它们还活着），
+                # 必须走 _connect_aux 去重；不能整体 disconnect()，那会连带断掉
+                # _build_editor 里连的 param_changed.emit，导致切 after_action 写不回 node.params。
                 w_act = self._widgets.get("after_action")
                 if isinstance(w_act, QComboBox):
-                    w_act.currentIndexChanged.connect(lambda _i: self._findimg_apply_param_visibility())
+                    self._connect_aux("findimg.after_action", w_act.currentIndexChanged,
+                                      lambda _i: self._findimg_apply_param_visibility())
                 # 绑定 range_mode 下拉框变化，切换目标窗口参数显隐 + 工具栏按钮
                 w_sm = self._widgets.get("range_mode")
                 if isinstance(w_sm, QComboBox):
-                    w_sm.currentIndexChanged.connect(lambda *_: self._on_findimg_range_mode_changed())
+                    self._connect_aux("findimg.range_mode", w_sm.currentIndexChanged,
+                                      lambda *_: self._on_findimg_range_mode_changed())
                 # 绑定 use_feature_assist 下拉框，切换特征参数显隐 + 工具栏按钮
                 w_ufa = self._widgets.get("use_feature_assist")
                 if isinstance(w_ufa, QComboBox):
-                    w_ufa.currentIndexChanged.connect(lambda _i: self._on_findimg_feature_assist_changed())
+                    self._connect_aux("findimg.use_feature_assist", w_ufa.currentIndexChanged,
+                                      lambda _i: self._on_findimg_feature_assist_changed())
                 self._findimg_apply_param_visibility(initial=True)
             except Exception as e:
                 print(f"[Inspector] FindImage UI 出错: {e}")
@@ -1428,11 +1941,13 @@ class InspectorPanel(QWidget):
                 # 绑定 action 下拉框变化，实时切分组
                 w_action = self._widgets.get("action")
                 if isinstance(w_action, QComboBox):
-                    w_action.currentIndexChanged.connect(lambda *_: self._apply_mouse_action_visibility(initial=False))
+                    self._connect_aux("mouse.action", w_action.currentIndexChanged,
+                                      lambda *_: self._apply_mouse_action_visibility(initial=False))
                 # 绑定 range_mode 下拉框变化，切换目标窗口参数显隐 + 工具栏按钮
                 w_cm = self._widgets.get("range_mode")
                 if isinstance(w_cm, QComboBox):
-                    w_cm.currentIndexChanged.connect(lambda *_: self._on_mouse_range_mode_changed())
+                    self._connect_aux("mouse.range_mode", w_cm.currentIndexChanged,
+                                      lambda *_: self._on_mouse_range_mode_changed())
             except Exception as e:
                 print(f"[Inspector] Mouse UI 出错: {e}")
 
@@ -1442,7 +1957,8 @@ class InspectorPanel(QWidget):
                 self._apply_loop_infinite_visibility()
                 w_inf = self._widgets.get("infinite")
                 if isinstance(w_inf, QCheckBox):
-                    w_inf.toggled.connect(lambda _: self._apply_loop_infinite_visibility())
+                    self._connect_aux("loop.infinite", w_inf.toggled,
+                                      lambda _: self._apply_loop_infinite_visibility())
                 # 循环体子画布内容（loop_body 只读字段）不进属性面板，双击节点进入编辑
                 self._hide_param_row("loop_body")
                 self._append_subgraph_hint("双击本节点进入「循环体」子画布编辑每圈要跑的内容")
@@ -1481,7 +1997,8 @@ class InspectorPanel(QWidget):
                 self._append_snip_roi_preview(node.type)
                 w_rm = self._widgets.get("range_mode")
                 if isinstance(w_rm, QComboBox):
-                    w_rm.currentIndexChanged.connect(lambda *_: self._on_screenshot_range_mode_changed())
+                    self._connect_aux("screenshot.range_mode", w_rm.currentIndexChanged,
+                                      lambda *_: self._on_screenshot_range_mode_changed())
                 self._apply_screenshot_range_visibility()
             except Exception as e:
                 print(f"[Inspector] {node.type} UI 出错: {e}")
@@ -1492,7 +2009,8 @@ class InspectorPanel(QWidget):
                 self._append_snip_roi_preview(node.type)
                 w_rm = self._widgets.get("range_mode")
                 if isinstance(w_rm, QComboBox):
-                    w_rm.currentIndexChanged.connect(lambda *_: self._on_ocr_range_mode_changed())
+                    self._connect_aux("ocr.range_mode", w_rm.currentIndexChanged,
+                                      lambda *_: self._on_ocr_range_mode_changed())
                 self._apply_ocr_range_visibility()
             except Exception as e:
                 print(f"[Inspector] {node.type} UI 出错: {e}")
@@ -1503,7 +2021,8 @@ class InspectorPanel(QWidget):
                 self._apply_clipboard_mode_visibility()
                 w_mode = self._widgets.get("mode")
                 if isinstance(w_mode, QComboBox):
-                    w_mode.currentIndexChanged.connect(lambda *_: self._apply_clipboard_mode_visibility())
+                    self._connect_aux("clipboard.mode", w_mode.currentIndexChanged,
+                                      lambda *_: self._apply_clipboard_mode_visibility())
             except Exception as e:
                 print(f"[Inspector] Clipboard UI 出错: {e}")
 
@@ -1529,7 +2048,8 @@ class InspectorPanel(QWidget):
                 self._apply_presskey_mode_visibility()
                 w_kb = self._widgets.get("kb_mode")
                 if isinstance(w_kb, QComboBox):
-                    w_kb.currentIndexChanged.connect(lambda *_: self._apply_presskey_mode_visibility())
+                    self._connect_aux("presskey.kb_mode", w_kb.currentIndexChanged,
+                                      lambda *_: self._apply_presskey_mode_visibility())
             except Exception as e:
                 print(f"[Inspector] PressKey UI 出错: {e}")
 
@@ -1539,7 +2059,8 @@ class InspectorPanel(QWidget):
                 self._apply_wait_mode_visibility()
                 w_dt = self._widgets.get("delay_type")
                 if isinstance(w_dt, QComboBox):
-                    w_dt.currentIndexChanged.connect(lambda *_: self._apply_wait_mode_visibility())
+                    self._connect_aux("wait.delay_type", w_dt.currentIndexChanged,
+                                      lambda *_: self._apply_wait_mode_visibility())
             except Exception as e:
                 print(f"[Inspector] Wait UI 出错: {e}")
 
@@ -1793,22 +2314,21 @@ class InspectorPanel(QWidget):
         v.setContentsMargins(6, 6, 6, 6)
         v.setSpacing(4)
 
-        # 缩略图
+        # 缩略图：走内容级缓存（同一批参考图反复切节点不再重复解码，实测 6 张 41ms → 0ms）
         pix = None
-        pil = None
         b64 = item.get("b64") or item.get("image_b64")
         if isinstance(b64, str) and b64:
-            pil = self._b64_to_pil(b64)
+            pix = _b64_thumb(b64, 88)
         path = item.get("path", "")
         real_path = self._real_img_path(path if isinstance(path, str) else "")
-        if pil is None and real_path and Image is not None:
+        if pix is None and real_path and Image is not None:
             try:
-                pil = Image.open(real_path)
+                pix = self._pil_to_qpixmap(Image.open(real_path), size=88)
             except Exception:
-                pil = None
+                pix = None
         w = int(item.get("w", 0) or 0)
         h = int(item.get("h", 0) or 0)
-        if pil is None and w > 0 and h > 0:
+        if pix is None and w > 0 and h > 0:
             pix_label = QLabel(f"({w}×{h})\n(无预览图)")
             pix_label.setAlignment(Qt.AlignCenter)
             pix_label.setStyleSheet(
@@ -1818,7 +2338,6 @@ class InspectorPanel(QWidget):
             )
             pix_label.setFixedSize(96, 96)
         else:
-            pix = self._pil_to_qpixmap(pil, size=88)
             pix_label = QLabel()
             pix_label.setAlignment(Qt.AlignCenter)
             if pix is not None:
@@ -1847,9 +2366,8 @@ class InspectorPanel(QWidget):
         btn_rep.setText("🔄")
         btn_rep.setToolTip("重新框选替换这张图")
         btn_rep.setStyleSheet(self._btn_style("#0B3A5C", "#0F4A77"))
-        nid = self._current_node.id if self._current_node else ""
         btn_rep.clicked.connect(
-            lambda _=False, n=nid, i=idx: self.request_snip_for_node.emit(n, f"if_img_replace_{i}")
+            lambda _=False, i=idx: self.request_snip_for_node.emit(self._nid(), f"if_img_replace_{i}")
         )
         br.addWidget(btn_rep)
 
@@ -2907,8 +3425,7 @@ class InspectorPanel(QWidget):
         # 参数名 -> 是否可见 的映射表
         vis_map = {
             "offset": show_offsets,
-            "post_delay_min_ms": show_offsets,
-            "post_delay_max_ms": show_offsets,
+            "post_delay_ms": show_offsets,
             # 特征识别辅助参数（features_json / feature_capture_width / feature_template_w/h 已隐藏，不在此管理）
             "feature_tolerance": use_feat,
             "feature_min_hits": use_feat,
@@ -3434,13 +3951,12 @@ class InspectorPanel(QWidget):
             "框选一个矩形区域作为静止ROI\n"
             "若已设置「目标窗口」，框选范围将自动限定在该窗口内"
         )
-        nid = node.id
-        btn_roi.clicked.connect(lambda _=False, n=nid: self.request_snip_for_node.emit(n, "if_static_roi"))
+        btn_roi.clicked.connect(lambda _=False: self.request_snip_for_node.emit(self._nid(), "if_static_roi"))
         bl.addWidget(btn_roi)
         btn_clear_roi = QPushButton("🗑️ 清除ROI")
         btn_clear_roi.setStyleSheet(self._btn_style("#6E7681", "#8B949E"))
         btn_clear_roi.setToolTip("清除已选的ROI区域和预览图")
-        btn_clear_roi.clicked.connect(lambda _=False, n=node: self._clear_ifstatic_roi(n.id))
+        btn_clear_roi.clicked.connect(lambda _=False: self._clear_ifstatic_roi(self._nid()))
         bl.addWidget(btn_clear_roi)
         bl.addStretch(1)
         self._form.addRow(btn_row)
@@ -3483,8 +3999,8 @@ class InspectorPanel(QWidget):
         self._form.addRow(info_row)
 
         b64 = node.params.get("roi_preview_b64", "")
-        pil = self._b64_to_pil(b64) if isinstance(b64, str) and b64 else None
-        if pil is None:
+        pix = _b64_thumb(b64, 220) if isinstance(b64, str) and b64 else None
+        if pix is None:
             empty = QLabel("（无预览）")
             empty.setAlignment(Qt.AlignCenter)
             empty.setStyleSheet(
@@ -3494,17 +4010,15 @@ class InspectorPanel(QWidget):
             )
             self._form.addRow(empty)
             return
-        pix = self._pil_to_qpixmap(pil, size=220)
-        if pix is not None:
-            lbl = QLabel()
-            lbl.setAlignment(Qt.AlignCenter)
-            lbl.setPixmap(pix)
-            lbl.setStyleSheet(
-                "QLabel { background:#000; border:2px solid #d84315; border-radius:4px; padding:2px; }"
-            )
-            if w > 0 and h > 0:
-                lbl.setToolTip(f"ROI 预览：实际区域 {w}×{h} 像素")
-            self._form.addRow(lbl)
+        lbl = QLabel()
+        lbl.setAlignment(Qt.AlignCenter)
+        lbl.setPixmap(pix)
+        lbl.setStyleSheet(
+            "QLabel { background:#000; border:2px solid #d84315; border-radius:4px; padding:2px; }"
+        )
+        if w > 0 and h > 0:
+            lbl.setToolTip(f"ROI 预览：实际区域 {w}×{h} 像素")
+        self._form.addRow(lbl)
 
     def _clear_ifstatic_roi(self, node_id: str):
         """清除静止ROI和预览图"""
@@ -3532,8 +4046,7 @@ class InspectorPanel(QWidget):
             # --- 通用(空list = 永远显示) ---
             "range_mode": [],
             "action": [],
-            "post_delay_min_ms": [],
-            "post_delay_max_ms": [],
+            "post_delay_ms": [],
             # --- 目标点（click/move/scroll 用）---
             "pos": ["click", "move", "scroll"],
             # --- drag 独有 ---
@@ -3543,8 +4056,7 @@ class InspectorPanel(QWidget):
             # --- 按钮/时长相关 ---
             "button": ["click", "drag"],
             "click_count": ["click"],
-            "hold_ms_min": ["click"],
-            "hold_ms_max": ["click"],
+            "hold_ms": ["click"],
             # --- scroll 独有 ---
             "scroll_dy": ["scroll"],
             "scroll_steps": ["scroll"],
@@ -4029,13 +4541,12 @@ class InspectorPanel(QWidget):
         if idx < 0:
             idx = 0
         combo.setCurrentIndex(idx)
-        nid = self._current_node.id
         combo.currentIndexChanged.connect(
-            lambda i, n=nid, c=combo: self.param_changed.emit(n, "blueprint_path", c.currentData() or "")
+            lambda i, c=combo: self.param_changed.emit(self._nid(), "blueprint_path", c.currentData() or "")
         )
         # 选完组件后通知主窗口：自动对齐端口数 + 循环引用检测（在参数已写入之后触发）
         combo.currentIndexChanged.connect(
-            lambda i, n=nid, c=combo: self.component_chosen.emit(n, str(c.currentData() or ""))
+            lambda i, c=combo: self.component_chosen.emit(self._nid(), str(c.currentData() or ""))
         )
         # 替换
         self._form.removeRow(target_row)
@@ -4125,8 +4636,8 @@ class InspectorPanel(QWidget):
         self._form.addRow(info)
 
         b64 = node.params.get("roi_preview_b64", "")
-        pil = self._b64_to_pil(b64) if isinstance(b64, str) and b64 else None
-        if pil is None:
+        pix = _b64_thumb(b64, 200) if isinstance(b64, str) and b64 else None
+        if pix is None:
             empty = QLabel("（无预览，点上方「🖱 框选ROI」）")
             empty.setAlignment(Qt.AlignCenter)
             empty.setStyleSheet(
@@ -4135,13 +4646,11 @@ class InspectorPanel(QWidget):
             )
             self._form.addRow(empty)
             return
-        pix = self._pil_to_qpixmap(pil, size=200)
-        if pix is not None:
-            lbl = QLabel()
-            lbl.setAlignment(Qt.AlignCenter)
-            lbl.setPixmap(pix)
-            lbl.setStyleSheet("QLabel { background:#000; border:2px solid #29b6f6; border-radius:4px; padding:2px; }")
-            self._form.addRow(lbl)
+        lbl = QLabel()
+        lbl.setAlignment(Qt.AlignCenter)
+        lbl.setPixmap(pix)
+        lbl.setStyleSheet("QLabel { background:#000; border:2px solid #29b6f6; border-radius:4px; padding:2px; }")
+        self._form.addRow(lbl)
 
     def _replace_seq_num_paths_with_buttons(self):
         """Sequence：num_paths 输入框替换为 +/- 按钮组合（必须用 +/- 控制，不能用原生 SpinBox 直接填）。"""
@@ -4462,25 +4971,27 @@ class InspectorPanel(QWidget):
             if val_label is not None:
                 # 对 +/- 按钮容器，直接监听内部按钮的点击事件（不做连接，实际信号由 param_changed 触发 inspector 刷新）
                 continue
+            # ⚠ 走 _connect_aux：这些是**参数控件**，复用路径下它们还活着，
+            #   直接 connect 会连上一堆绑定到旧节点的 _refresh（端口列表越刷越乱）。
             if isinstance(w, QSpinBox):
-                try: w.valueChanged.connect(_refresh)
-                except Exception: pass
+                self._connect_aux(f"ports.{pname}", w.valueChanged, _refresh)
             elif isinstance(w, QLineEdit):
-                try: w.textChanged.connect(_refresh)
-                except Exception: pass
+                self._connect_aux(f"ports.{pname}", w.textChanged, _refresh)
             elif isinstance(w, QPlainTextEdit):
-                try: w.textChanged.connect(_refresh)
-                except Exception: pass
+                self._connect_aux(f"ports.{pname}", w.textChanged, _refresh)
 
     # ---------------- 编辑器 ----------------
     def _clear_form(self):
         self._widgets.clear()
+        # 专属 UI 的连接表只在「整表重建」时清空：控件都销毁了，连接也随之失效。
+        # （同类型复用路径不清，因为参数控件还活着，靠 _connect_aux 的 key 去去重）
+        self._aux_conns.clear()
+        self._aux_widgets = []
         while self._form.rowCount() > 0:
             self._form.removeRow(0)
 
     def _build_editor(self, pd: ParamDef, current: Any) -> Optional[QWidget]:
         node = self._current_node
-        nid = node.id if node else ""
         editor = pd.editor
 
         if editor == EDITOR_INT:
@@ -4498,7 +5009,7 @@ class InspectorPanel(QWidget):
                 sp.setValue(int(current) if current is not None else int(pd.default or 0))
             except Exception:
                 sp.setValue(0)
-            sp.valueChanged.connect(lambda v, nid=nid, pn=pd.name: self.param_changed.emit(nid, pn, int(v)))
+            sp.valueChanged.connect(lambda v, pn=pd.name: self.param_changed.emit(self._nid(), pn, int(v)))
             sp.setStyleSheet(self._edit_style())
             return sp
 
@@ -4518,13 +5029,13 @@ class InspectorPanel(QWidget):
                 sp.setValue(float(current) if current is not None else float(pd.default or 0.0))
             except Exception:
                 sp.setValue(0.0)
-            sp.valueChanged.connect(lambda v, nid=nid, pn=pd.name: self.param_changed.emit(nid, pn, float(v)))
+            sp.valueChanged.connect(lambda v, pn=pd.name: self.param_changed.emit(self._nid(), pn, float(v)))
             sp.setStyleSheet(self._edit_style())
             return sp
 
         if editor == EDITOR_STRING:
             le = QLineEdit(str(current or ""))
-            le.textChanged.connect(lambda t, nid=nid, pn=pd.name: self.param_changed.emit(nid, pn, t))
+            le.textChanged.connect(lambda t, pn=pd.name: self.param_changed.emit(self._nid(), pn, t))
             le.setStyleSheet(self._edit_style())
             if pd.placeholder:
                 le.setPlaceholderText(pd.placeholder)
@@ -4538,7 +5049,7 @@ class InspectorPanel(QWidget):
                 cb.setChecked(bool(current))
             except Exception:
                 cb.setChecked(False)
-            cb.toggled.connect(lambda v, nid=nid, pn=pd.name: self.param_changed.emit(nid, pn, bool(v)))
+            cb.toggled.connect(lambda v, pn=pd.name: self.param_changed.emit(self._nid(), pn, bool(v)))
             cb.setStyleSheet("color: #C9D1D9;")
             return cb
 
@@ -4555,7 +5066,7 @@ class InspectorPanel(QWidget):
                 idx = 0
             cb.setCurrentIndex(idx)
             cb.currentIndexChanged.connect(
-                lambda i, nid=nid, pn=pd.name, combo=cb: self.param_changed.emit(nid, pn, combo.currentData())
+                lambda i, pn=pd.name, combo=cb: self.param_changed.emit(self._nid(), pn, combo.currentData())
             )
             cb.setStyleSheet(self._edit_style())
             return cb
@@ -4567,7 +5078,7 @@ class InspectorPanel(QWidget):
             row.setSpacing(4)
             le = QLineEdit(str(current or ""))
             le.setStyleSheet(self._edit_style())
-            le.textChanged.connect(lambda t, nid=nid, pn=pd.name: self.param_changed.emit(nid, pn, t))
+            le.textChanged.connect(lambda t, pn=pd.name: self.param_changed.emit(self._nid(), pn, t))
             btn = QPushButton("…")
             btn.setFixedWidth(28)
             btn.setStyleSheet(self._btn_style())
@@ -4583,10 +5094,10 @@ class InspectorPanel(QWidget):
             row.setSpacing(4)
             le = QLineEdit(str(current or ""))
             le.setStyleSheet(self._edit_style())
-            le.textChanged.connect(lambda t, nid=nid, pn=pd.name: self.param_changed.emit(nid, pn, t))
+            le.textChanged.connect(lambda t, pn=pd.name: self.param_changed.emit(self._nid(), pn, t))
             btn_pick = QPushButton("裁图")
             btn_pick.setStyleSheet(self._btn_style("#238636", "#2EA043"))
-            btn_pick.clicked.connect(lambda _=False, nid=nid, pn=pd.name: self.request_pick_template.emit(nid, pn))
+            btn_pick.clicked.connect(lambda _=False, pn=pd.name: self.request_pick_template.emit(self._nid(), pn))
             btn_file = QPushButton("…")
             btn_file.setFixedWidth(28)
             btn_file.setStyleSheet(self._btn_style())
@@ -4622,10 +5133,10 @@ class InspectorPanel(QWidget):
                 spins.append(s)
                 row.addWidget(s, 0)  # stretch=0：靠左排列，不拉伸
 
-            def _on_change(*_, nid=nid, pn=pd.name, sps=spins, sz=size):
+            def _on_change(*_, pn=pd.name, sps=spins, sz=size):
                 vals = [s.value() for s in sps]
                 t = tuple(vals)
-                self.param_changed.emit(nid, pn, t)
+                self.param_changed.emit(self._nid(), pn, t)
             for s in spins:
                 s.valueChanged.connect(_on_change)
 
@@ -4640,7 +5151,7 @@ class InspectorPanel(QWidget):
                     "QPushButton:hover { background: #2EA043; }"
                 )
                 btn_pick.clicked.connect(
-                    lambda _=False, nid=nid, pn=pd.name: self.request_pick_coord.emit(nid, pn)
+                    lambda _=False, pn=pd.name: self.request_pick_coord.emit(self._nid(), pn)
                 )
                 row.addWidget(btn_pick)
 
@@ -4675,8 +5186,8 @@ class InspectorPanel(QWidget):
             elif pd.name == "cases":
                 te.setPlaceholderText("AND 多条件判断：每行 变量名 运算符 值\n# 示例（全部同时满足才走 yes）:\nhp >= 30\nhp <= 100\nscore >= 60\ngender != \"female\"\nlevel > {min_level}")
             # textChanged 信号去抖：批量粘贴时不刷屏（直接连即可，QPlainTextEdit 本来就轻）
-            def _on_text(nid=nid, pn=pd.name, widget=te):
-                self.param_changed.emit(nid, pn, widget.toPlainText())
+            def _on_text(pn=pd.name, widget=te):
+                self.param_changed.emit(self._nid(), pn, widget.toPlainText())
             te.textChanged.connect(_on_text)
             te.setStyleSheet(self._edit_style())
             return te

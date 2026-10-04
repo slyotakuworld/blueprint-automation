@@ -35,7 +35,7 @@
 | 参数名 | 编辑器 | 默认值 | 必填 | 说明 |
 |--------|--------|--------|------|------|
 | `command` | 多行文本 | `echo hello {name}` | - | 要执行的命令，支持 `{var}` 变量插值 |
-| `working_dir` | 📁 路径 | `""` | - | 工作目录；空=当前项目目录；支持特殊占位符 `{blueprint_dir}` = 当前蓝图所在文件夹 |
+| `working_dir` | 📁 路径 | `""` | - | 工作目录；留空=沿用主程序当前目录；支持 `{变量}` 插值和特殊占位符 `{blueprint_dir}`=当前蓝图所在文件夹 |
 | `timeout_ms` | 整数 | `10000` | - | 超时毫秒；0=永不超时（慎用，可能卡死蓝图） |
 | `capture_streams` | ✅ 复选 | `true` | - | 捕获输出。关掉后不会等程序结束，立刻 out_done（适合 GUI 程序：notepad.exe、游戏） |
 | `shell_mode` | 下拉 | `cmd_c` | - | shell 模式：`cmd_c`（CMD /c）、`powershell`（PowerShell -NoProfile -Command）、`no_shell`（直接 CreateProcess） |

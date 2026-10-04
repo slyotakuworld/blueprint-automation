@@ -346,7 +346,7 @@ class InputActions:
         double=False,
         random_offset_radius=8,
         hold_ms_range=(30, 80),
-        post_delay_range=(80, 200),
+        post_delay_range=(30, 80),
         repeat=1,
         button="left",
     ):
@@ -382,7 +382,8 @@ class InputActions:
                 time.sleep(hold_ms / 1000.0)
                 self._hw_mouse_up(button)
                 if i < click_count - 1:
-                    time.sleep(0.08)
+                    # 双击两次按下之间的间隔：随机化，避免固定连点节奏（OS 双击判定窗口默认 500ms，安全）
+                    time.sleep(random.uniform(0.06, 0.12))
             post_delay_ms = random.randint(int(post_delay_range[0]), int(post_delay_range[1]))
             last_post = post_delay_ms
             if r < repeat_n - 1:

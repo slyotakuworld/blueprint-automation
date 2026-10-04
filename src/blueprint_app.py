@@ -2740,10 +2740,12 @@ class BlueprintMainWindow(QMainWindow):
 
     # ==================== 画布事件 ====================
     def _on_scene_node_selected(self, node_id: str):
+        # 走延迟入口：面板重建（50~250ms）不再卡在鼠标事件那一帧，
+        # 节点选中高亮 / 连线联动先画出来，面板随后刷新（详见 set_node_deferred）。
         if self._graph is None or node_id not in self._graph.nodes:
-            self._inspector.set_node(None)
+            self._inspector.set_node_deferred(None)
             return
-        self._inspector.set_node(self._graph.nodes[node_id])
+        self._inspector.set_node_deferred(self._graph.nodes[node_id])
 
     def _on_param_changed(self, node_id: str, param_name: str, value):
         if self._graph is None or node_id not in self._graph.nodes:

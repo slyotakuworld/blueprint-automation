@@ -14,17 +14,15 @@
 
 | 节点 | 参数对 | 效果 |
 |------|--------|------|
-| Mouse | `hold_ms_min` ~ `hold_ms_max` | 按住按钮时长在区间里随机 |
-| Mouse | `post_delay_min_ms` ~ `post_delay_max_ms` | 操作完再随机小睡一会 |
 | Wait | `min_seconds` ~ `max_seconds`（random 模式） | 两次动作之间的延迟每次都不一样 |
-| PressKey(key) | `hold_ms` + `interval_ms` | 按键保持时长和间隔均为固定值（无随机性，需随机化用 Mouse 节点或 Wait 节点 random 模式） |
+| PressKey(key) | `hold_ms` + `interval_ms` | 按键保持时长和间隔均为固定值（无随机性，需随机化用 Wait 节点 random 模式） |
+
+> 注：Mouse 的按压/节点后延迟已简化为固定值（`hold_ms` / `post_delay_ms`，默认 50ms），不再提供区间随机。
 
 ### ✅ 推荐默认值（日常挂机不用改）
 ```
-Mouse.hold_ms_min     = 30
-Mouse.hold_ms_max     = 80
-Mouse.post_delay_min  = 30
-Mouse.post_delay_max  = 80
+Mouse.hold_ms         = 50
+Mouse.post_delay_ms   = 50
 Wait （random）       = 0.2 ~ 0.6 秒（简单操作间）
                       = 1.0 ~ 3.0 秒（页面加载类）
 ```
@@ -113,7 +111,7 @@ Start
 
 | 目标 | 操作 |
 |------|------|
-| 更像真人 | Wait 全用 random 模式；Mouse hold/post_delay 设 min≠max |
-| 更快 | Wait 设 fixed 0.1s；drag_duration_ms 调小；Mouse hold_min/max 调小 |
+| 更像真人 | Wait 全用 random 模式 |
+| 更快 | Wait 设 fixed 0.1s；drag_duration_ms 调小；Mouse hold_ms / post_delay_ms 调小 |
 | 更稳定（找图） | FindImage 阈值 0.9+；模板图截紧凑；「找图范围」选目标窗口减少误判 |
 | 更稳（点击） | FindImage after_action=click 比单独 FindImage→Mouse 更不容易坐标错位 |

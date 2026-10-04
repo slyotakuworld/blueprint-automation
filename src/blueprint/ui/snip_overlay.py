@@ -250,14 +250,17 @@ class SnipOverlay(FullscreenOverlayBase):
         painter.drawText(x, int(y), self._limit_label)
 
     def _draw_hint_text(self, painter, text: str, lim: Optional[QRect]):
-        """画底部提示；若提示会落进限定区（可能被截进模板），换位置或干脆不画。"""
+        """画底部提示；若提示会落进限定区或当前选区（可能被截进模板/参考图），换位置或干脆不画。"""
         fm = painter.fontMetrics()
         tw = fm.horizontalAdvance(text)
         x = max(4, (self.width() - tw) // 2)
+        # 选区也要避开：全屏模式（无限定区）下选区是"挖空"的，松手时 ImageGrab 抓的是
+        # 屏幕实况，提示文字若压在选区里会被永久截进模板/参考图
+        avoid = [r for r in (lim, self._current_rect) if r is not None]
         for y in (self.height() - 40, 26 + fm.ascent(), self.height() - 8):
             if y + 4 > self.height() or y - fm.ascent() < 0:
                 continue
             box = QRect(x - 6, int(y) - fm.ascent() - 3, tw + 12, fm.height() + 8)
-            if lim is None or not box.intersects(lim):
+            if all(not box.intersects(r) for r in avoid):
                 painter.drawText(x, int(y), text)
                 return

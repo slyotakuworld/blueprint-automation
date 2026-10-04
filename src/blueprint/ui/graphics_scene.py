@@ -79,10 +79,17 @@ class NodeScene(QGraphicsScene):
     # ---------------- 背景网格 ----------------
     def drawBackground(self, painter: QPainter, rect: QRectF):
         painter.fillRect(rect, QColor("#1C2128"))
+        g = GRID_SIZE
+        # 缩得过小时线间距会小于 ~6 设备像素：既白画成百上千条线拖慢帧率，又糊成一片摩尔纹。
+        # painter 的 worldTransform 把场景坐标映射到设备像素，m11() 就是当前缩放倍数。
+        try:
+            if abs(painter.worldTransform().m11()) * g < 6.0:
+                return  # 只铺底色，不画网格（多数节点编辑器在缩小到一定程度后同样隐藏网格）
+        except Exception:
+            pass
         pen = QPen(QColor("#2D333B"))
         pen.setWidth(1)
         painter.setPen(pen)
-        g = GRID_SIZE
         left = int(rect.left() - (rect.left() % g)) - g
         right = int(rect.right()) + g
         top = int(rect.top() - (rect.top() % g)) - g

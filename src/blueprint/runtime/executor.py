@@ -675,9 +675,13 @@ def _find_window_3d(
     exe_name: str,
     class_name: str,
     prefer_visible: bool = True,
-) -> Optional[int]:
+    return_all: bool = False,
+):
     """三维搜索：title子串 / exe文件名(小写含) / class_name 精确等于（不区分大小写）。
     三个维度全部启用：仅当对应字段非空时才参与匹配评分。
+
+    return_all=False（默认）返回评分最高的单个 hwnd；
+    return_all=True 返回按评分降序的全部 hwnd 列表（供 FindImage 多候选轮询消歧用）。
     """
     title_s = str(title or "").strip()
     exe_s = str(exe_name or "").strip().lower()
@@ -694,11 +698,34 @@ def _find_window_3d(
     import win32gui as _wg
 
     for hwnd, w_title, w_cls, w_pid in wins:
-        # 可见性（优先）
+        # 真实可见性：IsWindowVisible + 非 DWM cloaked + rect 不在屏幕外。
+        # 只查 IsWindowVisible 会把最小化(-32000 垃圾位)/零尺寸/cloaked 的同名辅助窗口
+        # 也当成"可见"（浏览器有大量这种窗口），导致 exe/class 匹配选中它们 -> region 无效。
         try:
-            vis = _wg.IsWindowVisible(hwnd) if prefer_visible else True
+            _r = _wg.GetWindowRect(hwnd)
+        except Exception:
+            _r = None
+        # 零尺寸窗口（IME/crashpad 等系统辅助窗口，从未渲染）直接排除——
+        # 它们的 exe/cls 常与主窗口相同，留下只会靠 tie-break 随机抢占
+        if _r is None or _r[2] - _r[0] <= 0 or _r[3] - _r[1] <= 0:
+            continue
+        try:
+            vis = bool(_wg.IsWindowVisible(hwnd)) if prefer_visible else True
         except Exception:
             vis = False
+        if vis:
+            try:
+                import ctypes as _ct
+                _cloaked = _ct.c_int(0)
+                _ct.windll.dwmapi.DwmGetWindowAttribute(
+                    hwnd, 14, _ct.byref(_cloaked), _ct.sizeof(_cloaked))  # DWMWA_CLOAKED
+                if _cloaked.value != 0:
+                    vis = False
+            except Exception:
+                pass
+            # 屏幕外最小化位（-32000 一族）：IsWindowVisible 可能为 True 但不可见
+            if _r[0] <= -30000 or _r[1] <= -30000:
+                vis = False
         score = 0
         dim_ok = 0
         dim_checked = 0
@@ -732,15 +759,22 @@ def _find_window_3d(
         # 维度必须全满足（只要用户填了对应值的维度必须命中）
         if score < 0:
             continue
-        # 可见加分
+        # 可见加权（+50）：确保真实可见的主窗口稳赢同名隐藏/屏幕外辅助窗口
+        # （原来只 +1，同分时按 pid/hwnd tie-break 会随机选中错误窗口）
         if vis:
-            score += 1
+            score += 50
+        # 有标题加权（+10）：压过 IME/crashpad 等无标题系统辅助窗口
+        # （浏览器进程下这些窗口与主窗口 exe/cls 相同，无标题时原先会同分随机选中）
+        if (w_title or "").strip():
+            score += 10
         # 匹配维度数优先
         score += dim_ok * 100
         scored.append((score, dim_ok, -w_pid, hwnd))
     if not scored:
-        return None
+        return [] if return_all else None
     scored.sort(reverse=True)
+    if return_all:
+        return [int(s[3]) for s in scored]
     return int(scored[0][3])
 
 
@@ -1171,21 +1205,26 @@ def execute_FindImage(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any])
         )
 
     # 3) 目标窗口解析：window 模式必须先拿到窗口，找不到直接 err（不退化为全屏）
-    target = None
+    targets = []  # [(hwnd, rect), ...] 评分降序的全部候选窗口
     if range_mode == "window":
-        target = _resolve_target_rect(ctx, node.params, tag="FindImage")
-        if target is None:
+        targets = _resolve_target_rects(ctx, node.params, tag="FindImage")
+        if not targets:
             err = _target_err_msg(node.params, "FindImage")
             ctx.log(f"[FindImage] {err}", "ERROR")
             annotate_step(ctx, node, "find", note="ERROR: target window not found")
             return ({"out_pos": None}, ["err"], err)
+    target = targets[0] if targets else None
 
     # 4) 超时空转 + 滚动重试 循环
     t0 = time.time()
     pos = None
     last_err = ""
 
-    with _target_window_foreground(ctx, target):
+    # 多候选窗口（exe/class 命中多个真实可见窗口）：每轮轮询一个候选，
+    # 前置后在它的区域内找图，模板命中谁就算谁；单候选保持原行为（循环前一次性前置）
+    multi = len(targets) > 1
+
+    with _target_window_foreground(ctx, None if multi else target):
         try:
             # region 在窗口前置之后计算，避免最小化窗口恢复后 rect 失效
             region = None  # None=全屏；(x,y,w,h)=窗口区域
@@ -1196,7 +1235,20 @@ def execute_FindImage(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any])
                 win_origin = (int(rect[0]), int(rect[1]))
                 ctx.log(f"[FindImage] 目标窗口内找图 region={region}", "DEBUG")
 
+            cand_i = 0  # 多候选窗口轮询指针（单候选时不起作用）
             while (time.time() - t0) < timeout_s and ctx.is_running:
+                wait_if_paused(ctx)
+                if not ctx.is_running:
+                    break
+                # 多候选：本轮轮到下一个候选窗口——前置后更新 region / win_origin
+                if multi:
+                    hwnd_c, rect_c = targets[cand_i % len(targets)]
+                    cand_i += 1
+                    _bring_window_to_front_safe(ctx, hwnd_c)
+                    time.sleep(0.1)  # 等窗口切换完成再截图
+                    region = (int(rect_c[0]), int(rect_c[1]),
+                              int(rect_c[2]) - int(rect_c[0]), int(rect_c[3]) - int(rect_c[1]))
+                    win_origin = (int(rect_c[0]), int(rect_c[1]))
                 wait_if_paused(ctx)
                 if not ctx.is_running:
                     break
@@ -1331,11 +1383,10 @@ def execute_FindImage(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any])
                             pyautogui.doubleClick()
                         elif after_action == "right_click":
                             pyautogui.rightClick()
-                        post_min = max(0, int(node.params.get("post_delay_min_ms", 30) or 30))
-                        post_max = max(0, int(node.params.get("post_delay_max_ms", 80) or 80))
-                        post_delay_ms = random.randint(min(post_min, post_max), max(post_min, post_max))
+                        # 点击后延迟（固定值）
+                        post_delay_ms = max(0, int(node.params.get("post_delay_ms", 50) or 50))
                         if post_delay_ms > 0:
-                            ctx.log(f"[FindImage] 动作后延迟 {post_delay_ms}ms 再执行下一节点", "DEBUG")
+                            ctx.log(f"[FindImage] 点击后延迟 {post_delay_ms}ms 再执行下一节点", "DEBUG")
                             wait_if_paused(ctx)
                             time.sleep(post_delay_ms / 1000.0)
                     except Exception as ea:
@@ -1554,18 +1605,34 @@ def _target_err_msg(params: Dict[str, Any], tag: str) -> str:
 
 
 def _resolve_target_rect(ctx, params: Dict[str, Any], tag: str = "目标窗口"):
-    """解析「目标窗口」窗口：按 target_title / target_exe / target_class 查找，返回 (hwnd, rect)。
-    未配置定位条件、或条件没匹配到窗口，都返回 None（不再有任何全局目标窗口回落）。
+    """解析「目标窗口」窗口：按 target_title / target_exe / target_class 查找，
+    返回评分最高的 (hwnd, rect)。未配置定位条件、或条件没匹配到窗口，都返回 None
+    （不再有任何全局目标窗口回落）。
 
     rect 与编辑器框选 ROI / 拾取窗口同口径（DWM 可见边界），返回的是裸的
     (left, top, right, bottom)，调用方按需换算成 (x, y, w, h)。
+
+    多候选场景（同一条件命中多个可见窗口）请用 _resolve_target_rects。
+    """
+    rects = _resolve_target_rects(ctx, params, tag=tag)
+    return rects[0] if rects else None
+
+
+def _resolve_target_rects(ctx, params: Dict[str, Any], tag: str = "目标窗口") -> list:
+    """解析「目标窗口」的全部候选窗口，返回按匹配评分降序的 [(hwnd, rect), ...]。
+
+    定位条件与 _resolve_target_rect 完全一致；差别是条件命中多个真实可见窗口时
+    不再只挑一个，而是全部返回，由调用方（FindImage）逐个轮询尝试，用模板图本身消歧。
+
+    仅一个候选时行为与旧版完全一致（含最小化窗口自动还原）；
+    多候选时跳过最小化窗口（避免批量把窗口弹出来），若因此没有可用候选则返回 []。
     """
     from src.blueprint.core.variable_engine import VariableEngine
     title_raw = str(params.get("target_title", "") or "")
     exe_name = str(params.get("target_exe", "") or "").strip()
     class_name = str(params.get("target_class", "") or "").strip()
     if not (title_raw.strip() or exe_name or class_name):
-        return None
+        return []
     try:
         engine = getattr(ctx, "var_engine", None) or VariableEngine(ctx.variables)
         title = str(engine.interpolate(title_raw)) if engine.has_any_marker(title_raw) else title_raw
@@ -1577,33 +1644,40 @@ def _resolve_target_rect(ctx, params: Dict[str, Any], tag: str = "目标窗口")
     except Exception:
         title = title_raw
     try:
-        hwnd = _find_window_3d(title, exe_name, class_name)
-        if not hwnd:
+        hwnds = _find_window_3d(title, exe_name, class_name, return_all=True)
+        if not hwnds:
             ctx.log(f"[{tag}] 目标窗口未找到: title={title!r} exe={exe_name!r} class={class_name!r}", "WARN")
-            return None
-        # 窗口最小化时取到的 rect 是 (-32000,...) 垃圾值，先还原再取
-        try:
-            import win32gui as _wg2
-            if _wg2.IsIconic(hwnd):
-                _wg2.ShowWindow(hwnd, 9)  # SW_RESTORE
-                time.sleep(0.15)
-        except Exception:
-            pass
-        # 窗口矩形用 DWM 可见边界（与编辑器框选 ROI / 拾取窗口的基准一致），
-        # 裸 GetWindowRect 在 Win10/11 含不可见边框，会让 ROI 整体偏移几个像素
-        try:
-            from src.tools.window_utils import get_window_rect_dwm
-            rect = get_window_rect_dwm(hwnd)
-        except Exception:
-            rect = None
-        if rect is None:
-            import win32gui as _wg
-            rect = _wg.GetWindowRect(hwnd)  # (left, top, right, bottom)
-        ctx.log(f"[{tag}] 目标窗口 hwnd={hwnd} rect={rect} title={title!r}", "DEBUG")
-        return (hwnd, rect)
+            return []
+        out = []
+        import win32gui as _wg2
+        for hwnd in hwnds:
+            try:
+                if _wg2.IsIconic(hwnd):
+                    if len(hwnds) > 1:
+                        continue  # 多候选：跳过最小化窗口，不批量还原
+                    _wg2.ShowWindow(hwnd, 9)  # SW_RESTORE
+                    time.sleep(0.15)
+            except Exception:
+                pass
+            # 窗口矩形用 DWM 可见边界（与编辑器框选 ROI / 拾取窗口的基准一致），
+            # 裸 GetWindowRect 在 Win10/11 含不可见边框，会让 ROI 整体偏移几个像素
+            try:
+                from src.tools.window_utils import get_window_rect_dwm
+                rect = get_window_rect_dwm(hwnd)
+            except Exception:
+                rect = None
+            if rect is None:
+                import win32gui as _wg
+                rect = _wg.GetWindowRect(hwnd)  # (left, top, right, bottom)
+            out.append((hwnd, rect))
+        if not out:
+            return []
+        if len(out) > 1:
+            ctx.log(f"[{tag}] 目标条件命中 {len(out)} 个候选窗口", "DEBUG")
+        return out
     except Exception as e:
         ctx.log(f"[{tag}] 解析目标窗口失败: {type(e).__name__}: {e}", "WARN")
-        return None
+        return []
 
 
 def _bring_window_to_front_safe(ctx, hwnd):
@@ -1704,9 +1778,8 @@ def execute_Mouse(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
             annotate_step(ctx, node, "mouse_err", note=err[:60])
             return {}, ["err"], err
 
-    post_min = max(0, int(p.get("post_delay_min_ms", 30) or 30))
-    post_max = max(0, int(p.get("post_delay_max_ms", 80) or 80))
-    post_range = (min(post_min, post_max), max(post_min, post_max))
+    post_delay_ms = max(0, int(p.get("post_delay_ms", 50) or 50))
+    post_range = (post_delay_ms, post_delay_ms)  # 单值区间：game_click 内部 random.randint 退化为固定
 
     with _target_window_foreground(ctx, target):
         try:
@@ -1715,9 +1788,8 @@ def execute_Mouse(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
 
             if action == "click":
                 clicks = max(1, int(p.get("click_count", 1) or 1))
-                hold_min = max(1, int(p.get("hold_ms_min", 30) or 30))
-                hold_max = max(1, int(p.get("hold_ms_max", 80) or 80))
-                hold_range = (min(hold_min, hold_max), max(hold_min, hold_max))
+                hold_ms = max(1, int(p.get("hold_ms", 50) or 50))
+                hold_range = (hold_ms, hold_ms)
                 double = (clicks == 2)
                 repeat = 1 if clicks <= 2 else clicks
                 if ia is not None:
