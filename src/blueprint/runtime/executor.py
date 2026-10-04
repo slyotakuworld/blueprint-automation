@@ -351,7 +351,7 @@ def _run_subgraph_until_control(
 def execute_Loop(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
     infinite = bool(node.params.get("infinite", False))
     max_it = int(node.params.get("max_iterations", 5) or 5)
-    interval = float(node.params.get("interval_sec", 1.0) or 1.0)
+    interval = param_num(node.params.get("interval_sec"), 1.0, float, lo=0.0)
     if max_it <= 0:
         max_it = 5
     counter = ctx.loop_counters.get(node.id, 0)
@@ -513,12 +513,12 @@ def execute_Wait(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
         sec = max(0.0, min(float(in_sec), 3600.0))
         mode_txt = "连线"
     elif delay_type == "random":
-        min_s = max(0.0, float(p.get("min_seconds", 1.0) or 1.0))
-        max_s = max(min_s, float(p.get("max_seconds", 3.0) or 3.0))
+        min_s = param_num(p.get("min_seconds"), 1.0, float, lo=0.0, hi=3600.0)
+        max_s = max(min_s, param_num(p.get("max_seconds"), 3.0, float, lo=0.0, hi=3600.0))
         sec = random.uniform(min_s, max_s)
         mode_txt = f"随机[{min_s:g}~{max_s:g}]"
     else:
-        sec = max(0.0, min(float(p.get("seconds", 1.0) or 1.0), 3600.0))
+        sec = param_num(p.get("seconds"), 1.0, float, lo=0.0, hi=3600.0)
         mode_txt = "固定"
 
     note = f"{mode_txt} 等待 {sec:.3f}s"
@@ -537,9 +537,7 @@ def execute_OpenApp(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
     path_raw = str(node.params.get("path", "") or "").strip()
     args_raw = str(node.params.get("args", "") or "")
     working_dir_raw = str(node.params.get("working_dir", "") or "").strip()
-    wait_sec = float(node.params.get("wait_sec_after_launch", 2.0) or 2.0)
-    if wait_sec < 0:
-        wait_sec = 0.0
+    wait_sec = param_num(node.params.get("wait_sec_after_launch"), 2.0, float, lo=0.0)
 
     if not path_raw:
         msg = "[OpenApp] path 为空，未启动任何程序。"
@@ -1384,7 +1382,7 @@ def execute_FindImage(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any])
                         elif after_action == "right_click":
                             pyautogui.rightClick()
                         # 点击后延迟（固定值）
-                        post_delay_ms = max(0, int(node.params.get("post_delay_ms", 50) or 50))
+                        post_delay_ms = param_num(node.params.get("post_delay_ms"), 50, int, lo=0)
                         if post_delay_ms > 0:
                             ctx.log(f"[FindImage] 点击后延迟 {post_delay_ms}ms 再执行下一节点", "DEBUG")
                             wait_if_paused(ctx)
@@ -1595,6 +1593,30 @@ def _target_configured(params: Dict[str, Any]) -> bool:
     return any(str(params.get(k, "") or "").strip() for k in ("target_title", "target_exe", "target_class"))
 
 
+def param_num(value, default, cast=float, lo=None, hi=None):
+    """从节点参数里安全取数：只把「真·缺失」当默认值，**合法的 0 原样保留**。
+
+    为什么需要它：`int(p.get("post_delay_ms", 50) or 50)` 这种写法里
+    `0 or 50 == 50`，用户把「延迟 / 阈值 / 时长 / 超时」填 0 会被静默改成默认值。
+    凡是参数 min 允许 0 的（“0 = 不等待 / 0 = 永不超时 / 0 = 瞬间”这类），
+    读取处都必须走这里，不能写 `x or 默认值`。
+
+    value 为 None / 空串 / 转不动的非法值 → 用 default；其余按 cast 转换，
+    再按 lo/hi 收敛。
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        value = default
+    try:
+        out = cast(value)
+    except (TypeError, ValueError):
+        out = cast(default)
+    if lo is not None:
+        out = max(lo, out)
+    if hi is not None:
+        out = min(hi, out)
+    return out
+
+
 def _target_err_msg(params: Dict[str, Any], tag: str) -> str:
     """range_mode=window 但拿不到目标窗口时的统一错误文案（区分「没配」和「没找到」）。"""
     if _target_configured(params):
@@ -1778,7 +1800,7 @@ def execute_Mouse(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
             annotate_step(ctx, node, "mouse_err", note=err[:60])
             return {}, ["err"], err
 
-    post_delay_ms = max(0, int(p.get("post_delay_ms", 50) or 50))
+    post_delay_ms = param_num(p.get("post_delay_ms"), 50, int, lo=0)
     post_range = (post_delay_ms, post_delay_ms)  # 单值区间：game_click 内部 random.randint 退化为固定
 
     with _target_window_foreground(ctx, target):
@@ -1788,7 +1810,7 @@ def execute_Mouse(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
 
             if action == "click":
                 clicks = max(1, int(p.get("click_count", 1) or 1))
-                hold_ms = max(1, int(p.get("hold_ms", 50) or 50))
+                hold_ms = param_num(p.get("hold_ms"), 50, int, lo=1)
                 hold_range = (hold_ms, hold_ms)
                 double = (clicks == 2)
                 repeat = 1 if clicks <= 2 else clicks
@@ -1812,7 +1834,7 @@ def execute_Mouse(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
             elif action == "drag":
                 from_pt = _mouse_final_pos_for(ctx, p, "from_pos", target)
                 to_pt = _mouse_final_pos_for(ctx, p, "to_pos", target)
-                dur = max(0, int(p.get("drag_duration_ms", 300) or 300))
+                dur = param_num(p.get("drag_duration_ms"), 300, int, lo=0)
                 from_x, from_y = from_pt
                 to_x, to_y = to_pt
                 _drag_btn_held = False
@@ -2134,7 +2156,7 @@ def execute_Command(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
     params = dict(node.params or {})
     cmd_template = str(params.get("command", "") or "")
     wd_template = str(params.get("working_dir", "") or "")
-    timeout_ms = max(0, int(params.get("timeout_ms", 10000) or 10000))
+    timeout_ms = param_num(params.get("timeout_ms"), 10000, int, lo=0)  # 0 = 永不超时
     capture = bool(params.get("capture_streams", True))
     shell_mode = str(params.get("shell_mode", "cmd_c") or "cmd_c")
     fail_nonzero = bool(params.get("fail_on_nonzero", False))
@@ -2306,12 +2328,9 @@ def execute_WebBrowser(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]
     # 完整路径：去掉首尾空白与可能粘上的引号（用户从资源管理器「复制为路径」会带引号）
     browser_path_raw = str(p.get("browser_path", "") or "").strip().strip('"').strip("'").strip()
 
-    # 打开后等待秒数：0 = 不等。注意不能用 `x or 默认值` 写法，那样用户填 0 会被吃成默认值。
-    _w = p.get("wait_sec_after_open", 5.0)
-    try:
-        wait_sec = max(0.0, min(float(_w if _w is not None else 5.0), 3600.0))
-    except Exception:
-        wait_sec = 5.0
+    # 打开后等待秒数：0 = 不等。走 param_num 取值——不能用 `x or 默认值`，
+    # 那样用户填 0 会被静默吃成默认值。
+    wait_sec = param_num(p.get("wait_sec_after_open"), 5.0, float, lo=0.0, hi=3600.0)
 
     try:
         wait_if_paused(ctx)
@@ -3485,7 +3504,7 @@ def execute_IfImageDetect(ctx: ExecutionContext, node: Node, inputs: Dict[str, A
 def execute_StillnessDetect(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
     """
     if_static 节点：指定 ROI 内，在「静止持续时间」内像素差 < 阈值即判定静止。
-    - roi: [x, y, w, h]
+    - roi: [x, y, w, h]（必须框选，宽/高为 0 直接走 err）
     - 超过「最大超时」仍不满足 -> no；满足 -> yes
     - 暂停检查：循环开头 + sleep 内
     """
@@ -3505,16 +3524,22 @@ def execute_StillnessDetect(ctx: ExecutionContext, node: Node, inputs: Dict[str,
         roi += [0] * (4 - len(roi))
     x, y, w, h = int(roi[0]), int(roi[1]), int(roi[2]), int(roi[3])
 
-    dt = float(p.get("diff_threshold", 0.01) or 0.01)
+    dt = param_num(p.get("diff_threshold"), 0.01, float, lo=0.0)
     stillness_seconds = max(0.1, float(p.get("stillness_seconds", 5.0) or 5.0))
     sample_interval_seconds = max(0.03, float(p.get("sample_interval_seconds", 1.0) or 1.0))
     timeout_seconds = max(1.0, float(p.get("timeout_seconds", 20.0) or 20.0))
     range_mode = str(p.get("range_mode", "window") or "window")
 
     if w <= 0 or h <= 0:
-        ctx.log("[if_static] 未设置ROI，先点右侧按钮框选区域 -> no", "WARN")
-        annotate_step(ctx, node, "static", note="ERROR: ROI empty")
-        return {}, ["no"], ""
+        # 未设置 ROI 属于「配置还没做完」，不是「画面一直在动」——
+        # 走 no（端口 label 是「超时」）会把配置错误伪装成一次正常的超时判定，
+        # 让下游以为"等够了但没静止"，真正的原因被吞掉。所以这里走 err。
+        err = ("if_static：未设置 ROI（roi 宽/高为 0）——请先在右侧面板点「🖱 框选ROI」框一个区域。"
+               "本节点判定的是「某块区域画面有没有变化」，没有 ROI 就没有判定对象，"
+               "不会静默拿整个检测范围当 ROI。")
+        ctx.log(f"[if_static] {err}", "ERROR")
+        annotate_step(ctx, node, "static", note="ERROR: ROI 未设置")
+        return {}, ["err"], err
 
     # 目标窗口解析：window 模式必须先拿到窗口，找不到直接 err（不退化为全屏）
     target = None
@@ -3545,12 +3570,26 @@ def execute_StillnessDetect(ctx: ExecutionContext, node: Node, inputs: Dict[str,
             if not getattr(ctx, "is_running", True):
                 break
             shot_bgr = None
-            try:
-                if ctx.screen is not None:
-                    ox, oy = _win_offset
-                    shot_bgr = ctx.screen.capture_region_bgr((x + ox, y + oy, w, h))
-            except Exception:
-                shot_bgr = None
+            # ① 优先后台截窗：PrintWindow(PW_RENDERFULLCONTENT)，与「截图 / 文字」节点同款。
+            #    目标窗口被别的窗口盖住时也能拿到"它自己"的实时画面；若只用屏幕抓取，
+            #    帧差比较看的会是遮挡物，判定直接失真（同一组视觉节点口径必须一致）。
+            if target is not None:
+                try:
+                    from src.blueprint.runtime.screen_capture import capture_window_bgr
+                    _win_img = capture_window_bgr(target[0])
+                except Exception:
+                    _win_img = None
+                if _win_img is not None:
+                    shot_bgr = _crop_roi(_win_img, (x, y, w, h))
+            # ② 回退：屏幕抓取（同一 ROI 口径，window 模式下加窗口左上角偏移）。
+            #    截窗失败（最小化/拒绝渲染）或 ROI 越界时走这里。
+            if shot_bgr is None:
+                try:
+                    if ctx.screen is not None:
+                        ox, oy = _win_offset
+                        shot_bgr = ctx.screen.capture_region_bgr((x + ox, y + oy, w, h))
+                except Exception:
+                    shot_bgr = None
             if shot_bgr is None:
                 # 截图失败不立即终止，等待下一帧重试
                 time.sleep(min(0.5, interval_s))

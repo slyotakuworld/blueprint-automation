@@ -1941,15 +1941,15 @@ class InspectorPanel(QWidget):
             except Exception as e:
                 print(f"[Inspector] FindImage UI 出错: {e}")
 
-        # 7) Mouse 专属：根据 action 分组动态显隐参数，追加提示Label
+        # 7) Mouse 专属：根据 action 分组动态显隐参数（只在既有行上切换显隐，不插入任何提示行）
         if node.type == "Mouse":
             try:
-                self._apply_mouse_action_visibility(initial=True)
+                self._apply_mouse_action_visibility()
                 # 绑定 action 下拉框变化，实时切分组
                 w_action = self._widgets.get("action")
                 if isinstance(w_action, QComboBox):
                     self._connect_aux("mouse.action", w_action.currentIndexChanged,
-                                      lambda *_: self._apply_mouse_action_visibility(initial=False))
+                                      lambda *_: self._apply_mouse_action_visibility())
                 # 绑定 range_mode 下拉框变化，切换目标窗口参数显隐 + 工具栏按钮
                 w_cm = self._widgets.get("range_mode")
                 if isinstance(w_cm, QComboBox):
@@ -3964,8 +3964,10 @@ class InspectorPanel(QWidget):
         x, y, w, h = roi
         has_roi = (w > 0 and h > 0)
 
-        title = QLabel("⏸️ 静止 ROI（Region Of Interest）")
-        title.setStyleSheet("color: #ff7043; font-weight: bold; font-size: 10px;")
+        # 标题与「截图 / 文字」节点（_append_snip_roi_preview）同款：
+        # 用户要求预览图上方就写「ROI 预览」，不再用「⏸️ 静止 ROI（Region Of Interest）」。
+        title = QLabel("🖼️ ROI 预览")
+        title.setStyleSheet("color:#29b6f6; font-weight:bold; font-size:10px;")
         self._form.addRow(title)
 
         # 位置/尺寸信息行：与「截图 / 文字」节点（_append_snip_roi_preview）逐字一致。
@@ -4000,7 +4002,7 @@ class InspectorPanel(QWidget):
     # ================================================================
     # Mouse 专属：按 action 分组显隐参数（避免20+参数一次性糊给用户）
     # ================================================================
-    def _apply_mouse_action_visibility(self, initial: bool = False):
+    def _apply_mouse_action_visibility(self):
         node = self._current_node
         if node is None or node.type != "Mouse":
             return
@@ -4030,23 +4032,6 @@ class InspectorPanel(QWidget):
             "scroll_dy": ["scroll"],
             "scroll_steps": ["scroll"],
         }
-        # 初始调用时：在 form 顶部加一个 action 分组提示标题（用QGroupBox更清晰，这里用一个Label简化）
-        if initial:
-            # 遍历找到第几个参数，在 action 下面插入提示
-            tip_text_map = {
-                "click": "🖱 【点击模式】：在目标位置单击/双击/三击指定按键",
-                "move": "✈️ 【移动模式】：把光标移到目标位置（不点）",
-                "drag": "🔗 【拖拽模式】：从起点按住→移动→释放到终点（原子组合）",
-                "scroll": "🎡 【滚动模式】：在目标位置滚滚轮（垂直/水平）",
-            }
-            title_lbl = QLabel("🖱 鼠标 · 按当前 action 显示/隐藏对应参数")
-            title_lbl.setStyleSheet("color: #ff9800; font-weight: bold; font-size: 10px;")
-            sep = QFrame(); sep.setFrameShape(QFrame.HLine); sep.setStyleSheet("color: #2D333B;")
-            # 在 form 顶部（标题下面）插入分隔 + 提示
-            existing_rows = self._form.rowCount()
-            if existing_rows > 0:
-                self._form.insertRow(0, sep)
-                self._form.insertRow(0, title_lbl)
         # 遍历所有分组参数，按 action 控制显隐
         for param_name, visible_actions in groups.items():
             w = self._widgets.get(param_name)
@@ -4094,7 +4079,7 @@ class InspectorPanel(QWidget):
 
     def _on_mouse_range_mode_changed(self):
         """range_mode 切换时：刷新目标窗口参数显隐 + 刷新工具栏按钮"""
-        self._apply_mouse_action_visibility(initial=False)
+        self._apply_mouse_action_visibility()
         self._populate_action_bar(self._current_node)
 
     def _apply_loop_infinite_visibility(self):

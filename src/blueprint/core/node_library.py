@@ -154,6 +154,31 @@ def _data_out(name, data_type="any", label=""):
     return Port(name=name, type=PortType.DATA, direction=PortDirection.OUT, data_type=data_type, label=label or name)
 
 
+def _target_locator_params(scope_label: str) -> List[ParamDef]:
+    """「目标窗口定位三件套」（标题 / 程序名 / 类名）的公用构造。
+
+    找图 / 鼠标 / 检测 / 静止 / 截图 / 文字 六个节点的这套参数**逐字相同**，只有
+    help 里那句「仅「X=目标窗口」时生效」的 X 不一样（X 是本节点里 range_mode 的标签：
+    找图范围 / 坐标基准 / 检测范围 / 截取范围 / 识别范围），所以由调用方把标签传进来。
+
+    为什么必须共用：运行时这六个节点定位窗口走的是同一套
+    `executor._resolve_target_rect`（title 子串 / exe 子串 / class 全等）。
+    参数文案各写各的，改一处忘一处就会出现「文档说有、实际没有」的假文档。
+    """
+    return [
+        ParamDef(name="target_title", editor=EDITOR_STRING, default="",
+                 label="目标窗口·标题",
+                 help=f"仅「{scope_label}=目标窗口」时生效。窗口标题子串匹配，支持 {{变量}} 插值。\n"
+                      "三个条件（标题/程序名/类名）至少填一个。\n点上方「🎯 拾取目标窗口」按钮可自动填充。"),
+        ParamDef(name="target_exe", editor=EDITOR_STRING, default="",
+                 label="目标窗口·程序名",
+                 help=f"仅「{scope_label}=目标窗口」时生效。程序名子串匹配（如 notepad.exe），支持 {{变量}} 插值。留空=不按程序名匹配。"),
+        ParamDef(name="target_class", editor=EDITOR_STRING, default="",
+                 label="目标窗口·类名",
+                 help=f"仅「{scope_label}=目标窗口」时生效。窗口类名精确匹配，支持 {{变量}} 插值。留空=不按类名匹配。"),
+    ]
+
+
 # ============================================================
 # 16 个 MVP 节点定义
 # ============================================================
@@ -444,16 +469,8 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
                      help="目标窗口(window)：只在下面「目标窗口」定位到的那个窗口范围内找图，输出坐标也是相对该窗口左上角的（配合鼠标节点「目标窗口」模式使用）；\n"
                           "全屏(fullscreen)：在整块屏幕上找图，输出坐标为绝对屏幕坐标（配合鼠标节点「全屏」模式使用）。\n"
                           "选「目标窗口」时，窗口没找到会直接走「失败」出口，不会退化成全屏去找。"),
-            # 目标窗口定位（仅 range_mode=window 时生效）
-            ParamDef(name="target_title", editor=EDITOR_STRING, default="",
-                     label="目标窗口·标题",
-                     help="仅「找图范围=目标窗口」时生效。窗口标题子串匹配，支持 {变量} 插值。\n三个条件（标题/程序名/类名）至少填一个。\n点上方「🎯 拾取目标窗口」按钮可自动填充。"),
-            ParamDef(name="target_exe", editor=EDITOR_STRING, default="",
-                     label="目标窗口·程序名",
-                     help="仅「找图范围=目标窗口」时生效。程序名子串匹配（如 notepad.exe），支持 {变量} 插值。留空=不按程序名匹配。"),
-            ParamDef(name="target_class", editor=EDITOR_STRING, default="",
-                     label="目标窗口·类名",
-                     help="仅「找图范围=目标窗口」时生效。窗口类名精确匹配，支持 {变量} 插值。留空=不按类名匹配。"),
+            # 目标窗口定位（仅 range_mode=window 时生效）——定位三件套与其余五个节点共用
+            *_target_locator_params("找图范围"),
             # 匹配参数（算法 + 阈值相邻，便于一起调）
             ParamDef(
                 name="match_strategy",
@@ -478,8 +495,8 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
                      help="在超时时间内会根据自动滚动设置反复重试，直到找到或超时。"),
             ParamDef(name="template", editor=EDITOR_PATH, default="", label="模板路径",
                      help="要查找的图片文件路径（PNG/JPG/BMP等），也可点上面工具栏「📸 截取目标」或「📂 导入图片」直接选择，自动写入路径+预览。"),
-            ParamDef(name="template_b64", editor=EDITOR_STRING, default="", label="模板预览图(只读)",
-                     help="通过「📸 截取目标」/「📂 导入图片」时会写入b64缩略图，便于画布节点直接预览。"),
+            ParamDef(name="template_b64", editor=EDITOR_STRING, default="", label="模板预览图(内部字段)",
+                     help="内部字段：由上方「📸 截取目标」/「📂 导入图片」写入的模板缩略图(b64)，供画布节点直接预览。\n面板不渲染这一行（属机器托管数据），无需手填。"),
             # 未找到时滚动重试
             ParamDef(name="scroll_dy", editor=EDITOR_INT, default=0, label="滚动量(0=不滚动)", min=-5000, max=5000, step=1,
                      help="鼠标滚轮滚动量，单位是「滚轮刻度数」（1 刻度 ≈ 滚轮拨一格）。0=不滚动；"
@@ -601,7 +618,7 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         type="Mouse",
         category=CATEGORY_EXECUTE,
         title="鼠标",
-        description="鼠标交给咱啦~点击、按住、释放、移动、拖拽、滚轮随便选，坐标既能去屏幕上点着选，也能从上游找图节点直接连线传过来更省心哟。",
+        description="鼠标交给咱啦~点击、移动、拖拽、滚轮随便选，坐标既能去屏幕上点着选，也能从上游找图节点直接连线传过来更省心哟。",
         color="#ef6c00",
         accent="#ff9800",
         inputs=[
@@ -621,16 +638,8 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
                      help="目标窗口(window)：坐标基于下方「目标窗口」定位到的那个窗口左上角，拾取时自动扣除窗口偏移（配合找图节点的「目标窗口」范围使用）；\n"
                           "全屏(fullscreen)：坐标基于屏幕左上角（绝对屏幕坐标）。\n"
                           "选「目标窗口」时，窗口没找到会直接走「失败」出口，不会按绝对坐标硬点。"),
-            # 1.5) 目标窗口定位（仅 range_mode=window 时生效）
-            ParamDef(name="target_title", editor=EDITOR_STRING, default="",
-                     label="目标窗口·标题",
-                     help="仅「坐标基准=目标窗口」时生效。窗口标题子串匹配，支持 {变量} 插值。\n三个条件（标题/程序名/类名）至少填一个。\n点上方「🎯 拾取目标窗口」按钮可自动填充。"),
-            ParamDef(name="target_exe", editor=EDITOR_STRING, default="",
-                     label="目标窗口·程序名",
-                     help="仅「坐标基准=目标窗口」时生效。程序名子串匹配（如 notepad.exe），支持 {变量} 插值。留空=不按程序名匹配。"),
-            ParamDef(name="target_class", editor=EDITOR_STRING, default="",
-                     label="目标窗口·类名",
-                     help="仅「坐标基准=目标窗口」时生效。窗口类名精确匹配，支持 {变量} 插值。留空=不按类名匹配。"),
+            # 1.5) 目标窗口定位（仅 range_mode=window 时生效）——定位三件套与其他节点共用
+            *_target_locator_params("坐标基准"),
             # 2) 动作类型（第二位）
             ParamDef(name="action", editor=EDITOR_ENUM, default="click",
                      options=["click", "move", "drag", "scroll"],
@@ -641,7 +650,7 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
                      label="动作类型",
                      help="切换动作后，下方仅显示该动作用得上的参数。"),
 
-            # --- 目标点（click/press/move/scroll 用）---
+            # --- 目标点（click/move/scroll 用）---
             ParamDef(name="pos", editor=EDITOR_TUPLE2, default=(0, 0), label="目标点",
                      pick_coord=True,
                      help="鼠标操作的目标坐标 (X, Y)。点 📍 按钮可在屏幕上拾取坐标。"),
@@ -663,7 +672,7 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
                          "left": "左键", "right": "右键",
                      },
                      label="鼠标按键",
-                     help="点击/按住使用的鼠标键。"),
+                     help="点击 / 拖拽使用的鼠标键。"),
             ParamDef(name="click_count", editor=EDITOR_INT, default=1, min=1, max=3,
                      label="点击次数", help='1=单击 2=双击 3=三击'),
             ParamDef(name="hold_ms", editor=EDITOR_INT, default=50, min=1, max=5000,
@@ -901,7 +910,7 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         type="IfImageDetect",
         category=CATEGORY_VISION,
         title="检测",
-        description="当下就检查好几张图是不是都在屏幕上~完全求值全中才走「检测到」，短路缺一张就立马否决，一真即真（逻辑或）只要撞见任意一张中就喊「检测到」；只瞅当下这一眼，不会等太久哟。\n注意：完全模式下如果未添加任何检测图片，将直接走「未检测到」分支（空集视为未匹配）。",
+        description="当下就检查好几张图是不是都在屏幕上~完全求值全中才走「检测到」，短路缺一张就立马否决，一真即真（逻辑或）只要撞见任意一张中就喊「检测到」；只瞅当下这一眼，不会等太久哟。\n注意：未添加任何检测图片时（完全求值 / 短路 / 一真即真都一样），将直接走「未检测到」分支（空集视为未匹配）。",
         color="#ef6c00",
         accent="#ff9800",
         inputs=[_exec_in()],
@@ -919,16 +928,8 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
                      help="目标窗口(window)：只在下面「目标窗口」定位到的那个窗口范围内检测，确保所有模板都在同一个窗口内找到，避免跨窗口误匹配；\n"
                           "全屏(fullscreen)：在整块屏幕上检测，可能把不同窗口的相似图案误判为同一目标。\n"
                           "选「目标窗口」时，窗口没找到会直接走「失败」出口，不会退化成全屏去检测。"),
-            # 目标窗口定位（仅 range_mode=window 时生效）
-            ParamDef(name="target_title", editor=EDITOR_STRING, default="",
-                     label="目标窗口·标题",
-                     help="仅「检测范围=目标窗口」时生效。窗口标题子串匹配，支持 {变量} 插值。\n三个条件（标题/程序名/类名）至少填一个。\n点上方「🎯 拾取目标窗口」按钮可自动填充。"),
-            ParamDef(name="target_exe", editor=EDITOR_STRING, default="",
-                     label="目标窗口·程序名",
-                     help="仅「检测范围=目标窗口」时生效。程序名子串匹配（如 notepad.exe），支持 {变量} 插值。留空=不按程序名匹配。"),
-            ParamDef(name="target_class", editor=EDITOR_STRING, default="",
-                     label="目标窗口·类名",
-                     help="仅「检测范围=目标窗口」时生效。窗口类名精确匹配，支持 {变量} 插值。留空=不按类名匹配。"),
+            # 目标窗口定位（仅 range_mode=window 时生效）——定位三件套与其他节点共用
+            *_target_locator_params("检测范围"),
             # 匹配参数（算法 + 阈值相邻，便于一起调）
             ParamDef(
                 name="match_strategy",
@@ -986,7 +987,7 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         type="StillnessDetect",
         category=CATEGORY_VISION,
         title="静止",
-        description="盯着屏幕上一块区域看~画面安安静静不变就走yes，等太久还在动就超时走no，用来等加载结束最合适啦。",
+        description="盯着屏幕上一块区域看~画面安安静静不变就走yes，等太久还在动就超时走no，用来等加载结束最合适啦。区域要先用「🖱 框选ROI」框出来，没框就属于还没配好，直接走「失败」。",
         color="#d84315",
         accent="#ff7043",
         inputs=[_exec_in()],
@@ -1004,20 +1005,12 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
                      help="目标窗口(window)：ROI 坐标基于下方「目标窗口」定位到的那个窗口左上角，窗口移动 ROI 跟着移动；\n"
                           "全屏(fullscreen)：ROI 坐标基于屏幕左上角，固定不变。\n"
                           "选「目标窗口」时，窗口没找到会直接走「失败」出口，不会退化成全屏去检测。"),
-            # 目标窗口定位（仅 range_mode=window 时生效）
-            ParamDef(name="target_title", editor=EDITOR_STRING, default="",
-                     label="目标窗口·标题",
-                     help="仅「检测范围=目标窗口」时生效。窗口标题子串匹配，支持 {变量} 插值。\n三个条件（标题/程序名/类名）至少填一个。\n点上方「🎯 拾取目标窗口」按钮可自动填充。"),
-            ParamDef(name="target_exe", editor=EDITOR_STRING, default="",
-                     label="目标窗口·程序名",
-                     help="仅「检测范围=目标窗口」时生效。程序名子串匹配（如 notepad.exe），支持 {变量} 插值。留空=不按程序名匹配。"),
-            ParamDef(name="target_class", editor=EDITOR_STRING, default="",
-                     label="目标窗口·类名",
-                     help="仅「检测范围=目标窗口」时生效。窗口类名精确匹配，支持 {变量} 插值。留空=不按类名匹配。"),
+            # 目标窗口定位（仅 range_mode=window 时生效）——定位三件套与其他节点共用
+            *_target_locator_params("检测范围"),
             # ROI：与「截图 / 文字」节点同款 TUPLE4（四个自旋框），不再是手填字符串
             ParamDef(name="roi", editor=EDITOR_TUPLE4, default=(0, 0, 0, 0),
                      label="ROI区域(x,y,w,h)",
-                     help="相对「检测范围」左上角的区域 (x, y, w, h)。全 0 = 检测整个范围。\n点上方「📍 框选ROI区域」按钮自动填写，一般无需手填。"),
+                     help="相对「检测范围」左上角的区域 (x, y, w, h)。**必须框选**：宽或高为 0（未框选）时本节点直接走「失败」出口，不会拿整个范围去判定。\n点上方「🖱 框选ROI」按钮自动填写，一般无需手填。"),
             ParamDef(name="roi_preview_b64", editor=EDITOR_STRING, default="",
                      label="ROI缩略图(只读)",
                      help="框选 ROI 时写入的缩略图，便于画布/面板预览，无需手填。"),
@@ -1087,15 +1080,8 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
                      help="目标窗口(window)：截「目标窗口」定位到的那个窗口；\n"
                           "全屏(fullscreen)：截整个虚拟桌面。\n"
                           "选「目标窗口」时，窗口没找到会直接走「失败」出口，不会退化成截全屏。"),
-            ParamDef(name="target_title", editor=EDITOR_STRING, default="",
-                     label="目标窗口·标题",
-                     help="仅「截取范围=目标窗口」时生效。窗口标题子串匹配，支持 {变量} 插值。\n三个条件（标题/程序名/类名）至少填一个。\n点上方「🎯 拾取目标窗口」按钮可自动填充。"),
-            ParamDef(name="target_exe", editor=EDITOR_STRING, default="",
-                     label="目标窗口·程序名",
-                     help="仅「截取范围=目标窗口」时生效。程序名子串匹配（如 notepad.exe），支持 {变量} 插值。留空=不按程序名匹配。"),
-            ParamDef(name="target_class", editor=EDITOR_STRING, default="",
-                     label="目标窗口·类名",
-                     help="仅「截取范围=目标窗口」时生效。窗口类名精确匹配，支持 {变量} 插值。留空=不按类名匹配。"),
+            # 目标窗口定位三件套（与其他节点共用，见 _target_locator_params）
+            *_target_locator_params("截取范围"),
             ParamDef(name="roi", editor=EDITOR_TUPLE4, default=(0, 0, 0, 0),
                      label="ROI区域(x,y,w,h)",
                      help="相对「截取范围」左上角的区域 (x, y, w, h)。全 0 = 截整个范围。"),
@@ -1112,7 +1098,7 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         type="OcrRecognize",
         category=CATEGORY_VISION,
         title="文字",
-        description="用内置 OCR 引擎识别屏幕上的文字和数字~按「识别范围」现场截图（目标窗口 / 全屏），输出整屏文本和逐条识别结果；还能填一段文本或正则表达式去匹配整屏文本，命中走「匹配到」、没命中走「未匹配到」，一条文字都没识别到则单独走「无文字」。",
+        description="用内置 OCR 引擎识别屏幕上的文字和数字~按「识别范围」现场截图（目标窗口 / 全屏），输出整屏文本和逐条识别结果；还能填一段文本或正则表达式去匹配整屏文本，命中走「匹配到」、没命中走「未匹配到」；一条文字都没识别到就走「无文字」（与「失败」分开，属于正常业务结果，同时也会触发「完成」）。",
         color="#0b3d61",
         accent="#29b6f6",
         inputs=[
@@ -1135,16 +1121,8 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
                      help="目标窗口(window)：只在下面「目标窗口」定位到的那个窗口内截图识别，ROI 坐标相对该窗口左上角；\n"
                           "全屏(fullscreen)：在整块屏幕上截图识别，ROI 坐标相对屏幕左上角。\n"
                           "选「目标窗口」时，窗口没找到会直接走「失败」出口，不会退化成截全屏。"),
-            # 目标窗口定位（仅 range_mode=window 时生效）
-            ParamDef(name="target_title", editor=EDITOR_STRING, default="",
-                     label="目标窗口·标题",
-                     help="仅「识别范围=目标窗口」时生效。窗口标题子串匹配，支持 {变量} 插值。\n三个条件（标题/程序名/类名）至少填一个。\n点上方「🎯 拾取目标窗口」按钮可自动填充。"),
-            ParamDef(name="target_exe", editor=EDITOR_STRING, default="",
-                     label="目标窗口·程序名",
-                     help="仅「识别范围=目标窗口」时生效。程序名子串匹配（如 notepad.exe），支持 {变量} 插值。留空=不按程序名匹配。"),
-            ParamDef(name="target_class", editor=EDITOR_STRING, default="",
-                     label="目标窗口·类名",
-                     help="仅「识别范围=目标窗口」时生效。窗口类名精确匹配，支持 {变量} 插值。留空=不按类名匹配。"),
+            # 目标窗口定位（仅 range_mode=window 时生效）——定位三件套与其他节点共用
+            *_target_locator_params("识别范围"),
             ParamDef(name="roi", editor=EDITOR_TUPLE4, default=(0, 0, 0, 0),
                      label="ROI区域(x,y,w,h)",
                      help="相对「识别范围」左上角的区域 (x, y, w, h)。全 0 = 识别整个范围。"),

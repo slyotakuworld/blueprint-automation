@@ -208,6 +208,21 @@ def range_display(p: dict) -> str:
             or "未设置")
 
 
+def _param_num(value, default):
+    """画布摘要取数：只把「真·缺失」当默认值，合法的 0 原样保留。
+
+    与 executor.param_num 同一口径（这里刻意不跨层 import，UI 模块不依赖 runtime）。
+    典型受害者：Wait 的 seconds/min_seconds、Loop 的 interval_sec —— 参数 min=0，
+    画布上原本会把用户填的 0 显示成默认值 1，与运行时实际等待时间对不上。
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return float(default)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
 # ============================================================
 # 尺寸常量
 # ============================================================
@@ -503,7 +518,7 @@ class NodeItem(QGraphicsObject):
             return "并行体（双击进入子画布）"
         if t == "Loop":
             infinite = bool(p.get("infinite", False))
-            interval = float(p.get("interval_sec", 1.0) or 1.0)
+            interval = _param_num(p.get("interval_sec"), 1.0)
             if infinite:
                 return f"∞ 无限循环  间隔{interval:g}s"
             max_it = int(p.get("max_iterations", 5) or 5)
@@ -542,40 +557,6 @@ class NodeItem(QGraphicsObject):
             mode = str(p.get("mode", "read") or "read")
             mode_map = {"read": "读取", "write": "写入", "clear": "清空"}
             return f"[{mode_map.get(mode, mode)}]"
-        if t == "Mouse":
-            range_mode = str(p.get("range_mode", "window") or "window")
-            coord_txt = "窗口" if range_mode == "window" else "全屏"
-            action = str(p.get("action", "click") or "click")
-            action_map = {
-                "click": "点击",
-                "move": "移动", "drag": "拖拽", "scroll": "滚动",
-            }
-            action_txt = action_map.get(action, action)
-            # 附加关键信息
-            extra = ""
-            if action in ("click", "drag"):
-                btn = str(p.get("button", "left") or "left")
-                btn_map = {"left": "左", "right": "右"}
-                extra = btn_map.get(btn, btn)
-                if action == "click":
-                    cnt = int(p.get("click_count", 1) or 1)
-                    if cnt >= 2:
-                        extra += f"x{cnt}"
-            elif action == "scroll":
-                dy = int(p.get("scroll_dy", 0) or 0)
-                extra = f"{'上' if dy > 0 else '下'}{abs(dy)}px"
-            # 坐标点
-            pos_txt = ""
-            if action in ("click", "move", "scroll"):
-                pos_val = p.get("pos", (0, 0))
-                if isinstance(pos_val, (tuple, list)) and len(pos_val) == 2:
-                    pos_txt = f" ({int(pos_val[0])},{int(pos_val[1])})"
-            elif action == "drag":
-                from_val = p.get("from_pos", (0, 0))
-                to_val = p.get("to_pos", (0, 0))
-                if isinstance(from_val, (tuple, list)) and isinstance(to_val, (tuple, list)):
-                    pos_txt = f" ({int(from_val[0])},{int(from_val[1])})→({int(to_val[0])},{int(to_val[1])})"
-            return f"[{coord_txt}][{action_txt}] {extra}{pos_txt}".strip()
         if t == "PressKey":
             kb_mode = str(p.get("kb_mode", "text") or "text")
             if kb_mode == "text":
@@ -609,11 +590,11 @@ class NodeItem(QGraphicsObject):
         if t == "Wait":
             delay_type = str(p.get("delay_type", "fixed") or "fixed")
             if delay_type == "random":
-                min_s = float(p.get("min_seconds", 1.0) or 1.0)
-                max_s = float(p.get("max_seconds", 3.0) or 3.0)
+                min_s = _param_num(p.get("min_seconds"), 1.0)
+                max_s = _param_num(p.get("max_seconds"), 3.0)
                 return f"[随机] {min_s:g}~{max_s:g}s"
             else:
-                sec = float(p.get("seconds", 1.0) or 1.0)
+                sec = _param_num(p.get("seconds"), 1.0)
                 return f"[固定] {sec:g}s"
         return ""
 
@@ -623,6 +604,37 @@ class NodeItem(QGraphicsObject):
         n = self.node
         p = n.params or {}
         t = n.type
+        if t == "Mouse":
+            # 画布只展示「坐标基准 + 动作类型 + 鼠标按键 + 次数」四件事，
+            # 刻意**不写具体坐标**（用户明确）：坐标是每次执行都可能变的细节，
+            # 画布上留给能一眼认出"这个鼠标节点是干嘛的"的信息。
+            #
+            # 坐标基准的展示口径与「文字 / 检测 / 静止 / 截图」的「范围」**完全一致**：
+            # 首行 `🎯 <range_display>`（全屏 / 目标窗口标题(或程序名/类名) / 未设置），
+            # 而不是只写 `[窗口]/[全屏]` 这种分叉标记 —— 用户明确要求"参考文字节点"。
+            # （Mouse 的 `range_mode` + 定位三件套与视觉节点同键，可直接复用 range_display。）
+            action = str(p.get("action", "click") or "click")
+            action_map = {
+                "click": "点击", "move": "移动", "drag": "拖拽", "scroll": "滚动",
+            }
+            parts: List[str] = ["🖱", action_map.get(action, action)]
+            btn = str(p.get("button", "left") or "left")
+            if action in ("click", "drag"):
+                parts.append({"left": "左键", "right": "右键"}.get(btn, btn))
+            if action == "click":
+                # 次数始终显示（x1 / x2 / x3）：用户点名「次数」属于要在画布上看到的信息，
+                # 单击时的 x1 也照写，避免"这一次是几连击"要靠默认值去猜。
+                cnt = int(p.get("click_count", 1) or 1)
+                parts.append(f"x{cnt}")
+            elif action == "scroll":
+                # 滚动没有按键，这里用「次数」位表达方向+重复次数（方向不是坐标，保留）
+                steps = int(p.get("scroll_steps", 1) or 1)
+                dy = int(p.get("scroll_dy", 0) or 0)
+                parts.append(f"{'上' if dy > 0 else '下'}x{steps}" if dy else f"x{steps}")
+            return [
+                f"🎯 {range_display(p)}",
+                " ".join(parts),
+            ]
         if t == "StillnessDetect":
             still_s = float(p.get("stillness_seconds", 5.0) or 5.0)
             samp_s = float(p.get("sample_interval_seconds", 1.0) or 1.0)

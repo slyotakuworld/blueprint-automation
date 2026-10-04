@@ -88,6 +88,35 @@ def validate_graph(graph: BlueprintGraph) -> List[ValidationIssue]:
                         "", e.id,
                     )
                 )
+
+    # 7. 坐标基准配对：FindImage.out_pos → Mouse.in_pos 两边 range_mode 必须一致
+    #
+    # FindImage 的 out_pos 是「按自己 range_mode 换算过的坐标」：
+    #   · fullscreen → 绝对屏幕坐标
+    #   · window     → 相对目标窗口左上角的坐标
+    # Mouse 拿到 in_pos 后又会按**自己的** range_mode 再换算一次，所以两边基准不一致时
+    # 会重复叠加（或漏掉）一次窗口偏移 —— 点是能点上，但位置系统性偏掉，且运行时不报错。
+    # 这类"静默做错事"必须在跑之前就说出来，所以放在静态校验里。
+    _BASE_CN = {"window": "目标窗口", "fullscreen": "全屏"}
+    for e in graph.edges.values():
+        fn, tn = nodes_by_id.get(e.from_node), nodes_by_id.get(e.to_node)
+        if not (fn and tn):
+            continue
+        if (fn.type == "FindImage" and tn.type == "Mouse"
+                and e.from_port == "out_pos" and e.to_port == "in_pos"):
+            fmode = str(fn.params.get("range_mode", "window") or "window")
+            tmode = str(tn.params.get("range_mode", "window") or "window")
+            if fmode != tmode:
+                issues.append(
+                    ValidationIssue(
+                        "WARN", "POS_BASE_MISMATCH",
+                        f"坐标基准不一致：FindImage「找图范围」= {_BASE_CN.get(fmode, fmode)}，"
+                        f"Mouse「坐标基准」= {_BASE_CN.get(tmode, tmode)}。"
+                        f"找图输出的坐标会按 Mouse 的基准再换算一次，点击位置会整体偏掉。"
+                        f"请把两边的基准改成一致。",
+                        tn.id, e.id,
+                    )
+                )
     return issues
 
 
