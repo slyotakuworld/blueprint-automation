@@ -426,11 +426,13 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         inputs=[
             _exec_in(),
         ],
+        # 端口顺序 = 画布上的显示顺序。按「执行 → 找到 / 没找到 → 失败 → 位置」排，
+        # 让「失败（窗口没定位到这类硬错）」紧挨在数据出口前面，与描述里的语义顺序一致。
         outputs=[
             _exec_out("out_exec", label="执行"),
-            _exec_out("err", label="失败"),
             _exec_out("found", label="成功找到"),
             _exec_out("not_found", label="没有找到"),
+            _exec_out("err", label="失败"),
             _data_out("out_pos", "tuple2", label="位置"),
         ],
         params=[
@@ -1012,6 +1014,13 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
             ParamDef(name="target_class", editor=EDITOR_STRING, default="",
                      label="目标窗口·类名",
                      help="仅「检测范围=目标窗口」时生效。窗口类名精确匹配，支持 {变量} 插值。留空=不按类名匹配。"),
+            # ROI：与「截图 / 文字」节点同款 TUPLE4（四个自旋框），不再是手填字符串
+            ParamDef(name="roi", editor=EDITOR_TUPLE4, default=(0, 0, 0, 0),
+                     label="ROI区域(x,y,w,h)",
+                     help="相对「检测范围」左上角的区域 (x, y, w, h)。全 0 = 检测整个范围。\n点上方「📍 框选ROI区域」按钮自动填写，一般无需手填。"),
+            ParamDef(name="roi_preview_b64", editor=EDITOR_STRING, default="",
+                     label="ROI缩略图(只读)",
+                     help="框选 ROI 时写入的缩略图，便于画布/面板预览，无需手填。"),
             ParamDef(
                 name="stillness_seconds",
                 editor=EDITOR_FLOAT,
@@ -1041,20 +1050,6 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
                 step=0.1,
                 label="采样间隔(秒)",
                 help="多久采样一次屏幕做帧差比较，默认 1 秒",
-            ),
-            ParamDef(
-                name="roi",
-                editor=EDITOR_STRING,
-                default="[0,0,0,0]",
-                label="ROI区域(x,y,w,h)",
-                help="相对「检测范围」左上角的区域 [x, y, w, h]。全 0 = 检测整个范围。\n点上方「📍 框选ROI区域」按钮自动填写，一般无需手填。",
-            ),
-            ParamDef(
-                name="roi_preview_b64",
-                editor=EDITOR_STRING,
-                default="",
-                label="ROI缩略图(只读)",
-                help="框选 ROI 时写入的缩略图，便于画布/面板预览，无需手填。",
             ),
             ParamDef(
                 name="diff_threshold",

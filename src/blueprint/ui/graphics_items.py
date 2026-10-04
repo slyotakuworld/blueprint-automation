@@ -190,6 +190,25 @@ def color_for_data(dt: str) -> QColor:
 
 
 # ============================================================
+# 摘要共建：五个视觉节点共用的「范围」显示口径
+# ============================================================
+def range_display(p: dict) -> str:
+    """画布摘要：把「范围」渲染成一行短文本（全屏 / 目标窗口 / 未设置）。
+
+    找图 / 检测 / 截图 / 静止 / 文字 五个"视觉节点"共用同一口径 —— 这五个节点
+    运行时定位窗口走的是同一套 `executor._find_window_3d`（title 子串 / exe 子串 /
+    class 全等），所以画布上显示的也必须是同一句话，不能各写各的。
+    """
+    p = p or {}
+    if str(p.get("range_mode", "window") or "window") == "fullscreen":
+        return "全屏"
+    return (str(p.get("target_title", "") or "").strip()
+            or str(p.get("target_exe", "") or "").strip()
+            or str(p.get("target_class", "") or "").strip()
+            or "未设置")
+
+
+# ============================================================
 # 尺寸常量
 # ============================================================
 NODE_WIDTH = 200
@@ -606,27 +625,16 @@ class NodeItem(QGraphicsObject):
         t = n.type
         if t == "StillnessDetect":
             still_s = float(p.get("stillness_seconds", 5.0) or 5.0)
-            tout_s = float(p.get("timeout_seconds", 20.0) or 20.0)
             samp_s = float(p.get("sample_interval_seconds", 1.0) or 1.0)
+            # 只写「在哪儿检测」+「等多久」。
+            # · 超时不写（用户明确：静止节点画布不需要超时信息）；
+            # · ROI 也不写文字（用户明确：这三个视觉节点只要"范围 + ROI 预览图"），
+            #   ROI 内容由下面的缩略图直接体现。
+            # ⚠ 静止 + 间隔挤一行要量宽度：实测最坏（3600s / 60s）140px < 可用 184px，安全。
             lines = [
-                f"⏱ 静止持续 {still_s:g}s  |  ⏰ 超时 {tout_s:g}s  |  📷 间隔 {samp_s:g}s",
+                f"🎯 {range_display(p)}",
+                f"⏱ 静止 {still_s:g}s   📷 间隔 {samp_s:g}s",
             ]
-            roi_raw = p.get("roi", "[0,0,0,0]")
-            try:
-                if isinstance(roi_raw, str) and roi_raw:
-                    import json as _json
-                    roi = [int(v) for v in _json.loads(roi_raw)]
-                elif isinstance(roi_raw, (list, tuple)) and len(roi_raw) >= 4:
-                    roi = [int(v) for v in list(roi_raw)[:4]]
-                else:
-                    roi = [0, 0, 0, 0]
-            except Exception:
-                roi = [0, 0, 0, 0]
-            if len(roi) >= 4 and roi[2] > 0 and roi[3] > 0:
-                x, y, w, h = roi[0], roi[1], roi[2], roi[3]
-                lines.append(f"🎯 ROI: ({x},{y}) {w}×{h}")
-            else:
-                lines.append("🎯 ROI: （未设置）")
             # 如果有预览图，预留预览占位行（实际图像由paint方法绘制）
             b64 = str(p.get("roi_preview_b64", "") or "")
             if b64:
@@ -637,14 +645,7 @@ class NodeItem(QGraphicsObject):
             algo_map = {"hybrid": "智能混合", "template": "模板匹配", "gray": "灰度匹配"}
             algo_txt = algo_map.get(algo, algo)
             # 目标窗口（只读定位三件套；全屏模式直接写「全屏」）
-            rm = str(p.get("range_mode", "window") or "window")
-            if rm == "fullscreen":
-                win_txt = "全屏"
-            else:
-                win_txt = (str(p.get("target_title", "") or "").strip()
-                           or str(p.get("target_exe", "") or "").strip()
-                           or str(p.get("target_class", "") or "").strip()
-                           or "未设置")
+            win_txt = range_display(p)
             # 找到后执行
             act = str(p.get("after_action", "none") or "none")
             act_map = {
@@ -677,8 +678,9 @@ class NodeItem(QGraphicsObject):
             algo = str(p.get("match_strategy", "hybrid") or "hybrid")
             algo_map = {"hybrid": "智能混合", "template": "模板匹配", "gray": "灰度匹配"}
             algo_txt = algo_map.get(algo, algo)
-            thr = float(p.get("threshold", 0.9) or 0.9)
-            # 图片数
+            # 检测范围（与其它视觉节点同口径：全屏模式直接写「全屏」）
+            win_txt = range_display(p)
+            # 图片数（只用于决定要不要画缩略图预览，不再写进摘要文本）
             img_count = 0
             images_raw = p.get("images_json", "[]")
             try:
@@ -692,13 +694,39 @@ class NodeItem(QGraphicsObject):
                 img_count = len(imgs) if isinstance(imgs, list) else 0
             except Exception:
                 img_count = 0
+            # 顺序按「先看在哪检测 → 再看用什么算法、怎么求值」。
+            # 刻意**不写**「参考图 N 张 / 相似度」——张数和阈值属于参数细节，
+            # 画布上留给"在哪检测、怎么判"这两件真正影响读懂流程的事；
+            # 参考图本身仍以缩略图形式画出来（见 paint），但不再配文字。
             lines = [
-                f"[{mode_txt}]  算法:{algo_txt}  相似度≥{thr:.2f}",
-                f"🖼 参考图: {img_count}张",
+                f"🎯 {win_txt}",
+                f"算法:{algo_txt}  求值:{mode_txt}",
             ]
             # 如果有图片，加预览标记行（用于高度计算；实际图像由paint绘制）
             if img_count > 0:
                 lines.append("[__PREVIEW__:ifimg]")
+            return lines
+        if t == "Screenshot":
+            # 截图：只写「截取范围」。ROI **不写文字**（用户明确：只要"范围 + ROI 预览图"），
+            # ROI 内容由下面的缩略图直接体现。
+            lines = [f"🎯 {range_display(p)}"]
+            if str(p.get("roi_preview_b64", "") or ""):
+                lines.append("[__PREVIEW__:screenshot]")
+            return lines
+        if t == "OcrRecognize":
+            # 文字：识别范围 + 匹配方式（正则/包含）+ 匹配文本。
+            # ROI 同样不写文字，只出预览图（见 Screenshot 的说明）。
+            lines = [f"🎯 {range_display(p)}"]
+            mode = str(p.get("match_mode", "contains") or "contains")
+            mtext = str(p.get("match_text", "") or "").strip()
+            if not mtext:
+                lines.append("🔎 匹配: （未设置）")
+            elif mode == "regex":
+                lines.append(f"🔎 正则: {mtext}")
+            else:
+                lines.append(f"🔎 包含: {mtext}")
+            if str(p.get("roi_preview_b64", "") or ""):
+                lines.append("[__PREVIEW__:ocr]")
             return lines
         if t == "SetVariable":
             batch = str(p.get("batch_text", "") or "").strip()
@@ -763,14 +791,16 @@ class NodeItem(QGraphicsObject):
             "Loop", "Sequence", "Notify", "VarSwitch", "Clipboard", "SetVariable",
             "Mouse", "PressKey", "Wait",
             "StillnessDetect", "IfImageDetect", "FindImage",
+            "Screenshot", "OcrRecognize",
             "Component", "Parallel",
         )
 
     def _preview_extra_height(self) -> int:
-        """如果节点有预览图（StillnessDetect ROI预览 或 FindImage模板 或 IfImageDetect参考图缩略图），返回额外高度。"""
+        """如果节点有预览图（静止/截图/文字的 ROI 预览、FindImage 模板、检测参考图），返回额外高度。"""
         t = self.node.type
         p = self.node.params or {}
-        if t == "StillnessDetect":
+        if t in ("StillnessDetect", "Screenshot", "OcrRecognize"):
+            # 这三个节点的 ROI 预览共用同一套画法：roi_preview_b64 有图就占一条预览带
             b64 = str(p.get("roi_preview_b64", "") or "")
             if not b64:
                 return 0
@@ -986,7 +1016,9 @@ class NodeItem(QGraphicsObject):
             # 预览图绘制（StillnessDetect / FindImage / IfImageDetect）
             t = self.node.type
             p = self.node.params or {}
-            if t == "StillnessDetect":
+            if t in ("StillnessDetect", "Screenshot", "OcrRecognize"):
+                # 静止 / 截图 / 文字：三者都是「目标窗口/全屏 + ROI」的视觉节点，
+                # ROI 预览图共用同一套画法（居中铺满深色底框）
                 b64 = str(p.get("roi_preview_b64", "") or "")
                 if b64:
                     cursor_y += 8

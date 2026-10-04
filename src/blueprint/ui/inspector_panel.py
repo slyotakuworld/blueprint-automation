@@ -837,6 +837,15 @@ class InspectorPanel(QWidget):
             self._action_host.show()
             return
         if node.type == "StillnessDetect":
+            # 框选ROI：与「截图 / 文字」节点同款，且同样排在「拾取目标窗口」之前
+            btn_roi = QPushButton("🖱 框选ROI")
+            btn_roi.setStyleSheet(self._btn_style("#d84315", "#ff7043"))
+            btn_roi.setToolTip(
+                "框选一个矩形区域作为静止ROI\n"
+                "若检测范围=目标窗口，框选范围将自动限定在该窗口内"
+            )
+            btn_roi.clicked.connect(lambda _=False: self.request_snip_for_node.emit(self._nid(), "if_static_roi"))
+            self._add_action_btn(btn_roi)
             # 仅 range_mode=window 时显示目标窗口拾取按钮
             if str(node.params.get("range_mode", "window") or "window") == "window":
                 btn_pick = QPushButton("🎯 拾取目标窗口")
@@ -850,9 +859,7 @@ class InspectorPanel(QWidget):
                 btn_list.clicked.connect(lambda _=False: self._list_windows_for_ifstatic_temp())
                 self._add_action_btn(btn_list)
 
-                self._action_host.show()
-                return
-            self._action_host.hide()
+            self._action_host.show()
             return
         if node.type == "Mouse":
             # 仅 range_mode=window 时显示目标窗口拾取按钮
@@ -3940,28 +3947,9 @@ class InspectorPanel(QWidget):
         sep.setStyleSheet("color: #2D333B;")
         self._form.addRow(sep)
 
-        # 框选ROI按钮（放到静止ROI的上面）
-        btn_row = QWidget()
-        bl = QHBoxLayout(btn_row)
-        bl.setContentsMargins(0, 0, 0, 0)
-        bl.setSpacing(6)
-        btn_roi = QPushButton("📍 框选ROI区域")
-        btn_roi.setStyleSheet(self._btn_style("#d84315", "#ff7043"))
-        btn_roi.setToolTip(
-            "框选一个矩形区域作为静止ROI\n"
-            "若已设置「目标窗口」，框选范围将自动限定在该窗口内"
-        )
-        btn_roi.clicked.connect(lambda _=False: self.request_snip_for_node.emit(self._nid(), "if_static_roi"))
-        bl.addWidget(btn_roi)
-        btn_clear_roi = QPushButton("🗑️ 清除ROI")
-        btn_clear_roi.setStyleSheet(self._btn_style("#6E7681", "#8B949E"))
-        btn_clear_roi.setToolTip("清除已选的ROI区域和预览图")
-        btn_clear_roi.clicked.connect(lambda _=False: self._clear_ifstatic_roi(self._nid()))
-        bl.addWidget(btn_clear_roi)
-        bl.addStretch(1)
-        self._form.addRow(btn_row)
-
-        roi_raw = node.params.get("roi", "[0,0,0,0]")
+        # 框选ROI按钮已移到顶部动作条（与「截图 / 文字」节点一致，排在拾取目标窗口之前）；
+        # 这里只负责「位置/尺寸」信息行 + 预览图。
+        roi_raw = node.params.get("roi", (0, 0, 0, 0))
         try:
             if isinstance(roi_raw, str) and roi_raw:
                 roi = [int(x) for x in json.loads(roi_raw)]
@@ -3980,23 +3968,12 @@ class InspectorPanel(QWidget):
         title.setStyleSheet("color: #ff7043; font-weight: bold; font-size: 10px;")
         self._form.addRow(title)
 
-        info_row = QWidget()
-        ir = QHBoxLayout(info_row)
-        ir.setContentsMargins(0, 0, 0, 0)
-        ir.setSpacing(8)
-        pos_lbl = QLabel(f"📍 位置: ({x}, {y})")
-        pos_lbl.setStyleSheet("color:#C9D1D9; font-size:9px;")
-        size_lbl = QLabel(f"📐 尺寸: {w} × {h}")
-        size_lbl.setStyleSheet("color:#C9D1D9; font-size:9px;")
-        hint_lbl = QLabel("（未设置，请点上面 [📍 框选ROI区域]）" if not has_roi else "（已设置）")
-        hint_lbl.setStyleSheet(
-            f"font-size:9px; color: {'#F85149' if not has_roi else '#81C784'};"
-        )
-        ir.addWidget(pos_lbl)
-        ir.addWidget(size_lbl)
-        ir.addStretch(1)
-        ir.addWidget(hint_lbl)
-        self._form.addRow(info_row)
+        # 位置/尺寸信息行：与「截图 / 文字」节点（_append_snip_roi_preview）逐字一致。
+        # 历史遗留写法是「📍 位置: (x, y)」「📐 尺寸: w × h」两个 label + emoji，
+        # 比截图/文字多出 📍/📐 两个符号，用户点名要求统一 —— 别再改回去。
+        info = QLabel(f"位置 ({x},{y})  ·  尺寸 {w}×{h}" + ("" if has_roi else "  （未框选）"))
+        info.setStyleSheet("color:#C9D1D9; font-size:9px;")
+        self._form.addRow(info)
 
         b64 = node.params.get("roi_preview_b64", "")
         pix = _b64_thumb(b64, 220) if isinstance(b64, str) and b64 else None
@@ -4019,14 +3996,6 @@ class InspectorPanel(QWidget):
         if w > 0 and h > 0:
             lbl.setToolTip(f"ROI 预览：实际区域 {w}×{h} 像素")
         self._form.addRow(lbl)
-
-    def _clear_ifstatic_roi(self, node_id: str):
-        """清除静止ROI和预览图"""
-        self.param_changed.emit(node_id, "roi", "[0,0,0,0]")
-        self.param_changed.emit(node_id, "roi_preview_b64", "")
-        # 刷新面板显示
-        if self._current_node and self._current_node.id == node_id:
-            self.set_node(self._current_node)
 
     # ================================================================
     # Mouse 专属：按 action 分组显隐参数（避免20+参数一次性糊给用户）

@@ -3152,21 +3152,11 @@ class BlueprintMainWindow(QMainWindow):
             return
 
         # ---- 有了临时目标窗口就以它为框选范围；否则维持全屏 ----
+        # 限定区（临时目标窗口）**故意先不解析**：解析过程要把目标窗口提到最前，
+        # 若发生在遮罩上屏之前，用户"点完按钮又点了一下屏幕"就会点到那个窗口上。
+        # 这里只声明变量，稍后在遮罩已接管输入之后才填值；_on_result 闭包按名引用，
+        # 调用时读到的就是填好的值。
         limit_rect, limit_label, limit_status = (None, "", "none")
-        try:
-            node0 = self._graph.nodes.get(node_id)
-            if node0 is not None:
-                limit_rect, limit_label, limit_status = self._resolve_snip_limit(node0)
-        except Exception as e:
-            self._log.append_log(f"[Snip] 解析临时目标窗口失败: {e}", "WARN")
-        if limit_status == "ok":
-            self._log.append_log(
-                f"[Snip] {limit_label}，框选范围已限定在该窗口内 {limit_rect}", "INFO"
-            )
-        elif limit_status == "notfound":
-            self._log.append_log(
-                "[Snip] 节点已配置临时目标窗口，但当前找不到该窗口，本次回退为全屏框选", "WARN"
-            )
 
         def _on_result(result, nid=node_id, m=mode):
             try:
@@ -3229,20 +3219,14 @@ class BlueprintMainWindow(QMainWindow):
                     self._log.append_log(f"[Snip] b64编码失败: {e}", "ERROR")
                     return
                 # --- 按 mode 回填参数 ---
-                if m == "if_static_roi":
-                    self._on_param_changed(nid, "roi", json.dumps([int(x1), int(y1), int(w), int(h)]))
-                    self._on_param_changed(nid, "roi_preview_b64", b64)
-                    self._log.append_log(
-                        f"[if_static] ROI框选完成: ({x1},{y1}) {w}×{h}", "SUCCESS"
-                    )
-                    self._inspector.set_node(node)
-                    return
-                # Screenshot / OcrRecognize：roi 是 tuple4 (x,y,w,h)
-                if m in ("screenshot_roi", "ocr_roi"):
+                # 静止 / 截图 / 文字：roi 一律是 tuple4 (x,y,w,h)（三者同款参数样式）
+                if m in ("if_static_roi", "screenshot_roi", "ocr_roi"):
                     self._on_param_changed(nid, "roi", (int(x1), int(y1), int(w), int(h)))
                     self._on_param_changed(nid, "roi_preview_b64", b64)
+                    tag = {"if_static_roi": "[if_static]", "screenshot_roi": "[screenshot]",
+                           "ocr_roi": "[ocr]"}.get(m, "[roi]")
                     self._log.append_log(
-                        f"[{m}] ROI框选完成: ({x1},{y1}) {w}×{h}", "SUCCESS"
+                        f"{tag} ROI框选完成: ({x1},{y1}) {w}×{h}", "SUCCESS"
                     )
                     self._inspector.set_node(node)
                     return
@@ -3349,15 +3333,36 @@ class BlueprintMainWindow(QMainWindow):
                 traceback.print_exc()
 
         try:
-            overlay = SnipOverlay.prepare_and_run(
-                self, delay_ms=400, limit_rect=limit_rect, limit_label=limit_label
-            )
+            # ★ 顺序至关重要（2026-10-04 实测确认的事件穿透）：
+            #   ① 先 hide 主窗 + **同步** show 遮罩（delay_ms=0，中间不留任何等待）。
+            #      只要存在"遮罩还没上屏"的窗口期，用户点完 📸 又随手点一下屏幕的那次
+            #      按下就会落到当前前台窗口上 —— 而截图流程紧接着正好要把「临时目标窗口」
+            #      提到最前，于是那一下被目标窗口接走，Windows 连鼠标捕获一起给它，
+            #      整段拖拽都变成在目标窗口里框选 / 选中文本。
+            overlay = SnipOverlay.prepare_and_run(self, delay_ms=0)
             overlay.finished.connect(_on_result)
+            #   ② 遮罩已在屏幕上接管命中测试，现在才去解析目标窗口：提窗、找 hwnd
+            #      这些慢动作期间再怎么卡，用户点到的也只是我们的遮罩。
+            try:
+                node0 = self._graph.nodes.get(node_id)
+                if node0 is not None:
+                    limit_rect, limit_label, limit_status = self._resolve_snip_limit(node0)
+            except Exception as e:
+                self._log.append_log(f"[Snip] 解析临时目标窗口失败: {e}", "WARN")
+            #   ③ 把限定区回填给遮罩（set_limit 内部会重新置顶一次，抵掉提窗造成的 z 序变化）
             if limit_rect:
+                overlay.set_limit(limit_rect, limit_label)
+                self._log.append_log(
+                    f"[Snip] {limit_label}，框选范围已限定在该窗口内 {limit_rect}", "INFO"
+                )
                 self._log.append_log(
                     f"[Snip] 请在临时目标窗口内框选矩形（范围 {limit_rect}，ESC取消）...", "INFO"
                 )
             else:
+                if limit_status == "notfound":
+                    self._log.append_log(
+                        "[Snip] 节点已配置临时目标窗口，但当前找不到该窗口，本次回退为全屏框选", "WARN"
+                    )
                 self._log.append_log("[Snip] 请在屏幕上框选矩形（ESC取消）...", "INFO")
         except Exception as e:
             self._log.append_log(f"[Snip] 启动失败: {e}", "ERROR")
