@@ -16,6 +16,9 @@
 ``build-editor``   打包编辑器（PyInstaller ``--onedir`` → ``dist/BlueprintAutomation``）
 ``build-runtime``  重打运行时模板 ``BlueprintRuntime.exe``（``--onefile``，供「导出为独立 EXE」用）
 ``build-all``      编辑器 + 运行时模板（等价旧 ``build.cmd``）
+``ocr-runtime``    准备 OCR：库装进 .venv（随模板打包）、模型预取到 ``ocr_runtime/models``。
+                   日常由启动器菜单 1/2 自动完成（装库 + 缺模型时自动下载），此命令用于手动补齐，
+                   ``--models-only`` 只下模型
 ``env``            环境与模板新鲜度体检
 
 之所以把构建逻辑放在 Python 而不是批处理里：PyInstaller 的参数（尤其
@@ -24,9 +27,9 @@
 """
 
 from __future__ import annotations
-
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -56,6 +59,17 @@ RUNTIME_TEMPLATE_ROOT = os.path.join(ROOT, RUNTIME_NAME + ".exe")
 
 REQUIREMENTS = os.path.join(ROOT, "requirements.txt")
 
+# OCR 运行时目录：2026-10-05 起只放**模型**。
+#   ocr_runtime/models  ← 识别模型（paddleocr 首次使用会下到这里）
+# OCR 的**库**（paddlepaddle / paddleocr）装进 .venv（ocr-runtime 子命令安装），
+# 由 build-runtime 直接打进运行时模板；导出含「文字」节点的蓝图时只携带 models/。
+OCR_RUNTIME_DIR = os.path.join(ROOT, "ocr_runtime")
+OCR_LIB_DIR = os.path.join(OCR_RUNTIME_DIR, "lib")   # 旧布局残留，仅用于提示清理
+OCR_MODELS_DIR = os.path.join(OCR_RUNTIME_DIR, "models")
+
+# OCR 引擎的包名（用于判定 lib/ 是否真的可用：只认包目录，空目录不算）
+OCR_PKGS = ("paddlepaddle", "paddleocr")
+
 # 运行时代码：改动这些文件后必须重打模板，否则导出的 EXE 跑的还是旧代码
 RUNTIME_SOURCES = [
     os.path.join(ROOT, "src", "blueprint_runner.py"),
@@ -72,6 +86,74 @@ RUNTIME_HIDDEN_IMPORTS = [
 
 # 编辑器启动前快速探测的关键包（requirements.txt 的粗粒度代表）
 KEY_IMPORTS = ["PySide6", "cv2", "numpy", "PIL", "win32gui", "psutil", "pynput"]
+
+
+# ---------------------------------------------------------------------------
+# 「标准库补齐」——保险性的 stdlib 整包收集
+# ---------------------------------------------------------------------------
+# 历史（2026-10-05）：当时 paddle 外挂在 ocr_runtime/lib、不在打包期依赖图里，
+# 它用到的 stdlib（configparser、http.cookies…）收不进模板，导致导出 EXE 必挂，
+# 于是按 sys.stdlib_module_names 全量补齐（实测代价约 +10MB）。
+# 现在 paddle 已进 .venv、进依赖图，stdlib 大多会被自动收集；这份补齐保留作为
+# 保险（paddle/paddlex 有动态 import，静态图不保证全），删除可省约 10MB。
+_STDLIB_SKIP = {
+    "tkinter", "turtle", "turtledemo", "idlelib", "venv", "ensurepip",
+    "lib2to3", "test", "pydoc_data", "curses", "distutils",
+    "antigravity", "this",
+}
+
+# 非标准库但 paddle 运行时需要的第三方包，同样整包收集（实测半收集案例）：
+#   paddle → No module named 'setuptools.command.easy_install'
+#   paddle → cannot import name 'ImageEnhance' from 'PIL'
+_EXTRA_COLLECT_PACKAGES = ["setuptools", "PIL"]
+
+
+def _ocr_metadata_pyi_args() -> list[str]:
+    """生成 --copy-metadata 参数：把 venv 里**全部**发行版的 dist-info 打进模板。
+
+    原因：paddlex 创建 pipeline 时用 importlib.metadata 逐一核对依赖的版本
+    （paddlex/utils/deps.py），frozen 里缺任何一条 dist-info 就报
+    "A dependency error occurred during pipeline creation"。而 paddleocr 还会把
+    真实原因包进 __cause__ 吞掉，逐个排查太费劲 —— 干脆全量复制。
+    dist-info 都很小（每个几十 KB），全量代价可忽略。
+    """
+    try:
+        import importlib.metadata as _im
+
+        names = sorted({
+            d.metadata["Name"] for d in _im.distributions() if d.metadata["Name"]
+        })
+    except Exception:
+        return []
+    args: list[str] = []
+    for n in names:
+        args += ["--copy-metadata", n]
+    return args
+
+
+def _stdlib_supplement_pyi_args() -> list[str]:
+    """生成标准库补齐的 PyInstaller 参数（--collect-submodules / --hidden-import）。
+
+    顶层是「包」用 --collect-submodules（连子模块一起收），
+    是「单文件模块」用 --hidden-import。
+    平台相关、本机 import 不进来的（pwd / grp / termios / fcntl / curses …）
+    直接跳过，PyInstaller 也不会因为找不到而报错。
+    """
+    import importlib
+
+    args: list[str] = []
+    for name in sorted(sys.stdlib_module_names) + _EXTRA_COLLECT_PACKAGES:
+        if name in _STDLIB_SKIP or name.startswith("_"):
+            continue
+        try:
+            mod = importlib.import_module(name)
+        except Exception:
+            continue
+        if getattr(mod, "__path__", None):
+            args += ["--collect-submodules", name]
+        else:
+            args += ["--hidden-import", name]
+    return args
 
 
 # ---------------------------------------------------------------------------
@@ -188,8 +270,11 @@ def ensure_requirements(*, force: bool = False, auto_install: bool = True) -> bo
     """检查关键依赖；缺失（或 --force）时按 requirements.txt 安装。"""
     if not force:
         missing = [m for m in KEY_IMPORTS if not have_module(m)]
+        if not missing and not ocr_lib_ready():
+            # OCR 库单独查（find_spec 秒回，不触发 paddle 重型导入）
+            missing = ["paddleocr（OCR 库，随 requirements.txt 一起安装）"]
         if not missing:
-            ok("关键依赖已就绪（PySide6 / cv2 / numpy / PIL / win32gui / psutil / pynput）")
+            ok("关键依赖已就绪（PySide6 / cv2 / numpy / PIL / win32gui / psutil / pynput + OCR 库）")
             return True
         warn("缺少依赖：" + "、".join(missing))
     if not os.path.exists(REQUIREMENTS):
@@ -298,6 +383,7 @@ def cmd_build_editor(args: argparse.Namespace) -> int:
         "--add-data", f"{os.path.join(ROOT, 'assets', 'doc')};assets/doc",
         "--add-data", f"{os.path.join(ROOT, 'assets', 'doc_icons')};assets/doc_icons",
         "--add-data", f"{ICON};.",
+        *_stdlib_supplement_pyi_args(),
         ENTRY_EDITOR,
     ], dry_run=args.dry_run)
     _drop_stray_spec(APP_NAME)
@@ -349,6 +435,41 @@ def cmd_build_runtime(args: argparse.Namespace) -> int:
     ]
     for mod in RUNTIME_HIDDEN_IMPORTS:
         pyi_args += ["--hidden-import", mod]
+    # OCR 库（paddle 全家桶）已装进 .venv —— 2026-10-05 起直接打进模板。
+    # paddleocr/paddlex 在 ocr_engine 里是懒加载，PyInstaller 静态分析看不到入口，
+    # 必须 --collect-all（子模块 + 二进制 + 数据一起收）。没装 OCR 时跳过，
+    # 模板照常打包（只是导出的蓝图跑不了文字节点）。
+    import importlib.util as _ilu
+
+    for pkg in ("paddleocr", "paddlex"):
+        if _ilu.find_spec(pkg) is not None:
+            log(f"  OCR 库内置：{pkg}（--collect-all）")
+            pyi_args += ["--collect-all", pkg]
+    if _ilu.find_spec("paddle") is not None:
+        # paddle **不能**用 --collect-all / --collect-submodules：那会逐个 import
+        # 子模块做枚举，而 paddle.jit.sot 在隔离子进程里 import 直接段错误
+        # （exit 3221225477 = 0xC0000005），枚举子进程整颗崩掉 → 构建失败。
+        # 改为顶层 hidden-import + 数据/二进制整收，子模块由 modulegraph 静态
+        # 分析 import 图收集（静态解析不执行代码，不会踩到 jit.sot 的坑）。
+        log("  OCR 库内置：paddle（hidden + data/binaries，规避 jit.sot 段错误）")
+        pyi_args += [
+            "--hidden-import", "paddle",
+            "--collect-data", "paddle",
+            "--collect-binaries", "paddle",
+            # paddle.jit.sot（符号追踪）在 PyInstaller 的分析子进程里 import 即段错误
+            # （0xC0000005，两次构建失败均为它）——推理链路用不到，直接排除。
+            "--exclude-module", "paddle.jit.sot",
+        ]
+        # paddlex 初始化时要读全部必需依赖的 dist-info 元数据做版本核对
+        meta_args = _ocr_metadata_pyi_args()
+        log(f"  OCR 元数据补齐：{len(meta_args) // 2} 个发行版（--copy-metadata）")
+        pyi_args += meta_args
+    if not any(p in pyi_args for p in ("paddleocr", "paddle")):
+        warn("venv 里没有 OCR 库（paddleocr），模板将不含 OCR —— 需要时先跑 ocr-runtime。")
+    # stdlib 保险补齐（说明见 _stdlib_supplement_pyi_args）
+    stdlib_args = _stdlib_supplement_pyi_args()
+    log(f"  标准库补齐：{len(stdlib_args) // 2} 个顶层包/模块")
+    pyi_args += stdlib_args
     pyi_args.append(ENTRY_RUNTIME)
 
     t0 = time.time()
@@ -418,6 +539,106 @@ def cmd_build_all(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# 子命令：ocr-runtime
+# ---------------------------------------------------------------------------
+
+def ocr_lib_ready() -> bool:
+    """.venv 里是否已装 OCR 库（只查 paddleocr 是否可定位，不触发重初始化）。"""
+    import importlib.util
+
+    try:
+        return importlib.util.find_spec("paddleocr") is not None
+    except Exception:
+        return False
+
+
+def _warmup_ocr_models() -> bool:
+    """用 venv 里的库触发一次初始化，把识别模型下到 ocr_runtime/models（供离线导出）。"""
+    code = (
+        "import os\n"
+        "os.environ.setdefault('FLAGS_enable_pir_api', '0')\n"
+        "os.environ.setdefault('FLAGS_use_mkldnn', '0')\n"
+        "from paddleocr import PaddleOCR\n"
+        "PaddleOCR(use_textline_orientation=True, lang='ch', enable_mkldnn=False)\n"
+        "print('OCR models ready')\n"
+    )
+    env = dict(os.environ)
+    env["PADDLE_PDX_CACHE_HOME"] = OCR_MODELS_DIR
+    try:
+        return subprocess.call([python_exe(), "-c", code], cwd=ROOT, env=env) == 0
+    except OSError as exc:
+        warn(f"  模型预取启动失败：{exc}")
+        return False
+
+
+def cmd_ocr_runtime(args: argparse.Namespace) -> int:
+    """准备 OCR：库装进 .venv（随模板打包），模型预取到 ocr_runtime/models（随导出携带）。
+
+    2026-10-05 方案变更：不再往 ocr_runtime/lib 装库（外挂 lib 体积太大）。
+    """
+    step("准备 OCR 运行时")
+    log(f"  库   → .venv（随运行时模板打包，不再放 ocr_runtime/lib）")
+    log(f"  模型 → {OCR_MODELS_DIR}（导出含「文字」节点的 EXE 时自动携带）")
+
+    models_only = getattr(args, "models_only", False)
+    if models_only and not ocr_lib_ready():
+        fail("venv 里还没有 OCR 库，请先运行 start.cmd（菜单 1/2 会自动装库）。")
+        return 1
+
+    pip_cmd = [
+        python_exe(), "-m", "pip", "install", "--upgrade",
+        *OCR_PKGS,
+    ]
+
+    if args.dry_run:
+        if models_only:
+            log(f"[dry-run] （触发一次 PaddleOCR 初始化，把模型下到 {OCR_MODELS_DIR}）")
+        else:
+            log("[dry-run] " + " ".join(pip_cmd))
+            if not args.skip_models:
+                log(f"[dry-run] （随后触发一次 PaddleOCR 初始化，把模型下到 {OCR_MODELS_DIR}）")
+        log("[dry-run] 已跳过实际安装。")
+        return 0
+
+    if models_only:
+        ok("仅预取模型（--models-only）：OCR 库已就绪，跳过安装步骤。")
+    elif ocr_lib_ready() and not args.force:
+        ok(f"OCR 库已就绪（.venv）：{OCR_PKGS}")
+        log("  （如需重装：加 --force）")
+    else:
+        step("① 安装 OCR 库到 .venv（paddlepaddle 约 370MB，请耐心等待）")
+        if run(pip_cmd) != 0:
+            fail("OCR 库安装失败。可手动重试：")
+            log(f"  {python_exe()} -m pip install {' '.join(OCR_PKGS)}")
+            return 1
+        if not ocr_lib_ready():
+            fail("安装后仍未找到 paddleocr 包，请检查 pip 输出。")
+            return 1
+        ok("OCR 库已就绪（.venv）")
+
+    # ② 模型：首次识别会自动下载；这里提前取好，导出的 EXE 才能离线可用。
+    if args.skip_models:
+        warn("已按 --skip-models 跳过模型预取（首次识别时会联网下载）。")
+    elif os.path.isdir(OCR_MODELS_DIR) and os.listdir(OCR_MODELS_DIR):
+        ok(f"OCR 模型已在位：{OCR_MODELS_DIR}")
+    else:
+        step("② 预取 OCR 模型到 ocr_runtime/models（首次约 180MB）")
+        if _warmup_ocr_models():
+            ok(f"OCR 模型已就绪：{OCR_MODELS_DIR}")
+        else:
+            warn("模型预取未成功（可稍后重跑本命令；首次识别时会自动下载）。")
+
+    # ③ 旧布局清理提示：lib/ 已废弃，提示用户删掉省 550MB
+    if os.path.isdir(OCR_LIB_DIR):
+        warn(f"检测到旧布局 {OCR_LIB_DIR}（已废弃，库现在装在 .venv 并随模板打包）。")
+        log("  可整个删除该目录腾出约 550MB：ocr_runtime/lib 不会再被使用。")
+
+    log("")
+    ok("OCR 运行时准备完成。")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # 子命令：env
 # ---------------------------------------------------------------------------
 
@@ -455,8 +676,18 @@ def cmd_env(args: argparse.Namespace) -> int:
     log("关键依赖：")
     for mod in KEY_IMPORTS:
         log(f"  {'✔' if have_module(mod) else '✘'} {mod}")
-    for extra in ("paddleocr", "paddle", "pandas", "shapely"):
-        log(f"  {'✔' if have_module(extra) else '✘'} {extra}（OCR 相关，运行时模板需要）")
+    # OCR：库在 .venv（随模板打包），模型在 ocr_runtime/models（随导出携带）
+    log("")
+    log("OCR 运行时：")
+    log(f"  {'✔' if ocr_lib_ready() else '✘'} 库（.venv 里的 paddlepaddle/paddleocr，随模板打包）")
+    if os.path.isdir(OCR_MODELS_DIR):
+        _n = len(os.listdir(OCR_MODELS_DIR))
+        log(f"  {'✔' if _n else '✘'} 模型 models/（{_n} 项）")
+    else:
+        log("  ✘ 模型 models/（未预取，首次识别会联网下载）")
+    if not ocr_lib_ready():
+        log("      → 尚未准备：启动 start.cmd（菜单 1/2）时会自动装库并下载模型")
+        log("        （也可手动执行：start.cmd ocr-runtime）")
 
     # 资源（手册 / 图标）
     log("")
@@ -524,6 +755,16 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("build-all", help="编辑器 + 运行时模板（等价旧 build.cmd）")
     p.add_argument("--dry-run", action="store_true", help="只打印两段 PyInstaller 命令")
     p.set_defaults(func=cmd_build_all)
+
+    p = sub.add_parser(
+        "ocr-runtime",
+        help="准备 OCR：库装进 .venv + 模型预取（日常由启动器菜单 1/2 自动完成，此命令用于手动补齐）",
+    )
+    p.add_argument("--force", action="store_true", help="重装 OCR 库（默认已就绪则跳过）")
+    p.add_argument("--models-only", action="store_true", help="只预取模型，不装库（要求库已就绪）")
+    p.add_argument("--skip-models", action="store_true", help="只装库，不预取识别模型")
+    p.add_argument("--dry-run", action="store_true", help="只打印将要执行的命令")
+    p.set_defaults(func=cmd_ocr_runtime)
 
     p = sub.add_parser("env", help="环境与模板新鲜度体检")
     p.set_defaults(func=cmd_env)

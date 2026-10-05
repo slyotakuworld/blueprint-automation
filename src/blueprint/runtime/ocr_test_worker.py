@@ -22,11 +22,20 @@ import sys
 
 
 def _setup_import_path():
-    """开发模式下把工程根加进 sys.path（本文件位于 <工程根>/src/blueprint/runtime/）。"""
+    """开发模式下把工程根 + OCR 库目录加进 sys.path。
+
+    ⚠ 本文件位于 <工程根>/src/blueprint/runtime/，靠上四级得到工程根。
+
+    ⚠ **必须同时挂 ocr_runtime/lib**：本进程是「测试识别」按钮 Popen 出来的**独立子进程**，
+    **不继承父进程（编辑器）的 sys.path** —— 编辑器挂了库也没用。
+    历史上漏了这一句，导致「测试识别」永远报 OcrUnavailable，
+    而编辑器主进程里的一切看起来都正常（2026-10-05 定位）。
+    """
     root = os.path.dirname(os.path.dirname(os.path.dirname(
         os.path.dirname(os.path.abspath(__file__)))))
     if root not in sys.path:
         sys.path.insert(0, root)
+    # OCR 库装在 .venv 里（paddleocr 直接可 import），无需再挂任何外挂路径
 
 
 def run(img_path: str, lang: str) -> dict:

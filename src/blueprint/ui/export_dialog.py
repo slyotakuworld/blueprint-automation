@@ -85,7 +85,7 @@ class ExportDialog(QDialog):
 
         # ---- 导出前体检（组件断链 / OCR 运行时 / 模板是否比代码旧）----
         try:
-            self._issues = exporter.preflight(self._graph, project_root=project_root)
+            self._issues = exporter.preflight(self._graph, project_root=self._project_root)
         except Exception:
             self._issues = []
         if self._issues:
@@ -131,14 +131,30 @@ class ExportDialog(QDialog):
         self._tpl_lbl.setWordWrap(True)
         root.addWidget(self._tpl_lbl)
 
-        # OCR 依赖提示（动态打包）：用了 OCR 节点才提示（含组件递归检测）
-        self._uses_ocr = exporter.uses_ocr(self._graph, project_root=project_root)
+        # OCR 运行时提示（按需携带）：只有含「文字」节点时才涉及
+        self._uses_ocr = exporter.uses_ocr(self._graph, project_root=self._project_root)
+        self._ocr_src = exporter.ocr_runtime_source_dir() if self._uses_ocr else None
         if self._uses_ocr:
-            ocr_lbl = QLabel(
-                "⚠ 本蓝图包含「文字」节点，运行时需要 OCR 引擎（ocr_runtime/ 目录）。\n"
-                "   导出后请把项目里的 ocr_runtime/ 目录放到生成的 EXE 同级目录下，否则识别节点会报「OCR 未安装」。"
-            )
-            ocr_lbl.setStyleSheet("color:#D29922; font-size:11px; background:#2A2414; padding:6px 8px; border-radius:4px;")
+            if self._ocr_src:
+                ocr_lbl = QLabel(
+                    "✔ 本蓝图包含「文字」节点：导出时会自动把 ocr_runtime/（OCR 库 + 模型）"
+                    "复制到 EXE 同级目录，双击即可用识别。\n"
+                    f"   源目录：{self._ocr_src}"
+                )
+                ocr_lbl.setStyleSheet(
+                    "color:#3FB950; font-size:11px; background:#12261A;"
+                    " padding:6px 8px; border-radius:4px;"
+                )
+            else:
+                ocr_lbl = QLabel(
+                    "⚠ 本蓝图包含「文字」节点，但本机还没有可用的 OCR 运行时（ocr_runtime/）。\n"
+                    "   导出的 EXE 将无法识别文字。请先运行 start.cmd 选「5. 准备 OCR 运行时」"
+                    "（命令行：start.cmd ocr-runtime）。"
+                )
+                ocr_lbl.setStyleSheet(
+                    "color:#D29922; font-size:11px; background:#2A2414;"
+                    " padding:6px 8px; border-radius:4px;"
+                )
             ocr_lbl.setWordWrap(True)
             root.addWidget(ocr_lbl)
 
@@ -225,6 +241,37 @@ class ExportDialog(QDialog):
             )
             return
 
+        # 「按需携带」前置告知：含 OCR 且目标还没有模型 → 要现拷约 180MB 模型。
+        # 讲清楚避免被当成卡死；库已内置于模板，不用再拷几百 MB 的库目录。
+        if self._uses_ocr and self._ocr_src:
+            dst_rt = os.path.join(
+                os.path.dirname(os.path.abspath(out)), exporter.OCR_RUNTIME_DIRNAME
+            )
+            try:
+                need_copy = not exporter._has_ocr_models(dst_rt)
+            except Exception:
+                need_copy = True
+            if need_copy:
+                try:
+                    mb = exporter.ocr_runtime_size_mb(self._ocr_src)
+                except Exception:
+                    mb = 0.0
+                size_txt = f"约 {mb:.0f} MB" if mb else "约 180 MB"
+                r = QMessageBox.question(
+                    self,
+                    "需要携带 OCR 模型",
+                    "本蓝图包含「文字」节点，导出时会把 OCR 模型复制到 EXE 同级目录：\n\n"
+                    f"　来源：{self._ocr_src}\n"
+                    f"　体积：{size_txt}\n\n"
+                    "复制期间窗口会短暂无响应（几秒到十几秒），这是正常现象，请勿关闭窗口。\n"
+                    "复制完成才会生成正式目录，中断不会留下半个目录。\n\n"
+                    "现在开始导出吗？",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes,
+                )
+                if r != QMessageBox.Yes:
+                    return
+
         QApplication.setOverrideCursor(Qt.WaitCursor)
         self._ok_btn.setEnabled(False)
         try:
@@ -247,10 +294,10 @@ class ExportDialog(QDialog):
             f"打包图片：{res.asset_count} 个"
         )
         if self._uses_ocr:
-            msg += (
-                "\n\n⚠ 本蓝图包含「文字」节点：请把 ocr_runtime/ 目录放到"
-                " EXE 同级目录，否则识别节点无法运行。"
-            )
+            if res.ocr_carried:
+                msg += f"\n\n✔ OCR 运行时：{res.ocr_note}"
+            elif res.ocr_note:
+                msg += f"\n\n⚠ OCR 运行时未就绪：{res.ocr_note}"
         if res.missing:
             msg += "\n\n⚠ 以下引用的图片未找到，未被打包：\n" + "\n".join(res.missing[:8])
             if len(res.missing) > 8:

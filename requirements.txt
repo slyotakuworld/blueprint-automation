@@ -1,9 +1,17 @@
 PySide6
-opencv-python
-numpy>=1.24
+opencv-contrib-python>=4.10
+numpy>=2.3
 pillow
 pyautogui
 pydirectinput
 pynput
 pywin32
 psutil
+
+# --- OCR (for blueprints using the "Text" node) ---
+# Libraries are baked into the runtime template; models live in ocr_runtime/models.
+# IMPORTANT: paddleocr depends on opencv-contrib-python. opencv-python and
+# opencv-contrib-python both ship a cv2/ package and MUST NOT be installed
+# together -- keep contrib only (it is a superset of opencv-python).
+paddlepaddle
+paddleocr

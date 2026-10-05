@@ -2980,8 +2980,15 @@ class InspectorPanel(QWidget):
             box.exec()
             return
         if not items and not warn:
+            size_txt = ""
+            try:
+                if img_bgr is not None and getattr(img_bgr, "size", 0) > 0:
+                    _h, _w = img_bgr.shape[:2]
+                    size_txt = f"\n\n本次送识别的图像尺寸：{int(_w)}×{int(_h)}"
+            except Exception:
+                pass
             QMessageBox.information(self, "识别结果",
-                                    "未识别到任何文字/数字。\n（运行时本节点会走「无文字」出口）")
+                                    "未识别到任何文字/数字。\n（运行时本节点会走「无文字」出口）" + size_txt)
             return
         if not items and warn:
             # 截取区域不对（如全屏退回）时，警告本身就解释了为什么没识别到

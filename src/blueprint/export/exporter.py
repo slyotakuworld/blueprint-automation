@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -29,6 +30,8 @@ class ExportResult:
     asset_count: int = 0
     total_bytes: int = 0
     missing: List[str] = field(default_factory=list)
+    ocr_carried: bool = False   # 是否已把 ocr_runtime/ 复制到导出 EXE 同级
+    ocr_note: str = ""          # 携带结果说明（成功位置 / 失败原因），供界面展示
 
 
 def runtime_template_path() -> str:
@@ -63,17 +66,117 @@ def preview_assets(graph) -> Any:
 # ============================================================
 # 导出前体检
 # ============================================================
+# 2026-10-05 起方案变更：OCR **库**（paddlepaddle/paddleocr）装进 .venv、由
+# PyInstaller 直接打进运行时模板；`ocr_runtime/` 里只剩**模型**（models/）。
+# 导出含「文字」节点的蓝图时，只把 models/ 复制到 EXE 同级的 ocr_runtime/ 下。
+OCR_RUNTIME_DIRNAME = "ocr_runtime"
+OCR_MODELS_DIRNAME = "models"
+# 复制模型时要跳过的东西（PaddleX 缓存目录等，运行时会自建）
+_COPY_IGNORE = shutil.ignore_patterns("__pycache__", "locks", "temp", "func_ret")
+
+
 def _ocr_runtime_dirs() -> List[str]:
-    """OCR 运行时的候选位置：程序目录 / ocr_runtime，开发模式下还有项目根（src 的上一级）。"""
+    """OCR 运行时的候选位置：程序目录下的 ocr_runtime/，开发模式下还有项目根。"""
     cands: List[str] = []
     try:
         from src.config.app_paths import APP_DIR
-        cands.append(os.path.join(APP_DIR, "ocr_runtime"))
+        cands.append(os.path.join(APP_DIR, OCR_RUNTIME_DIRNAME))
         parent = os.path.dirname(os.path.abspath(APP_DIR))
-        cands.append(os.path.join(parent, "ocr_runtime"))
+        cands.append(os.path.join(parent, OCR_RUNTIME_DIRNAME))
     except Exception:
         pass
-    return cands
+    # 开发模式兜底：本文件在 src/blueprint/export/ 下 → 再上三级是项目根
+    try:
+        root = os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.dirname(os.path.abspath(__file__)))))
+        cands.append(os.path.join(root, OCR_RUNTIME_DIRNAME))
+    except Exception:
+        pass
+    seen: set = set()
+    out: List[str] = []
+    for d in cands:
+        k = os.path.normcase(os.path.abspath(d))
+        if k not in seen:
+            seen.add(k)
+            out.append(d)
+    return out
+
+
+def _has_ocr_models(d: str) -> bool:
+    """目录里是否有**可用的** OCR 模型（ocr_runtime/models/ 非空即算）。
+
+    模型缺失时 paddleocr 首次识别会尝试联网下载——导出物以「离线可用」为目标，
+    所以导出前 models/ 必须在位；只有目录存在且有文件才算可用。
+    """
+    models = os.path.join(d, OCR_MODELS_DIRNAME)
+    if not os.path.isdir(models):
+        return False
+    try:
+        return any(os.scandir(models))
+    except OSError:
+        return False
+
+
+def ocr_runtime_source_dir() -> Optional[str]:
+    """返回一个可用的 ocr_runtime/ 源目录（必须含真正的模型），找不到返回 None。"""
+    for d in _ocr_runtime_dirs():
+        if _has_ocr_models(d):
+            return d
+    return None
+
+
+def ocr_runtime_size_mb(d: str) -> float:
+    """估算 ocr_runtime/models 体积（MB），仅供导出前提示用。"""
+    total = 0
+    for root, _dirs, files in os.walk(os.path.join(d, OCR_MODELS_DIRNAME)):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
+    return total / 1048576.0
+
+
+def carry_ocr_runtime(out_exe_path: str) -> tuple:
+    """把 ocr_runtime/models 复制到导出 EXE 的同级目录，返回 (是否成功, 说明)。
+
+    蓝图不含「文字」节点时不会调用本函数 —— 这就是「按需携带」：没用 OCR 的导出物
+    一个字节都不多带。
+
+    库（paddle 等）已内置于模板 EXE，这里只带模型（约 180MB），几秒即完。
+    仍保持**原子化**（先拷 `<dst>.copying` 再改名），中断不留残缺目录。
+    """
+    dst = os.path.join(
+        os.path.dirname(os.path.abspath(out_exe_path)), OCR_RUNTIME_DIRNAME
+    )
+    if _has_ocr_models(dst):
+        return True, f"OCR 模型已在位（{dst}），未重复复制"
+    src = ocr_runtime_source_dir()
+    if not src:
+        return False, (
+            "未找到可用的 OCR 模型（ocr_runtime/models/ 为空或不存在）。"
+            "请先在启动器选「准备 OCR 运行时」（命令行：start.cmd ocr-runtime）预取模型，再导出。"
+        )
+    dst_models = os.path.join(dst, OCR_MODELS_DIRNAME)
+    tmp = dst_models + ".copying"
+    try:
+        shutil.rmtree(tmp, ignore_errors=True)
+        os.makedirs(os.path.dirname(tmp), exist_ok=True)
+        shutil.copytree(
+            os.path.join(src, OCR_MODELS_DIRNAME), tmp, ignore=_COPY_IGNORE
+        )
+    except Exception as e:  # noqa: BLE001
+        shutil.rmtree(tmp, ignore_errors=True)
+        return False, f"复制 OCR 模型失败（磁盘空间或权限？）：{e}"
+    try:
+        # 清掉可能残留的旧目录/旧半成品，再把临时的改名上去
+        if os.path.isdir(dst_models):
+            shutil.rmtree(dst_models, ignore_errors=True)
+        os.replace(tmp, dst_models)
+    except Exception as e:  # noqa: BLE001
+        shutil.rmtree(tmp, ignore_errors=True)
+        return False, f"OCR 模型落位失败：{e}"
+    return True, f"已携带 OCR 模型（{ocr_runtime_size_mb(dst):.0f} MB）→ {dst_models}"
 
 
 def runtime_source_mtime() -> float:
@@ -102,7 +205,7 @@ def preflight(graph, project_root: Optional[str] = None) -> List[Dict[str, str]]
 
     检查三项（都是「不检查就会白忙一场」的类型）：
       1. 组件引用断链：蓝图里「调用组件」指向的 .bp.json 不存在（含子画布与递归嵌套）。
-      2. 用了 OCR 但没带 ocr_runtime/ 目录 → 导出的 EXE 识别节点必然报「OCR 未安装」。
+      2. 用了 OCR 但本机还没准备 ocr_runtime/（导出会自动携带它，缺了则 EXE 的识别节点会报「OCR 未安装」）。
       3. 运行时模板比编辑器里的运行时代码旧 → 导出的 EXE 跑的还是旧代码（需执行 start.cmd build-runtime）。
     """
     issues: List[Dict[str, str]] = []
@@ -164,14 +267,17 @@ def preflight(graph, project_root: Optional[str] = None) -> List[Dict[str, str]]
                        "运行到该节点会失败（按空操作跳过）。",
             })
 
-    # ---------- 2) OCR 运行时 ----------
+    # ---------- 2) OCR 模型 ----------
+    # 含「文字」节点时，导出会自动把 ocr_runtime/models 复制到 EXE 同级
+    # （库已内置于模板，只需模型）；只有「模型还没预取」才需要提醒。
     try:
         if uses_ocr(graph, project_root=project_root):
-            if not any(os.path.isdir(d) for d in _ocr_runtime_dirs()):
+            if not ocr_runtime_source_dir():
                 issues.append({
                     "level": "warn",
-                    "msg": "蓝图包含「文字」节点，但没找到 ocr_runtime/ 目录："
-                           "导出后必须把 ocr_runtime/ 放到 EXE 同级目录，否则识别节点会报「OCR 未安装」。",
+                    "msg": "蓝图包含「文字」节点，但本机还没有 OCR 模型（ocr_runtime/models/）。"
+                           "导出会自动把它复制到 EXE 同级，现在缺了这一步，导出的 EXE 首次识别会联网下载模型。"
+                           "请先在启动器选「准备 OCR 运行时」（命令行：start.cmd ocr-runtime）。",
                 })
     except Exception:
         pass
@@ -295,11 +401,23 @@ def export_blueprint(
     if not has_payload(out_abs):
         return ExportResult(ok=False, message="导出文件校验失败：未检测到载荷，请重试。")
 
+    # OCR 运行时：**只**在蓝图含「文字」节点时随 EXE 携带
+    # （没用 OCR 的导出物一个字节都不多带 —— 这就是设计里的「按需」）。
+    ocr_carried = False
+    ocr_note = ""
+    try:
+        if uses_ocr(graph, project_root=source_project):
+            ocr_carried, ocr_note = carry_ocr_runtime(out_abs)
+    except Exception as e:  # noqa: BLE001
+        ocr_note = f"携带 OCR 运行时失败：{e}"
+
     return ExportResult(
         ok=True,
         out_path=out_abs,
         asset_count=payload.asset_count,
         total_bytes=total,
         missing=list(payload.missing),
+        ocr_carried=ocr_carried,
+        ocr_note=ocr_note,
         message="导出完成",
     )

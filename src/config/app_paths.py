@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import shutil
@@ -58,6 +59,67 @@ INTERNAL_DIR = get_internal_dir()
 CONFIG_DIR = os.path.join(APP_DIR, "config")
 USER_CONFIG_FILE = os.path.join(APP_DIR, "config.json")
 LOG_FILE = os.path.join(APP_DIR, "bot_log.txt")
+
+# ============================================================
+# OCR 运行时目录
+#   <APP_DIR>/ocr_runtime/models  ← 识别模型（PADDLE_PDX_CACHE_HOME 指向这里）
+# 2026-10-05 方案变更：OCR **库**（paddlepaddle/paddleocr）装进 .venv、由 PyInstaller
+# 打进运行时模板；`ocr_runtime/` 里只剩**模型**，导出时按需复制到 EXE 同级。
+# ============================================================
+OCR_RUNTIME_DIRNAME = "ocr_runtime"
+
+
+# ---------------------------------------------------------------------------
+# 非 ASCII 路径规避（paddle C++ 层的硬限制）
+#
+# 现象：EXE / ocr_runtime 放在含中文的路径下（如 C:\Users\<中文用户名>\Desktop），
+# PaddleOCR 初始化报
+#   [json.exception.parse_error.101] parse error ... attempting to parse an empty input
+# 根因：paddle 的 C++（libpaddle）在 Windows 上用**窄字符 API** 打开模型文件，
+#   中文路径读不到 → 内容为空 → nlohmann 解析空输入报错。Python 层（import / json）
+#   都正常，只有 C++ 读文件这一段挂。
+# 规避：在 C:\Users\Public（天生全 ASCII 且人人可写）下建一个**目录联接（junction）**
+#   指向真实 ocr_runtime —— 联接目标由内核以宽字符解析，C++ 打开的路径全程 ASCII。
+#   实测同一份文件：中文路径 FAIL / ASCII 联接 PASS。
+# ---------------------------------------------------------------------------
+
+_ASCII_VIEW_ROOT = r"C:\Users\Public\BlueprintOCR"
+
+
+def _has_non_ascii(s: str) -> bool:
+    return any(ord(ch) > 127 for ch in s)
+
+
+def ocr_runtime_view_dir() -> str:
+    """返回 ocr_runtime 的「纯 ASCII 视图」路径（paddle C++ 能正确打开的那种）。
+
+    - 真实路径本就全 ASCII → 原样返回，零开销。
+    - 含非 ASCII → 在 C:\\Users\\Public\\BlueprintOCR\\<hash> 建目录联接并返回联接路径。
+    - 建联接失败（Public 不可写等罕见情况）→ 回退真实路径（此时 OCR 会报
+      json parse error，但至少行为与修复前一致）。
+
+    调用点：ocr_engine.get_runtime_dir()（模型缓存路径）。Python 自己读写文件不受
+    影响，走这条视图只是为了喂 paddle C++（库已内置于 .venv/模板，不再涉及 sys.path）。
+    """
+    real = os.path.join(APP_DIR, OCR_RUNTIME_DIRNAME)
+    if not _has_non_ascii(real):
+        return real
+    link = os.path.join(
+        _ASCII_VIEW_ROOT, hashlib.md5(real.lower().encode("utf-8")).hexdigest()[:16]
+    )
+    if os.path.isdir(link):
+        return link
+    try:
+        os.makedirs(_ASCII_VIEW_ROOT, exist_ok=True)
+        # CPython 内置 _winapi.CreateJunction（shutil 同款）：不需要管理员权限，
+        # 也不用绕 cmd mklink 的参数解析怪癖。目标为中文路径没问题——联接目标由
+        # 内核以宽字符解析，paddle C++ 打开的联接路径全程 ASCII。
+        import _winapi
+
+        _winapi.CreateJunction(real, link)
+    except Exception:
+        return real
+    return link if os.path.isdir(link) else real
 # CACHE_DIR / TEMPLATE_CACHE_FILE / TEMPLATE_META_FILE：
 #   有工程时用工程目录的 cache/（通过 cache_dir()）
 #   未开工程时回退到全局 APP_DIR/cache/

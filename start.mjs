@@ -13,6 +13,7 @@
  *   start.cmd deps                 只检查/安装依赖
  *   start.cmd build                打包发布版（编辑器 + 运行时模板）
  *   start.cmd build-runtime        只重打运行时模板
+ *   start.cmd ocr-runtime          准备 OCR 运行时目录 ocr_runtime/（库 + 模型）
  *   start.cmd env                  查看环境信息与模板新鲜度
  *   追加 --force 强制重装依赖；追加 --yes 跳过交互（等价菜单默认项 1）
  */
@@ -142,13 +143,32 @@ const KEY_IMPORTS = ['PySide6', 'cv2', 'numpy', 'PIL', 'win32gui', 'psutil', 'py
 /** 检查关键依赖；缺失（或 force）时按 requirements.txt 安装 */
 async function ensureDeps(py, { force = false } = {}) {
   if (!force) {
-    const code = KEY_IMPORTS.map((m) => `import ${m}`).join('; ');
-    const res = runSync(py, ['-c', code]);
-    if (res.status === 0) {
-      ok('关键依赖已就绪（PySide6 / cv2 / numpy / PIL / win32gui / psutil / pynput）');
+    // 逐模块各起一个子进程检查（与 bp_dev.have_module 口径一致）。
+    // 不要拼成一条 `import A; import B; ...`：单进程里库之间的导入交互会让整体
+    // 误报失败，且日志看不出缺的是谁。
+    const missing = [];
+    for (const m of KEY_IMPORTS) {
+      const res = runSync(py, ['-c', `import ${m}`]);
+      if (res.status !== 0) missing.push(m);
+    }
+    // OCR 库单独查（find_spec 秒回，不触发 paddle 重型导入）
+    let ocrReady = false;
+    if (missing.length === 0) {
+      const ocr = runSync(py, [
+        '-c',
+        "import importlib.util,sys;sys.exit(0 if importlib.util.find_spec('paddleocr') else 1)",
+      ]);
+      ocrReady = ocr.status === 0;
+    }
+    if (missing.length === 0 && ocrReady) {
+      ok('关键依赖已就绪（PySide6 / cv2 / numpy / PIL / win32gui / psutil / pynput + OCR 库）');
       return true;
     }
-    warn('部分关键依赖缺失，准备安装。');
+    if (missing.length > 0) {
+      warn(`缺少依赖：${missing.join('、')}`);
+    } else {
+      warn('OCR 库（paddlepaddle/paddleocr）缺失，准备按 requirements.txt 一起安装。');
+    }
   }
   if (!fs.existsSync(REQUIREMENTS)) {
     fail(`找不到依赖清单：${REQUIREMENTS}`);
@@ -164,6 +184,30 @@ async function ensureDeps(py, { force = false } = {}) {
   }
   ok('依赖安装完成');
   return true;
+}
+
+const OCR_MODELS_DIR = path.join(ROOT, 'ocr_runtime', 'models');
+
+/** OCR 识别模型预取：缺失时自动下载到 ocr_runtime/models（导出 EXE 时自动携带）。失败不阻塞主流程。 */
+async function ensureOcrModels(py) {
+  let has = false;
+  try {
+    has = fs.existsSync(OCR_MODELS_DIR) && fs.readdirSync(OCR_MODELS_DIR).length > 0;
+  } catch {
+    has = false;
+  }
+  if (has) {
+    ok('OCR 模型已在位（ocr_runtime/models）。');
+    return true;
+  }
+  log('OCR 识别模型未预取，自动下载中（约 180MB，首次需要几分钟）……');
+  const code = await dispatch(py, 'ocr-runtime', ['--models-only']);
+  if (code === 0) {
+    ok('OCR 模型已就绪（导出含「文字」节点的 EXE 时自动携带）。');
+    return true;
+  }
+  warn('OCR 模型下载未完成（不影响编辑器使用；下次运行 start.cmd 会自动重试）。');
+  return false;
 }
 
 /** 转发到 Python 侧真实实现 */
@@ -188,11 +232,11 @@ function printBanner() {
 
 function printMenu() {
   log('请选择操作：');
-  log(`  ${c.bold}1${c.reset}. 启动编辑器（开发模式，自动检查依赖）`);
-  log(`  ${c.bold}2${c.reset}. 仅检查 / 安装环境依赖（不启动）`);
+  log(`  ${c.bold}1${c.reset}. 启动编辑器（开发模式，自动检查依赖与 OCR 模型）`);
+  log(`  ${c.bold}2${c.reset}. 仅检查 / 安装环境依赖与 OCR 模型（不启动）`);
   log(`  ${c.bold}3${c.reset}. 打包发布版（编辑器 + 运行时模板 → dist\\BlueprintAutomation）`);
   log(`  ${c.bold}4${c.reset}. 仅重打运行时模板（供「导出为独立 EXE」使用）`);
-  log(`  ${c.bold}5${c.reset}. 查看环境信息（版本 / 依赖 / 模板新鲜度）`);
+  log(`  ${c.bold}5${c.reset}. 查看环境信息（版本 / 依赖 / 模板新鲜度 / OCR 运行时）`);
   log(`  ${c.bold}6${c.reset}. 退出`);
   log('');
 }
@@ -205,6 +249,7 @@ const SUBCOMMANDS = {
   'build-all': 'build-all',
   'build-editor': 'build-editor',
   'build-runtime': 'build-runtime',
+  'ocr-runtime': 'ocr-runtime',
   env: 'env',
 };
 
@@ -227,12 +272,12 @@ async function main() {
   if (subArg) {
     if (!(subArg in SUBCOMMANDS)) {
       fail(`未知命令：${subArg}`);
-      log('  可用命令：dev | deps | build | build-editor | build-runtime | env');
+      log('  可用命令：dev | deps | build | build-editor | build-runtime | ocr-runtime | env');
       return;
     }
     choice = SUBCOMMANDS[subArg];
     if (choice === '__deps_only__') {
-      await ensureDeps(py, { force });
+      if (await ensureDeps(py, { force })) await ensureOcrModels(py);
       ok('依赖处理完成，未启动任何程序。');
       return;
     }
@@ -254,8 +299,11 @@ async function main() {
   switch (choice) {
     case '1':
     case 'run': {
-      if (!(await ensureDeps(py, { force }))) {
+      const depsReady = await ensureDeps(py, { force });
+      if (!depsReady) {
         warn('依赖未完全就绪，仍尝试启动编辑器（缺包时会报导入错误）。');
+      } else {
+        await ensureOcrModels(py);
       }
       const extra = [...(force ? ['--force'] : []), ...passthrough];
       const code = await dispatch(py, 'run', extra);
@@ -265,7 +313,7 @@ async function main() {
     }
     case '__deps_only__':
     case '2': {
-      await ensureDeps(py, { force });
+      if (await ensureDeps(py, { force })) await ensureOcrModels(py);
       ok('依赖处理完成，未启动。之后运行 start.cmd 选 1 即可启动编辑器。');
       return;
     }
@@ -286,6 +334,13 @@ async function main() {
     }
     case 'build-editor': {
       await dispatch(py, 'build-editor', passthrough);
+      return;
+    }
+    case 'ocr-runtime': {
+      await ensureDeps(py, { force });
+      const code = await dispatch(py, 'ocr-runtime', passthrough);
+      if (code === 0) ok('OCR 已就绪：库在 .venv 随模板打包，模型在 ocr_runtime/models 随导出携带。');
+      else fail(`OCR 准备失败（退出码 ${code}）。`);
       return;
     }
     case 'env':

@@ -24,9 +24,13 @@ _THIS = os.path.abspath(__file__)
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(_THIS))
 
 # 开发模式：把项目根放进 sys.path，才能 import src.blueprint.*
-# 打包后（frozen）依赖已经内置，无需处理。
 if not getattr(sys, "frozen", False) and _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
+
+# OCR（可选）：库（paddle 等）已随模板打包进 EXE（PyInstaller 收集自 .venv）；
+# 模型仍外挂在 exe 同级的 ocr_runtime/models（蓝图含「文字」节点时由导出流程携带）。
+# 模型路径由 src/blueprint/runtime/ocr_engine.get_runtime_dir() 解析（含中文路径的
+# ASCII 视图规避，见 app_paths.ocr_runtime_view_dir）。
 
 
 # ============================================================

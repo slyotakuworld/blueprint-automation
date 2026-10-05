@@ -62,6 +62,9 @@ _PROJECT_ROOT = os.path.dirname(_CURRENT_DIR)
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
+# OCR（可选）：库（paddle 等）装在 .venv 里（start.cmd ocr-runtime 安装），
+# 开发模式直接 import 即可；模型在 ocr_runtime/models，由 ocr_engine 解析。
+
 import uuid
 
 from src.blueprint.core.graph_store import BlueprintStore
@@ -3221,12 +3224,31 @@ class BlueprintMainWindow(QMainWindow):
                 # --- 按 mode 回填参数 ---
                 # 静止 / 截图 / 文字：roi 一律是 tuple4 (x,y,w,h)（三者同款参数样式）
                 if m in ("if_static_roi", "screenshot_roi", "ocr_roi"):
-                    self._on_param_changed(nid, "roi", (int(x1), int(y1), int(w), int(h)))
+                    # ★ roi 坐标系必须与运行时一致（节点文档：「window 模式相对窗口左上角」）：
+                    #   · 框选被限定在目标窗口内（limit_rect 非空）→ 存**相对窗口左上角**；
+                    #   · 未限定（fullscreen 模式 / 目标窗口没找到）→ 存**屏幕绝对坐标**。
+                    # 运行时 _crop_roi 是对「窗口局部图」裁剪、if_static 回退抓屏还会加窗口偏移，
+                    # 所以 window 模式存绝对坐标会让裁剪整体右/下偏移（甚至只剩一条窄边），
+                    # 表现就是「窗口里明明有字，测试识别/运行却说没识别到」（2026-10-05 定位）。
+                    rx, ry = int(x1), int(y1)
+                    if limit_rect:
+                        try:
+                            rx = int(x1) - int(limit_rect[0])
+                            ry = int(y1) - int(limit_rect[1])
+                        except Exception:
+                            rx, ry = int(x1), int(y1)
+                    elif limit_status == "notfound":
+                        self._log.append_log(
+                            "[Snip] 目标窗口当前没找到，本次 ROI 只能按「屏幕绝对坐标」记录；"
+                            "该节点是「目标窗口」模式，等窗口就绪后这份 ROI 会对不上，"
+                            "建议窗口打开时重新框选一次 ROI。", "WARN")
+                    self._on_param_changed(nid, "roi", (rx, ry, int(w), int(h)))
                     self._on_param_changed(nid, "roi_preview_b64", b64)
                     tag = {"if_static_roi": "[if_static]", "screenshot_roi": "[screenshot]",
                            "ocr_roi": "[ocr]"}.get(m, "[roi]")
+                    origin = "窗口相对" if limit_rect else "屏幕绝对"
                     self._log.append_log(
-                        f"{tag} ROI框选完成: ({x1},{y1}) {w}×{h}", "SUCCESS"
+                        f"{tag} ROI框选完成: {origin}({rx},{ry}) {w}×{h}", "SUCCESS"
                     )
                     self._inspector.set_node(node)
                     return

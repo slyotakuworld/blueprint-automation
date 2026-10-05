@@ -23,14 +23,38 @@ os.environ.setdefault("FLAGS_use_mkldnn", "0")
 
 
 def get_runtime_dir() -> str:
-    """返回 OCR 运行时目录（模型缓存放这里）。可被动态打包/测试覆盖。"""
-    from src.config.app_paths import APP_DIR
+    """返回 OCR 运行时目录（模型缓存放这里）。可被动态打包/测试覆盖。
 
-    return os.path.join(APP_DIR, "ocr_runtime")
+    ⚠ 用「ASCII 视图」——paddle 的 C++ 层打不开含中文的路径（窄字符 API），
+    中文用户名的电脑上 EXE 放桌面/下载等目录时，模型必须经
+    C:\\Users\\Public 下的目录联接访问。详见 app_paths.ocr_runtime_view_dir()。
+    """
+    from src.config.app_paths import ocr_runtime_view_dir
+
+    return ocr_runtime_view_dir()
 
 
 class OcrUnavailable(Exception):
     """OCR 引擎不可用（依赖未安装 / 模型未就绪）。"""
+
+
+def _chain(e: BaseException, depth: int = 5) -> str:
+    """把异常 __cause__ 链拼成一串。
+
+    paddleocr 会把自己的真实错误用 `raise RuntimeError(...) from e` 包一层
+    （如 paddlex 的 DependencyError 不写明细，只留一句「参照安装文档」），
+    不挖 __cause__ 就永远看不到真凶。
+    """
+    parts: list[str] = []
+    seen: set[int] = set()
+    cur: Optional[BaseException] = e
+    while cur is not None and depth > 0 and id(cur) not in seen:
+        seen.add(id(cur))
+        msg = str(cur).strip()
+        parts.append(f"{type(cur).__name__}: {msg}" if msg else type(cur).__name__)
+        cur = cur.__cause__ or cur.__context__
+        depth -= 1
+    return " <- ".join(parts)
 
 
 class OcrEngine:
@@ -54,7 +78,8 @@ class OcrEngine:
                 from paddleocr import PaddleOCR
             except ImportError as e:
                 raise OcrUnavailable(
-                    "PaddleOCR 未安装。请运行: pip install paddlepaddle paddleocr"
+                    "未找到 OCR 引擎（paddleocr）。请先准备 OCR：启动器选"
+                    "「准备 OCR 运行时」（命令行：start.cmd ocr-runtime）。"
                 ) from e
             try:
                 self._engine = PaddleOCR(
@@ -63,7 +88,7 @@ class OcrEngine:
                     enable_mkldnn=False,
                 )
             except Exception as e:
-                raise OcrUnavailable(f"PaddleOCR 初始化失败: {e}") from e
+                raise OcrUnavailable(f"PaddleOCR 初始化失败: {_chain(e)}") from e
             return self._engine
 
     def recognize(self, img_bgr: np.ndarray) -> Dict[str, Any]:
