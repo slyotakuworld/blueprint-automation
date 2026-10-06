@@ -1,10 +1,24 @@
 import os
 import re
+import threading
 import time
 
 import cv2
 
 from ...config.app_paths import debug_dir
+
+
+# 步骤号自增锁：并行分支是多线程并发，`ctx.step_counter += 1` 不是原子操作，
+# 两个线程可能读到同一个值再各自写回 → 撞号（两张证据图写进同一文件名互相覆盖），
+# 日志里的 Step 号也会乱序。统一走这把锁自增。
+_step_counter_lock = threading.Lock()
+
+
+def bump_step(ctx) -> int:
+    """原子地推进并返回当前步骤号（所有 step_counter 自增都必须走这里）。"""
+    with _step_counter_lock:
+        ctx.step_counter += 1
+        return ctx.step_counter
 
 
 def _safe_dirs(run_id: str) -> str:
@@ -23,8 +37,7 @@ def annotate_step(ctx, node, kind, pos=None, region=None, template_rect=None, no
     template_rect: (x,y,w,h) 找图命中的模板矩形(蓝框)
     note:   顶部白字备注
     """
-    ctx.step_counter += 1
-    step = ctx.step_counter
+    step = bump_step(ctx)
     try:
         screen = None
         if ctx.screen is not None:

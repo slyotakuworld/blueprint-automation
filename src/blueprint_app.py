@@ -37,10 +37,12 @@ from PySide6.QtWidgets import (
     QDialog,
     QDockWidget,
     QFileDialog,
+    QFormLayout,
     QFrame,
     QHBoxLayout,
     QInputDialog,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
@@ -224,6 +226,17 @@ class BlueprintMainWindow(QMainWindow):
         self._current_path: Optional[str] = None
         self._graph: Optional[BlueprintGraph] = None
         self._last_saved_graph_hash: Optional[str] = None  # 上一次保存/加载时的蓝图哈希，None=从未落盘
+        # 「设置变量」节点的数据输出端口（= batch_text 里的变量名）防抖重建：
+        # batch_text 是**逐字符** textChanged 提交的，若每敲一个字就重建端口，
+        # 画布会疯狂重建/重连边 —— 所以这里只登记待处理节点，停手后再统一对齐一次。
+        self._setvar_port_pending: set = set()
+        # 上次已提示过的「写错的行」指纹（node_id -> 错误摘要），同一种错误只提醒一次，
+        # 避免打字过程中每停 400ms 就往日志里刷一条 WARN。
+        self._setvar_err_reported: Dict[str, str] = {}
+        self._setvar_port_timer = QTimer(self)
+        self._setvar_port_timer.setSingleShot(True)
+        self._setvar_port_timer.setInterval(400)
+        self._setvar_port_timer.timeout.connect(self._apply_setvar_output_ports)
         self._runner: Optional[BlueprintRunner] = None
         # 工程系统
         self._pm: ProjectManager = ProjectManager.instance()
@@ -1009,20 +1022,14 @@ class BlueprintMainWindow(QMainWindow):
         if self._graph is None or node_id not in self._graph.nodes:
             return
         node = self._graph.nodes[node_id]
-        # 三种子画布容器节点：参数键名 -> 子画布 kind
-        _container_map = {
-            "Loop": ("loop_body", "loop"),
-            "Sequence": ("seq_body", "seq"),
-            "Parallel": ("par_body", "parallel"),
-        }
-        if node.type in _container_map:
-            body_key, kind = _container_map[node.type]
+        # 三种子画布容器节点：节点类型 -> (回写参数键名, 子画布 kind)
+        if node.type in self._CONTAINER_BODY_KEYS:
+            body_key, kind = self._CONTAINER_BODY_KEYS[node.type]
             body = node.params.get(body_key)
-            if isinstance(body, dict) and body.get("nodes"):
-                self._enter_subgraph(node, body_key, kind)
-            else:
-                self._create_empty_subgraph(node, body_key, kind)
-                self._enter_subgraph(node, body_key, kind)
+            if not (isinstance(body, dict) and body.get("nodes")):
+                # 还没初始化过 → 先在内存里造一份空子画布（刻意不写进 params，见 _create_empty_subgraph）
+                body = self._create_empty_subgraph(node, body_key, kind)
+            self._enter_subgraph(node, body_key, kind, body)
             return
         # 组件节点：双击 → 跳到它调用的那张组件蓝图（跳转前问是否保存当前修改）
         if node.type == "Component":
@@ -1083,11 +1090,71 @@ class BlueprintMainWindow(QMainWindow):
         self._open_blueprint_path(abs_path)
         self._log.append_log(f"[Component] 已跳转到组件蓝图：{os.path.basename(abs_path)}", "SUCCESS")
 
-    def _create_empty_subgraph(self, host_node, body_key: str, kind: str):
-        """给子画布容器节点创建一个空的子图（含一个起始节点）。
+    # ---------------- 子画布 body 的「统一口径」（读 / 写 / 算哈希三处必须完全一致）----------------
+    @staticmethod
+    def _sub_canonical(sub) -> Optional[dict]:
+        """把子画布图对象规范化成「只含 nodes + links」的纯 dict。
+
+        为什么不能直接用 `sub.to_dict()`：
+          ① to_dict 会带上 bp_type / breakpoints / metadata(name, created_at…)，而 metadata.created_at
+             在构造 BlueprintGraph 时被填成「当前时间」→「进子画布看一眼再退出」就会把 body 改一次，
+             文档哈希随之变化 → 标题栏误报未保存 *，而且每进出一次文件内容就变一次。
+          ② links 顺序是按边 id 排的，而边 id 在加载时由 hash() 生成、跨进程不稳定 →
+             同一个 body 在不同次启动下顺序不同 → 又是假脏。
+        所以统一口径：只留 nodes + links，且 links 按「端口四元组」稳定排序。
+        """
+        if sub is None:
+            return None
+        try:
+            d = sub.to_dict()
+        except Exception:
+            return None
+        links = d.get("links")
+        if not isinstance(links, list):
+            links = []
+
+        def _k(l):
+            if not isinstance(l, dict):
+                return ("", "", "", "")
+            return (
+                str(l.get("from_node", "")), str(l.get("from_port", "")),
+                str(l.get("to_node", "")), str(l.get("to_port", "")),
+            )
+
+        return {
+            "nodes": d.get("nodes") if isinstance(d.get("nodes"), dict) else {},
+            "links": sorted(links, key=_k),
+        }
+
+    @classmethod
+    def _sub_hash(cls, sub) -> Optional[str]:
+        """子画布内容的指纹（用统一口径算，跨进程稳定）。"""
+        d = cls._sub_canonical(sub)
+        if d is None:
+            return None
+        try:
+            canonical = json.dumps(d, sort_keys=True, ensure_ascii=False, indent=2)
+            return hashlib.sha1(canonical.encode("utf-8")).hexdigest()
+        except Exception:
+            return None
+
+    def _sub_changed(self, item: dict, sub) -> bool:
+        """相对「进入子画布那一刻」有没有真实改动。算不出指纹时保守返回 True。"""
+        if sub is None:
+            return True
+        cur = self._sub_hash(sub)
+        if cur is None:
+            return True
+        return cur != item.get("entry_hash")
+
+    def _create_empty_subgraph(self, host_node, body_key: str, kind: str) -> dict:
+        """构造一个空的子图 body（含一个起始节点）并返回，**不写进 host_node.params**。
 
         起始节点按容器类型区分：并行体用「分支入口 Branch」（运行时只认 Branch，
         开始节点在并行体里不参与执行），循环体/顺序体用「开始 Start」。
+
+        ⚠ 只「造」不「写」是刻意的：双击进去看一眼不算修改。body 只有在用户真的在
+        子画布里有改动时，才会在「退出子画布 / 保存」时写回宿主节点的 params。
         """
         from src.blueprint.core.node_library import create_node as _cn
         start_type = "Branch" if kind == "parallel" else "Start"
@@ -1096,23 +1163,115 @@ class BlueprintMainWindow(QMainWindow):
             "nodes": {start.id: start.to_dict()},
             "links": [],
         }
-        host_node.params[body_key] = body
         title = {"loop": "循环", "seq": "顺序执行", "parallel": "并行执行"}.get(kind, "子画布")
         self._log.append_log(
-            f"已为「{title}」节点创建空的子画布（含「{'分支入口' if kind == 'parallel' else '开始'}」），双击即可进入编辑。",
+            f"「{title}」节点的子画布还是空的，已自动放入一个"
+            f"「{'分支入口' if kind == 'parallel' else '开始'}」节点。在里面编辑后退出/保存才会写回蓝图。",
             "INFO",
         )
+        return body
 
-    def _enter_subgraph(self, host_node, body_key: str, kind: str):
-        """进入子画布容器节点（Loop/Sequence/Parallel）的子画布：父图压栈，切换渲染。"""
-        from src.blueprint.core.models import BlueprintGraph
-        body = host_node.params.get(body_key)
-        if not (isinstance(body, dict) and body.get("nodes")):
+    # 三种子画布容器节点：节点类型 → (回写参数键名, 子画布 kind)
+    _CONTAINER_BODY_KEYS = {
+        "Loop": ("loop_body", "loop"),
+        "Sequence": ("seq_body", "seq"),
+        "Parallel": ("par_body", "parallel"),
+    }
+
+    # 子画布专用上下文节点：在哪一层的容器里，左侧节点库就额外给出对应节点
+    _CONTEXT_NODES = {"loop": ["Continue", "Break"], "parallel": ["Branch"]}
+
+    def _apply_context_nodes(self, kind):
+        """按「当前所在层的容器类型」刷新左侧节点库的上下文节点。
+
+        loop → Continue/Break；parallel → Branch；其余（根图 / 顺序体）→ 无。
+
+        ⚠ 退出子画布时也必须按「新的当前层」重新套用 —— 否则
+        「进循环体（有 Continue/Break）→ 再进并行体 → 退回循环体」时，
+        这几个节点会被上一次的 set_context_nodes([]) 清掉，看起来就是「节点不见了」。
+        """
+        palette = getattr(self, "_palette", None)
+        if palette is None:
             return
+        try:
+            palette.set_context_nodes(list(self._CONTEXT_NODES.get(kind, [])))
+        except Exception:
+            pass
+
+    def _enter_subgraph(self, host_node, body_key: str, kind: str, body=None, quiet: bool = False):
+        """进入子画布容器节点（Loop/Sequence/Parallel）的子画布：父图压栈，切换渲染。
+
+        quiet=True 用于「运行时自动跟随」：照常切换画布，但不往日志面板刷「进入子画布」这类噪音。
+        """
+        from src.blueprint.core.models import BlueprintGraph
+        if not isinstance(body, dict):
+            body = host_node.params.get(body_key)
+        if not (isinstance(body, dict) and body.get("nodes")):
+            body = self._create_empty_subgraph(host_node, body_key, kind)
+
+        # ---- 进画布前的体检 ----
+        # 历史 bug 的形态：中途保存会把「父图内容」误写进 loop_body，再进循环体看到的就是整张父图；
+        # 若父图里又有本容器节点，就变成自我嵌套、每保存一次膨胀一层。
+        # ⚠ 注意：节点 id 是「每张图各自编号」的，"1" 在不同层级重复出现是完全正常的
+        #   （父图有 1，子画布里第一个节点也叫 1）。所以下面【只告警、绝不改内容】——
+        #   宁可提示一句，也绝不能因为误判把用户辛苦搭好的子画布清空。
+        _MAX_SUBGRAPH_DEPTH = 32
+        if len(self._subgraph_stack) >= _MAX_SUBGRAPH_DEPTH:
+            self._log.append_log(
+                f"[子画布] 嵌套层级已达上限 {_MAX_SUBGRAPH_DEPTH} 层，为防递归失控已阻止继续进入。"
+                f"请检查是不是哪里套得太深。",
+                "ERROR",
+            )
+            return
+        bnodes = body.get("nodes") or {}
+        parent = self._graph
+        # 体检只在「用户手动进来」时提示：运行时自动跟随会反复进出同一层，
+        # 每次都刷一遍 WARN 会把运行日志冲掉（要看去手动双击一次即可）。
+        if (not quiet) and parent is not None and bnodes:
+            # 泄漏判据必须够严：只看「id 集合相同」会误报 —— 两张小图恰好都只有 start 和 1 是很常见的。
+            # 所以要求「id 完全一致 且 每个 id 的节点类型也一模一样」，才认定是「父图被整体写进子画布」。
+            _bid = set(bnodes.keys())
+            _pid = set(parent.nodes.keys())
+            if _bid == _pid:
+                _types_match = True
+                for _k in _bid:
+                    _bnd = bnodes.get(_k) or {}
+                    _pnd = parent.nodes.get(_k)
+                    _ptype = getattr(_pnd, "type", None)
+                    try:
+                        from src.blueprint.core.node_library import NODE_LIBRARY as _NL2
+                        _pshort = getattr(_NL2.get(_ptype), "type_short_name", _ptype)
+                    except Exception:
+                        _pshort = _ptype
+                    if str(_bnd.get("type", "")) != str(_pshort):
+                        _types_match = False
+                        break
+                if _types_match:
+                    self._log.append_log(
+                        f"[子画布] 「{host_node.type} {host_node.id}」的 {body_key} 内容和父图一模一样"
+                        f"（id 与类型全部对上），疑似父图被整体误写进了子画布（历史 bug 形态）。"
+                        f"请先确认内容是否正确，再决定是否保存。",
+                        "WARN",
+                    )
+            _nested = bnodes.get(host_node.id)
+            if isinstance(_nested, dict):
+                try:
+                    from src.blueprint.core.node_library import NODE_LIBRARY as _NL
+                    _short = getattr(_NL.get(host_node.type), "type_short_name", host_node.type)
+                except Exception:
+                    _short = host_node.type
+                if str(_nested.get("type", "")) == str(_short):
+                    self._log.append_log(
+                        f"[子画布] 「{host_node.type} {host_node.id}」的 {body_key} 里出现了同类型同 id 的容器节点，"
+                        f"疑似自我嵌套（越保存越大）。如果这是有意套的可以忽略本条，否则建议删掉多余层级。",
+                        "WARN",
+                    )
+
+        # 读取口径与写回口径一致：只喂 nodes + links，不注入 metadata
+        # （否则子图会带上「构造时刻」的 created_at，一往返就变）
         sub = BlueprintGraph.from_dict({
             "nodes": body.get("nodes", {}),
             "links": body.get("links", []),
-            "metadata": {"name": f"{host_node.id}::{body_key}"},
         })
         sub._host_node_id = host_node.id
         self._subgraph_stack.append({
@@ -1121,26 +1280,26 @@ class BlueprintMainWindow(QMainWindow):
             "parent_graph": self._graph,
             "node_id": host_node.id,
             "sub_graph": sub,        # 本层子图对象：退出/回写时以此为准，不能依赖 self._graph
+            "entry_hash": self._sub_hash(sub),  # 进入时的内容指纹：判断「有没有真改过」
         })
         self._scene.set_graph(sub)
         self._graph = sub
         self._inspector.set_node(None)
         # 上下文节点：循环体注入 Continue/Break；并行体注入 Branch
-        if kind == "loop":
-            self._palette.set_context_nodes(["Continue", "Break"])
-        elif kind == "parallel":
-            self._palette.set_context_nodes(["Branch"])
-        else:
-            self._palette.set_context_nodes([])
+        self._apply_context_nodes(kind)
         self._refresh_breadcrumb()
-        title = {"loop": "循环", "seq": "顺序执行", "parallel": "并行执行"}.get(kind, "子画布")
-        self._log.append_log(
-            f"进入「{title}」节点 {host_node.id[:8]} 的子画布。双击节点内容可编辑；点「← 返回父图」退出。",
-            "INFO",
-        )
+        if not quiet:
+            title = {"loop": "循环", "seq": "顺序执行", "parallel": "并行执行"}.get(kind, "子画布")
+            self._log.append_log(
+                f"进入「{title}」节点 {host_node.id[:8]} 的子画布。双击节点内容可编辑；点「← 返回父图」退出。",
+                "INFO",
+            )
 
-    def _exit_subgraph(self):
-        """退出当前子画布，返回父图。"""
+    def _exit_subgraph(self, quiet: bool = False):
+        """退出当前子画布，返回父图。
+
+        quiet=True 用于「运行时自动跟随」：照常回写/切换画布，但不往日志面板刷噪音。
+        """
         if not self._subgraph_stack:
             return
         item = self._subgraph_stack.pop()
@@ -1150,19 +1309,30 @@ class BlueprintMainWindow(QMainWindow):
         # 回写子图内容到宿主节点：必须用栈里记录的本层子图对象，不能用 self._graph。
         # 否则一旦中途保存过（保存时 self._graph 可能被临时指向父图），
         # 这里就会把「父图内容」写进 loop_body —— 再进循环体看到的就变成整张父图（历史 bug）。
+        # 另外：只有「相对进入时真的改过」才写回 —— 双击进去看一眼不该把蓝图变脏。
         body_key = item.get("body_key")
         sub_graph = item.get("sub_graph") or self._graph
         if body_key and sub_graph is not None:
             node_id = item.get("node_id")
             host = parent_graph.nodes.get(node_id)
+            if host is not None and self._sub_changed(item, sub_graph):
+                host.params[body_key] = self._sub_canonical(sub_graph)
             if host is not None:
-                host.params[body_key] = sub_graph.to_dict()
+                # 无论本次写没写，都以当前内容刷新指纹：
+                # 未改 → 指纹不变；已改 → 写回后继续按新内容比对，避免反复进出造成假脏。
+                item["entry_hash"] = self._sub_hash(sub_graph)
         self._scene.set_graph(parent_graph)
         self._graph = parent_graph
         self._inspector.set_node(None)
-        self._palette.set_context_nodes([])  # 清空子画布专用节点
+        # ★ 必须按「退回去之后所在的层」重新套用上下文节点，不能无条件清空：
+        #   循环体里再进并行体时，退回循环体后 Continue/Break 要重新出现（否则看起来「节点不见了」）。
+        self._apply_context_nodes(
+            self._subgraph_stack[-1].get("kind") if self._subgraph_stack else None
+        )
         self._refresh_breadcrumb()
-        self._log.append_log("已返回父图。", "INFO")
+        self._update_title()  # 退出后刷新标题栏的「未保存 *」（未改动时不该出现星号）
+        if not quiet:
+            self._log.append_log("已返回父图。", "INFO")
 
     def _build_statusbar(self):
         self._status = QStatusBar(self)
@@ -1226,13 +1396,17 @@ class BlueprintMainWindow(QMainWindow):
         """
         # 0) 停止正在运行的 runner（防止旧 runner 继续执行旧图、高亮串到新图节点）
         self._stop_and_detach_runner()
+        # 0.4) 丢掉上一张蓝图遗留的「设置变量」端口对齐任务（节点 id 是每张图各自编号的，
+        #      留着可能在切换后打到新蓝图里恰好同 id 的节点上）
+        try:
+            self._setvar_port_pending.clear()
+            self._setvar_err_reported.clear()
+            self._setvar_port_timer.stop()
+        except Exception:
+            pass
         # 0.5) 重置子图导航栈 + palette 上下文（切换蓝图后不再停留在旧的子画布）
         self._subgraph_stack.clear()
-        if self._palette is not None:
-            try:
-                self._palette.set_context_nodes([])
-            except Exception:
-                pass
+        self._apply_context_nodes(None)  # 回到根图：左侧不再有子画布专用节点
         if self._breadcrumb_bar is not None:
             try:
                 self._breadcrumb_bar.setVisible(False)
@@ -1404,8 +1578,39 @@ class BlueprintMainWindow(QMainWindow):
         except Exception:
             pass
         self._log.append_log(f"已加载蓝图: {path}", "SUCCESS")
+        self._log_component_identity(path)
         self._update_title()
         self._refresh_assets()
+
+    def _log_component_identity(self, path: str):
+        """打开的若是「组件蓝图」，在日志里点明身份 + 当前被多少处引用。
+
+        组件蓝图与普通蓝图在编辑器里外观完全相同（标题栏 [组件] 之外没有其它线索），
+        而「改一张组件 = 同时改所有引用它的蓝图」，所以打开时就要说清楚。
+        """
+        try:
+            if not bp_kind_mod.is_component(path, self._proj_root()):
+                return
+        except Exception:
+            return
+        n_ref = 0
+        detail = ""
+        try:
+            refs = self._collect_component_refs(path)
+            n_ref = len(refs)
+            if refs:
+                shown = "、".join(f"{os.path.basename(r['bp'])} · {r['where']}" for r in refs[:5])
+                detail = f"（{shown}{' 等' if n_ref > 5 else ''}）"
+            else:
+                detail = "（当前没有任何「调用组件」节点引用它）"
+        except Exception:
+            pass
+        self._log.append_log(
+            "🧩 这是一张「组件蓝图」：改它会同时影响所有引用它的蓝图。"
+            f"当前工程里有 {n_ref} 处引用{detail}。"
+            "查看全部引用：资源树里右键本文件 → 🔗 谁引用了它",
+            "INFO",
+        )
         # 工程下的蓝图列表可能因为"最近修改时间"重排，下次打开工程下拉时自动刷新（aboutToShow 已经连了刷新）
 
     def _save_target_graph(self):
@@ -1446,21 +1651,38 @@ class BlueprintMainWindow(QMainWindow):
             QMessageBox.warning(self, "保存失败", "写入文件失败，请检查路径与权限。")
 
     def _flush_subgraph_to_host(self):
-        """把当前子图内容回写到宿主节点的 params（loop_body/seq_body/par_body），不改变导航栈、不切画布。"""
-        if not self._subgraph_stack or self._graph is None:
+        """把栈里**每一层**子画布的内容逐层回写到各自宿主节点的 params（loop_body/seq_body/par_body），
+        不改变导航栈、不切画布。
+
+        必须从最深一层往浅层回写：深层的宿主节点属于「上一层子图对象」，只有先写深层，
+        上一层回写时才会带上最新内容。多层嵌套（如 循环体 → 并行体）时只回写一层，
+        会让更外层拿到旧内容 → 存盘后重开丢内层修改，标题栏还会一直显示未保存 *。
+
+        只有「相对进入时真的改过」才写（查看 ≠ 修改）。写回用统一口径（只含 nodes+links），
+        并刷新指纹，保证「在子画布里按保存」不会把文档搞成假脏。
+        """
+        if not self._subgraph_stack:
             return
-        item = self._subgraph_stack[-1]
-        body_key = item.get("body_key")
-        if not body_key:
-            return
-        parent_graph = item.get("parent_graph")
-        node_id = item.get("node_id")
-        if parent_graph is None or node_id is None:
-            return
-        sub_graph = item.get("sub_graph") or self._graph
-        host = parent_graph.nodes.get(node_id)
-        if host is not None and sub_graph is not None:
-            host.params[body_key] = sub_graph.to_dict()
+        depth = len(self._subgraph_stack)
+        for idx in range(depth - 1, -1, -1):
+            item = self._subgraph_stack[idx]
+            body_key = item.get("body_key")
+            if not body_key:
+                continue
+            parent_graph = item.get("parent_graph")
+            node_id = item.get("node_id")
+            if parent_graph is None or node_id is None:
+                continue
+            sub_graph = item.get("sub_graph")
+            if sub_graph is None and idx == depth - 1:
+                sub_graph = self._graph  # 最顶层退而取当前图（正常情况下 sub_graph 一定有值）
+            if sub_graph is None:
+                continue
+            host = parent_graph.nodes.get(node_id)
+            if host is not None:
+                if self._sub_changed(item, sub_graph):
+                    host.params[body_key] = self._sub_canonical(sub_graph)
+                item["entry_hash"] = self._sub_hash(sub_graph)
 
     def _on_save_as(self):
         if self._graph is None:
@@ -2107,7 +2329,7 @@ class BlueprintMainWindow(QMainWindow):
         return total
 
     # ============================================================
-    # 组件：引用收集 / 反向依赖 / 端口自动对齐 / 循环引用检测
+    # 组件：引用收集 / 反向依赖 / 端口数核对（只提示）/ 循环引用检测
     # ============================================================
     def _proj_root(self) -> Optional[str]:
         """当前工程根目录（未打开工程返回 None）。"""
@@ -2256,7 +2478,7 @@ class BlueprintMainWindow(QMainWindow):
                 self._open_blueprint_path(picked["bp"])
                 self._log.append_log(f"[Component] 已跳转到引用方：{os.path.basename(picked['bp'])}", "SUCCESS")
 
-    # ---------------- 端口数自动对齐 ----------------
+    # ---------------- 组件端口数核对（只提示，绝不自动改） ----------------
     @staticmethod
     def _component_port_counts(sub_graph) -> tuple:
         """读子蓝图定义，返回 (入参端口数, 返回值端口数)；某一端不存在返回 None。"""
@@ -2280,8 +2502,52 @@ class BlueprintMainWindow(QMainWindow):
             pass
         return n_in, n_out
 
+    def _check_component_port_match(self, node, abs_path: str, rel_path: str) -> bool:
+        """核对「调用方端口数」与「组件 Start / End 声明的端口数」是否一致。
+
+        只写日志，**绝不改参数**：改 num_inputs / num_outputs 会让节点重建动态端口，
+        已经连好的线会断。所以这里只负责把不一致说出来，改不改、怎么改由用户决定。
+
+        返回 True = 一致（或组件没声明端口，无从核对）。
+        """
+        try:
+            sub = BlueprintStore.load(abs_path)
+        except Exception as e:
+            self._log.append_log(f"[Component] 读取组件失败：{e}", "WARN", node_id=node.id)
+            return True
+        if sub is None:
+            return True
+        n_in, n_out = self._component_port_counts(sub)
+        if n_in is None and n_out is None:
+            self._log.append_log(
+                f"提示：组件 {os.path.basename(rel_path)} 里没有 Start / End 节点，"
+                f"无法核对端口数（该组件也不会通过端口传参）。",
+                "INFO", node_id=node.id,
+            )
+            return True
+        cur_in = int(node.params.get("num_inputs", 0) or 0)
+        cur_out = int(node.params.get("num_outputs", 0) or 0)
+        diffs = []
+        if n_in is not None and n_in != cur_in:
+            diffs.append(f"入参：组件 Start 声明 {n_in} 个，本节点设了 {cur_in} 个")
+        if n_out is not None and n_out != cur_out:
+            diffs.append(f"返回值：组件 End 声明 {n_out} 个，本节点设了 {cur_out} 个")
+        if not diffs:
+            return True
+        self._log.append_log(
+            f"⚠ 组件端口数不一致（{os.path.basename(rel_path)}）：{'；'.join(diffs)}。"
+            f"两边数量必须相等，运行时才能按序对上 —— 请手动把本节点改成与组件一致。"
+            f"（不会自动改：改端口数会重建端口、断开已连好的线）",
+            "WARN", node_id=node.id,
+        )
+        return False
+
     def _on_component_chosen(self, node_id: str, rel_path: str):
-        """选完组件蓝图后：① 自动对齐输入/输出端口数 ② 循环引用检测。"""
+        """选完组件蓝图后：① 核对端口数（**只提示，绝不自动改**）② 循环引用检测。
+
+        为什么不自动对齐：`num_inputs` / `num_outputs` 一改，节点会重建动态端口，
+        已经连好的线会跟着断（用户明确要求：不要自动改，只提示未对齐）。
+        """
         if self._graph is None or node_id not in self._graph.nodes:
             return
         rel_path = (rel_path or "").strip()
@@ -2292,36 +2558,12 @@ class BlueprintMainWindow(QMainWindow):
             return
         abs_path = os.path.normpath(os.path.join(root, rel_path))
         if not os.path.isfile(abs_path):
-            self._log.append_log(f"⚠ 组件文件不存在，无法对齐端口：{rel_path}", "WARN")
+            self._log.append_log(f"⚠ 组件文件不存在，无法核对端口数：{rel_path}", "WARN")
             return
         node = self._graph.nodes[node_id]
 
-        # ---- ① 端口数自动对齐 ----
-        try:
-            sub = BlueprintStore.load(abs_path)
-            if sub is not None:
-                n_in, n_out = self._component_port_counts(sub)
-                changed = []
-                cur_in = int(node.params.get("num_inputs", 0) or 0)
-                cur_out = int(node.params.get("num_outputs", 0) or 0)
-                if n_in is not None and n_in != cur_in:
-                    self._on_param_changed(node_id, "num_inputs", n_in)
-                    changed.append(f"输入 {cur_in}→{n_in}")
-                if n_out is not None and n_out != cur_out:
-                    self._on_param_changed(node_id, "num_outputs", n_out)
-                    changed.append(f"输出 {cur_out}→{n_out}")
-                if changed:
-                    self._log.append_log(
-                        f"🔧 已按组件定义自动对齐端口数（{os.path.basename(rel_path)}）：{'、'.join(changed)}",
-                        "SUCCESS",
-                    )
-                elif n_in is None and n_out is None:
-                    self._log.append_log(
-                        f"提示：组件 {os.path.basename(rel_path)} 里没有 Start/End 节点，端口数保持不变。",
-                        "INFO",
-                    )
-        except Exception as e:
-            self._log.append_log(f"[Component] 端口对齐失败：{e}", "WARN")
+        # ---- ① 端口数一致性核对（只打日志，不改任何参数）----
+        self._check_component_port_match(node, abs_path, rel_path)
 
         # ---- ② 循环引用检测 ----
         try:
@@ -2643,23 +2885,38 @@ class BlueprintMainWindow(QMainWindow):
         if not isinstance(nodes, dict):
             return data
         depth = len(self._subgraph_stack)
+        # 先看每一层相对「进入时」有没有真实改动：只有「改动层 → 更深层」才需要覆盖进文档，
+        # 没改动的层保持磁盘原样 —— 否则「进子画布看一眼」就会被算成「有未保存修改」。
+        changed = []
+        subs = []
         for idx, item in enumerate(self._subgraph_stack):
+            sub = self._graph if idx == depth - 1 else item.get("sub_graph")
+            subs.append(sub)
+            try:
+                changed.append(self._sub_changed(item, sub))
+            except Exception:
+                changed.append(True)  # 保守：算不出来就当作改过，宁可提示保存也不要漏
+        first_changed = next((i for i, c in enumerate(changed) if c), None)
+        if first_changed is None:
+            return data
+        for idx in range(first_changed, depth):
+            item = self._subgraph_stack[idx]
             body_key = item.get("body_key")
             nid = item.get("node_id")
             host = nodes.get(nid) if isinstance(nid, str) else None
             if not isinstance(host, dict) or not body_key:
                 break
-            sub = self._graph if idx == depth - 1 else item.get("sub_graph")
+            sub = subs[idx]
             if sub is None:
                 break
-            try:
-                sub_data = sub.to_dict()
-            except Exception:
+            sub_data = self._sub_canonical(sub)
+            if sub_data is None:
                 break
             params = host.get("data")
             if not isinstance(params, dict):
                 params = {}
                 host["data"] = params
+            # ★ 与写回同口径（只含 nodes+links）：保证「保存后算出的哈希」与「这里覆盖出的哈希」一致
             params[body_key] = sub_data
             nodes = sub_data.get("nodes") if isinstance(sub_data.get("nodes"), dict) else {}
         return data
@@ -2721,17 +2978,25 @@ class BlueprintMainWindow(QMainWindow):
         # 2. 蓝图名部分
         blueprint_name = ""
         saved_mark = ""
+        comp_mark = ""  # 组件蓝图标识（普通蓝图为空）
         if self._graph is not None:
-            blueprint_name = str(self._graph.name or "未命名蓝图").strip() or "未命名蓝图"
+            # 文档名必须取「根图」的名字：子画布那张图的 name 是 "Untitled"，
+            # 直接用 self._graph 会让「进循环体/并行体后标题栏丢掉蓝图名」。
+            _doc = self._root_graph() or self._graph
+            blueprint_name = str(_doc.name or "未命名蓝图").strip() or "未命名蓝图"
+            # 组件蓝图与普通蓝图在编辑器里长得一模一样，标题栏必须把身份标出来，
+            # 否则用户分不清「我改的是被 N 处引用的公共组件」还是「一张独立蓝图」。
+            if str(getattr(_doc, "bp_type", "") or "") == bp_kind_mod.BP_TYPE_COMPONENT:
+                comp_mark = "  [组件]"
             if self._need_save():
                 saved_mark = " *"  # 未保存 / 有改动 → 标题栏加星号
         # 3. 拼接标题逻辑：有工程就放最前面；/号只在「同时有工程和蓝图」时显示，避免多余符号
         if project_part and blueprint_name:
-            title = f"{project_part}  /  {blueprint_name}{saved_mark} — {app_name}"
+            title = f"{project_part}  /  {blueprint_name}{comp_mark}{saved_mark} — {app_name}"
         elif project_part:
             title = f"{project_part} — {app_name}"
         elif blueprint_name:
-            title = f"{blueprint_name}{saved_mark} — {app_name}"
+            title = f"{blueprint_name}{comp_mark}{saved_mark} — {app_name}"
         else:
             title = app_name
         self.setWindowTitle(title)
@@ -2921,6 +3186,12 @@ class BlueprintMainWindow(QMainWindow):
                                     self._scene.remove_edge(eid, _emit_will=False)
                         node.inputs = list(new_in)
                         need_refresh_ports = True
+                # ---- SetVariable：batch_text 里的变量名 → 数据输出端口 ----
+                # 变量的增删/改名都会改变端口集，但 batch_text 是**逐字符**提交的：
+                # 这里只登记，由 400ms 防抖定时器统一重建（打字过程中既不重建端口，
+                # 也不刷新属性面板，否则会把用户正在输入的文本框刷掉）。
+                if node.type == "SetVariable" and param_name == "batch_text":
+                    self._setvar_queue_ports(node.id)
 
                 if need_refresh_ports:
                     # 重建 PortItem（会全删旧的、新建同名的）
@@ -2952,6 +3223,114 @@ class BlueprintMainWindow(QMainWindow):
             # 传入改参数前采样的旧几何：节点变矮时显式让视口重绘旧区域，否则留残影
             ni.refresh_geometry(_old_scene_rect)
         self._scene.graph_changed.emit()
+
+    # ---------------- SetVariable：变量 → 数据输出端口（防抖重建） ----------------
+    def _setvar_queue_ports(self, node_id: str):
+        """登记一个待对齐输出端口的「设置变量」节点，并（重）启防抖定时器。"""
+        try:
+            self._setvar_port_pending.add(node_id)
+            self._setvar_port_timer.start()
+        except Exception:
+            pass
+
+    def _apply_setvar_output_ports(self):
+        """把「设置变量」节点的数据输出端口对齐到 batch_text 里当前设置的变量名。
+
+        端口名/标签 = 变量名，所以「写几个变量就长出几个出参」，可直接连到
+        「组件」节点的入参端口，或组件蓝图里「结束」节点的返回值端口。
+
+        只有端口名集合真的变了才重建；重建口径与 Component / Start / End 完全一致
+        （先删掉「消失端口」上的连线 → 换端口 → 重建 PortItem → 按端口名重挂其余边）。
+        ⚠ 刻意**不刷新属性面板**：batch_text 是逐字符提交的，刷新会打断用户正在输入的文本。
+        """
+        pending = set(getattr(self, "_setvar_port_pending", set()) or set())
+        try:
+            self._setvar_port_pending = set()
+        except Exception:
+            pass
+        if not pending or self._graph is None:
+            return
+        from src.blueprint.core.node_library import _resolve_output_ports_default
+        for node_id in sorted(pending):
+            node = self._graph.nodes.get(node_id)
+            if node is None or node.type != "SetVariable":
+                continue
+            try:
+                # 写错的行（认不下来的行）不会变成变量 → 也就不会有对应出参。
+                # 这里必须点出来，否则用户看到的是「明明写了变量，右侧却没有出参」而毫无线索。
+                # 单独 try 包住：报告失败绝不能影响端口重建本身。
+                try:
+                    self._report_setvar_parse_errors(node)
+                except Exception:
+                    pass
+                new_out = _resolve_output_ports_default("SetVariable", dict(node.params or {}))
+                cur_out_names = [p.name for p in node.outputs]
+                new_out_names = [p.name for p in new_out]
+                if cur_out_names == new_out_names:
+                    continue
+                removed = set(cur_out_names) - set(new_out_names)
+                if removed and self._scene is not None:
+                    for eid in [e.id for e in list(self._graph.edges.values())
+                                if e.from_node == node_id and e.from_port in removed]:
+                        self._scene.remove_edge(eid, _emit_will=False)
+                node.outputs = list(new_out)
+                if self._scene is not None:
+                    ni = self._scene.node_item(node_id)
+                    if ni is not None:
+                        ni.sync_from_node()   # 内部已含 refresh_geometry()
+                        self._scene.reconnect_node_edges(node_id)
+                try:
+                    self._log.append_log(
+                        "「设置变量」节点的数据出口已按变量名更新："
+                        + ("、".join(new_out_names[1:]) if len(new_out_names) > 1 else "（暂无变量）"),
+                        "DEBUG",
+                        node_id=node_id,
+                    )
+                except Exception:
+                    pass
+            except Exception as e:
+                print(f"[WARN] SetVariable 输出端口重建异常: {e}")
+        if self._scene is not None:
+            self._scene.graph_changed.emit()
+
+    def _report_setvar_parse_errors(self, node):
+        """把「设置变量」里认不下来的行打到日志（同一种错误只报一次）。
+
+        `batch_text` 里每一行都必须是 `变量名=值`，变量名须以字母/下划线/汉字开头
+        （不能数字开头、不能含空格或横杠）。写错的行**不会**变成变量，
+        因此也不会生成右侧数据出口 —— 这就是「写了变量却没有出参」的唯一原因，
+        必须明确告知，而不是静默丢掉。
+        """
+        try:
+            from src.blueprint.core.node_library import _setvar_parse_issues
+            _names, errs = _setvar_parse_issues((node.params or {}).get("batch_text"))
+        except Exception:
+            return
+        reported = getattr(self, "_setvar_err_reported", None)
+        if not isinstance(reported, dict):     # 防御：属性缺失也不能把端口重建带崩
+            reported = {}
+            try:
+                self._setvar_err_reported = reported
+            except Exception:
+                pass
+        sig = "\n".join(errs)
+        if reported.get(node.id) == sig:
+            return          # 与上次提示内容完全相同 → 不重复刷日志
+        reported[node.id] = sig
+        if not errs:
+            return
+        head = "；".join(errs[:2])
+        if len(errs) > 2:
+            head += f" …等共 {len(errs)} 行"
+        try:
+            self._log.append_log(
+                f"「设置变量」有 {len(errs)} 行写法不正确，这些行不会生成右侧出参（"
+                f"变量名须字母/下划线/汉字开头，数字开头或含空格、横杠都不行）：{head}",
+                "WARN",
+                node_id=node.id,
+            )
+        except Exception:
+            pass
 
     # 与「模板图」绑定的特征辅助参数：模板一换，这些值全部失效
     _FEATURE_BOUND_PARAMS = (
@@ -3610,12 +3989,18 @@ class BlueprintMainWindow(QMainWindow):
 
         self._log.append_log("[📍偏移拾取] 请在屏幕上点击目标位置（offset = 目标点 - 模板中心）", "INFO")
 
-        overlay = VisualOffsetOverlay.prepare_and_run(
-            self,
-            screenshot=screenshot_pix,
-            template_rect=tpl_qrect,
-            delay_ms=100,
-        )
+        try:
+            overlay = VisualOffsetOverlay.prepare_and_run(
+                self,
+                screenshot=screenshot_pix,
+                template_rect=tpl_qrect,
+                delay_ms=100,
+            )
+        except Exception as e:
+            # prepare_and_run 在构造失败时已恢复主窗（见其注释），这里只负责提示；
+            # 不包这一层的话异常会抛进 Qt 槽函数，属于未处理异常。
+            QMessageBox.warning(self, "偏移拾取启动失败", f"无法启动偏移拾取：\n{e}")
+            return
         overlay.finished.connect(
             lambda result, nid=node_id: self._on_findimg_offset_picked(nid, result)
         )
@@ -3698,11 +4083,29 @@ class BlueprintMainWindow(QMainWindow):
             return
         if not self._ensure_project_open("运行蓝图（会在工程目录下生成debug缓存"):
             return
+        # 把还挂在防抖里的「设置变量」数据出口（变量名 → 端口）立刻对齐一次，
+        # 免得「刚敲完变量名就按 F5」时画布/文件里的端口还是旧的。
+        try:
+            if getattr(self, "_setvar_port_pending", None):
+                self._setvar_port_timer.stop()
+                self._apply_setvar_output_ports()
+        except Exception:
+            pass
         if self._runner is not None and self._runner.isRunning():
             self._log.append_log("已有运行中的蓝图，先停止。", "WARN")
             return
+        # ★ 运行的是「整张根蓝图」，不是当前打开的那一层子画布（self._graph 在子画布里是子图）。
+        #   若正停在循环体/顺序体/并行体里编辑，就先逐层退回根图 —— 退回过程会把每层子图内容
+        #   回写进宿主节点，这样运行的图 == 保存出来的图，画布也和实际执行的内容对得上。
+        #   不这样做的话：循环体会被当成一张独立蓝图单独跑一遍；并行体里只有 Branch 入口、
+        #   没有开始节点，会直接报「没有开始节点」。
+        if self._subgraph_stack:
+            while self._subgraph_stack:
+                self._exit_subgraph()
+            self._log.append_log("运行前已自动返回根图：本次运行的是整张蓝图。", "INFO")
         # 1. 静态校验（§九）
-        issues = validate_graph(self._graph)
+        # 传 project_root：组件节点要据此把 blueprint_path 解析成文件去核对端口数
+        issues = validate_graph(self._graph, project_root=self._proj_root())
         if issues:
             msg = format_issues(issues)
             if has_errors(issues):
@@ -3716,16 +4119,20 @@ class BlueprintMainWindow(QMainWindow):
                     return
             else:
                 self._log.append_log("静态校验提示：\n" + msg, "WARN")
+        # 1.5 组件蓝图独立运行：没有调用方 → 没有人写 __arg_i → Start 的 param 端口会全空。
+        #     先讲清楚，并允许临时填测试值（只注入本次运行，绝不写进蓝图文件）。
+        preset_vars = self._collect_component_run_args()
+        if preset_vars is None:
+            self._log.append_log("已取消运行（组件入参未确认）。", "INFO")
+            return
         # 2. 启动 runner（QThread 硬约束 §4）
         # ⚠ 运行期没有「全局目标窗口」：
         #   每个节点的操作范围 100% 由它自己的「范围模式」（目标窗口 / 全屏）+ 目标定位条件决定，
         #   这样「编辑器内点▶运行」与「导出后的挂机 EXE」行为完全一致，
         #   避免出现「编辑器里能跑、导出后找不到图」的口径偏差。
-        runner = BlueprintRunner(self._graph, self)
+        runner = BlueprintRunner(self._graph, self, initial_variables=preset_vars)
         runner.log_message.connect(self._on_runner_log, Qt.QueuedConnection)
-        runner.highlight_node.connect(
-            lambda nid, s=self._scene: s.set_running_node(nid), Qt.QueuedConnection,
-        )
+        runner.highlight_node.connect(self._on_runner_highlight, Qt.QueuedConnection)
         runner.highlight_clear.connect(
             lambda: self._scene.clear_running(), Qt.QueuedConnection,
         )
@@ -3754,6 +4161,154 @@ class BlueprintMainWindow(QMainWindow):
             f"▶ 蓝图运行中（运行快捷键={run_qt}），按 {stop_qt} 优雅停止，按 {pause_qt} 暂停/继续当前蓝图。",
             "INFO",
         )
+
+    # ---------------- 组件蓝图「独立运行」的入参确认 ----------------
+    def _collect_component_run_args(self) -> Optional[dict]:
+        """组件蓝图在编辑器里点运行前的入参确认。
+
+        「组件」本质就是一张完整蓝图，所以它自己也能当根图跑。但没有调用方时
+        没人往 ctx.variables 写 __arg_i → Start 的 param_0…param_N 全部为空，
+        组件内部直接拿这些端口当输入时会静默拿到空值。这里先把话说清楚。
+
+        返回：
+          None   → 用户取消，不要运行
+          {}     → 继续运行，入参留空
+          {...}  → 用临时测试值运行（键 __arg_i，只在本次运行注入，不写回蓝图）
+        """
+        doc = self._root_graph() or self._graph
+        if doc is None:
+            return {}
+        if str(getattr(doc, "bp_type", "") or "") != bp_kind_mod.BP_TYPE_COMPONENT:
+            return {}  # 普通蓝图，不打扰
+        start = None
+        for nd in (getattr(doc, "nodes", {}) or {}).values():
+            if getattr(nd, "type", "") == "Start":
+                start = nd
+                break
+        if start is None:
+            return {}
+        try:
+            n_in = max(0, min(20, int((getattr(start, "params", None) or {}).get("num_params", 0) or 0)))
+        except Exception:
+            n_in = 0
+        if n_in <= 0:
+            return {}  # 组件没声明入参，没什么可确认的
+
+        box = QMessageBox(self)
+        box.setWindowTitle("组件蓝图 · 独立运行")
+        box.setIcon(QMessageBox.Question)
+        box.setText(f"这是一张「组件蓝图」，它的 Start 声明了 {n_in} 个入参。")
+        box.setInformativeText(
+            f"独立运行时没有任何调用方传参，Start 的 param_0 … param_{n_in - 1} 会全部为空；\n"
+            "组件内部若直接使用这些端口，拿到的就是空值。\n\n"
+            "· 直接运行：入参留空\n"
+            "· 填入测试值：临时给本次运行喂几个值，方便单独调试（不写进蓝图文件）"
+        )
+        btn_test = box.addButton("填入测试值…", QMessageBox.YesRole)
+        btn_direct = box.addButton("直接运行（入参为空）", QMessageBox.NoRole)
+        box.addButton("取消", QMessageBox.RejectRole)
+        box.setDefaultButton(btn_direct)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is btn_test:
+            return self._ask_component_arg_values(n_in)
+        if clicked is btn_direct:
+            return {}
+        return None
+
+    def _ask_component_arg_values(self, n_in: int) -> Optional[dict]:
+        """弹窗临时填 n_in 个组件入参值。返回 {__arg_i: 文本}；取消返回 None。"""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("组件入参 · 测试值")
+        dlg.resize(460, 0)
+        lay = QVBoxLayout(dlg)
+        tip = QLabel(
+            f"为本次运行临时填入 {n_in} 个入参（留空 = 该入参为空）。\n"
+            "这些值不会写进蓝图文件，只在这一次运行里生效。"
+        )
+        tip.setStyleSheet("color:#8B949E; font-size:11px;")
+        tip.setWordWrap(True)
+        lay.addWidget(tip)
+        form = QFormLayout()
+        edits: List[QLineEdit] = []
+        for i in range(n_in):
+            ed = QLineEdit()
+            ed.setPlaceholderText(f"组件 Start 的 param_{i}")
+            form.addRow(f"入参 {i + 1}", ed)
+            edits.append(ed)
+        lay.addLayout(form)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        btn_cancel = QPushButton("取消")
+        btn_ok = QPushButton("开始运行")
+        btn_ok.setDefault(True)
+        row.addWidget(btn_cancel)
+        row.addWidget(btn_ok)
+        lay.addLayout(row)
+        result: Dict[str, Any] = {"v": None}
+
+        def _ok():
+            result["v"] = {f"__arg_{i}": ed.text() for i, ed in enumerate(edits)}
+            dlg.accept()
+
+        btn_ok.clicked.connect(_ok)
+        btn_cancel.clicked.connect(dlg.reject)
+        if edits:
+            edits[0].setFocus()
+        dlg.exec()
+        return result["v"]
+
+    def _on_runner_highlight(self, node_id, path=None):
+        """执行高亮（runner 信号）：先把画布「跟随」到执行点所在的子画布层，再高亮该节点。
+
+        path = 执行点的「容器链」（由 executor 带上）：
+          []                  → 根图
+          [LoopId]            → 循环体
+          [LoopId, ParId]     → 循环体里的并行体
+          None                → 不可导航（如组件子蓝图内部）→ 不动画布，只按 id 高亮
+        为什么要带上 path：节点 id 是「每张图各自编号」的，父图的 1 和循环体里的 1 是同名不同人，
+        只给一个裸 id 时画布只能停在当前层 —— 表现就是「高亮不跟着进循环/并行体」。
+        """
+        try:
+            self._follow_exec_path(path)
+        except Exception:
+            pass
+        try:
+            self._scene.set_running_node(node_id)
+        except Exception:
+            pass
+
+    def _follow_exec_path(self, path):
+        """把画布导航到 path 指定的子画布层（只导航，不改任何蓝图内容）。
+
+        做法：先退到与目标路径的公共前缀，再逐层进入。已经在目标层时什么都不做
+        （避免每次执行节点都重建一遍画布）。路径里出现「不是容器」的 id（蓝图被改过）
+        就放弃跟随、保持当前层，绝不乱跳。
+        """
+        if path is None:
+            return  # 不可导航（组件子蓝图内部）
+        target = [str(x) for x in path]
+        # 1) 退到公共前缀：栈本身是 target 的前缀时就停
+        guard = 0
+        while self._subgraph_stack and guard < 64:
+            guard += 1
+            cur = [str(it.get("node_id")) for it in self._subgraph_stack]
+            if target[: len(cur)] == cur:
+                break
+            self._exit_subgraph(quiet=True)
+        # 2) 逐层进入（只认三种容器节点）
+        guard = 0
+        while len(self._subgraph_stack) < len(target) and guard < 64:
+            guard += 1
+            nid = target[len(self._subgraph_stack)]
+            node = self._graph.nodes.get(nid) if self._graph is not None else None
+            if node is None or node.type not in self._CONTAINER_BODY_KEYS:
+                return  # 结构对不上（节点被删/不是容器）→ 放弃跟随，保持当前层
+            body_key, kind = self._CONTAINER_BODY_KEYS[node.type]
+            body = node.params.get(body_key)
+            if not (isinstance(body, dict) and body.get("nodes")):
+                body = self._create_empty_subgraph(node, body_key, kind)
+            self._enter_subgraph(node, body_key, kind, body, quiet=True)
 
     def _on_toggle_pause(self):
         if self._runner is None or not self._runner.isRunning():
@@ -4638,8 +5193,12 @@ class BlueprintMainWindow(QMainWindow):
         if self._graph is None:
             QMessageBox.warning(self, "无法导出", "当前没有打开任何蓝图。")
             return
+        # ★ 导出的必须是「整张根蓝图」：若正处在子画布（循环体/顺序体/并行体）里，
+        #   先把各层内容回写进宿主节点、再取根图，否则会把那层子画布当成蓝图导出。
+        #   这里只回写、不切换画布 —— 导出不该把用户从子画布弹出去。
+        src_graph = self._save_target_graph() or self._graph
         # 取一个友好的蓝图名：优先 graph.name，其次当前文件名
-        name = str(getattr(self._graph, "name", "") or "").strip()
+        name = str(getattr(src_graph, "name", "") or "").strip()
         if (not name or name == "Untitled") and self._current_path:
             try:
                 _, stem, _ = BlueprintStore._split_bp_path(self._current_path)
@@ -4658,7 +5217,7 @@ class BlueprintMainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "模块加载失败", f"加载导出对话框失败：\n{e}")
             return
-        dlg = ExportDialog(self, self._graph, name, project_root=project_root)
+        dlg = ExportDialog(self, src_graph, name, project_root=project_root)
         if dlg.exec():
             out_path = getattr(dlg, "_result_path", "")
             if out_path:

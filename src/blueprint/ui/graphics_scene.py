@@ -383,6 +383,14 @@ class NodeScene(QGraphicsScene):
                 ei.set_to_port(pi)
         self.addItem(ei)
         self._edge_items[edge.id] = ei
+        # 连线会改变两端节点的画布摘要（如「文本内容」为空时改为提示「← 端口传入」），
+        # 这里显式刷一次两端节点，否则新线的效果要等下次几何变化才画出来。
+        for ni in (from_ni, to_ni):
+            if ni is not None:
+                try:
+                    ni.update()
+                except Exception:
+                    pass
         if emit:
             self.edge_created.emit(edge.id)
             self.graph_changed.emit()
@@ -397,7 +405,16 @@ class NodeScene(QGraphicsScene):
         ei = self._edge_items.pop(edge_id, None)
         if ei:
             self.removeItem(ei)
-        self.graph.edges.pop(edge_id, None)
+        removed_edge = self.graph.edges.pop(edge_id, None)
+        # 断线同样会改变两端节点的画布摘要（「← 端口传入」要变回「(空)」）
+        if removed_edge is not None:
+            for nid in (removed_edge.from_node, removed_edge.to_node):
+                ni = self._node_items.get(nid)
+                if ni is not None:
+                    try:
+                        ni.update()
+                    except Exception:
+                        pass
         self.edge_removed.emit(edge_id)
         self.graph_changed.emit()
 

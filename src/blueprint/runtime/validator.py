@@ -1,4 +1,5 @@
-from typing import List
+import os
+from typing import List, Optional
 
 from ..core.models import BlueprintGraph, Node, PortType
 
@@ -15,8 +16,13 @@ class ValidationIssue:
         return f"[{self.level}] ({self.code}) {self.message}"
 
 
-def validate_graph(graph: BlueprintGraph) -> List[ValidationIssue]:
-    """运行前静态校验 6 条硬约束。"""
+def validate_graph(graph: BlueprintGraph, project_root: Optional[str] = None) -> List[ValidationIssue]:
+    """运行前静态校验。
+
+    参数 project_root：当前工程根目录。只有传了它才会做「组件端口数一致性」检查
+    （要据此把组件节点的 blueprint_path 解析成绝对路径去读那张组件蓝图）。
+    不传 = 跳过该项，其余检查照常。
+    """
     issues: List[ValidationIssue] = []
     nodes = list(graph.nodes.values())
 
@@ -54,7 +60,7 @@ def validate_graph(graph: BlueprintGraph) -> List[ValidationIssue]:
 
     # 4. 必填参数
     for n in nodes:
-        _check_required_params(n, issues)
+        _check_required_params(n, issues, graph)
 
     # 5. Loop 自环合法性（简化：只检查 Loop.max_iterations > 0）
     for n in nodes:
@@ -117,10 +123,85 @@ def validate_graph(graph: BlueprintGraph) -> List[ValidationIssue]:
                         tn.id, e.id,
                     )
                 )
+
+    # 8. Component 组件的端口数 vs 被调用蓝图 Start/End 的声明
+    #
+    # 调用方的 num_inputs / num_outputs 与被调用方 Start.num_params / End.num_returns
+    # 是两套各自独立的数字，运行期靠「按序对应」传参：
+    #     调用方 in_2 → 变量 __arg_2 → 组件 Start 的 param_2
+    # 数量不一致时两边都用 .get() 取值，**不报错、不警告**，只会静默错位：
+    # 多传的端口被丢弃，少传的端口读到 None。属于典型「静默做错事」，必须在跑之前说出来。
+    if project_root:
+        for n in nodes:
+            if n.type == "Component":
+                _check_component_ports(n, project_root, issues)
     return issues
 
 
-def _check_required_params(n: Node, issues: List[ValidationIssue]):
+def _check_component_ports(n: Node, project_root: str, issues: List[ValidationIssue]):
+    """核对组件节点端口数与组件定义是否一致（只产生 issue，不改任何东西）。"""
+    raw = str(n.params.get("blueprint_path", "") or "").strip()
+    if not raw:
+        issues.append(ValidationIssue(
+            "WARN", "COMP_NO_PATH", "组件节点没有选择要调用的蓝图，运行时会被跳过。", n.id))
+        return
+    path = raw if os.path.isabs(raw) else os.path.join(project_root, raw)
+    if not os.path.isfile(path):
+        issues.append(ValidationIssue(
+            "ERROR", "COMP_PATH_MISSING",
+            f"组件蓝图文件不存在：{raw}（解析为 {path}）。运行时该组件会被当作空操作跳过。", n.id))
+        return
+    try:
+        from ..core.graph_store import BlueprintStore
+        sub = BlueprintStore.load(path)
+    except Exception as e:
+        issues.append(ValidationIssue("WARN", "COMP_LOAD_FAIL", f"组件蓝图加载失败：{e}", n.id))
+        return
+    if sub is None:
+        issues.append(ValidationIssue("WARN", "COMP_LOAD_FAIL", f"组件蓝图读取为空：{raw}", n.id))
+        return
+
+    n_in = None
+    n_out = None
+    for sn in (getattr(sub, "nodes", {}) or {}).values():
+        t = getattr(sn, "type", "")
+        p = getattr(sn, "params", None) or {}
+        if t == "Start" and n_in is None:
+            try:
+                n_in = max(0, min(20, int(p.get("num_params", 0) or 0)))
+            except Exception:
+                n_in = 0
+        elif t == "End" and n_out is None:
+            try:
+                n_out = max(0, min(20, int(p.get("num_returns", 0) or 0)))
+            except Exception:
+                n_out = 0
+
+    try:
+        cur_in = int(n.params.get("num_inputs", 0) or 0)
+    except Exception:
+        cur_in = 0
+    try:
+        cur_out = int(n.params.get("num_outputs", 0) or 0)
+    except Exception:
+        cur_out = 0
+
+    diffs = []
+    if n_in is not None and n_in != cur_in:
+        diffs.append(f"入参：组件 Start 声明 {n_in} 个，本节点设了 {cur_in} 个")
+    if n_out is not None and n_out != cur_out:
+        diffs.append(f"返回值：组件 End 声明 {n_out} 个，本节点设了 {cur_out} 个")
+    if diffs:
+        issues.append(ValidationIssue(
+            "WARN", "COMP_PORT_MISMATCH",
+            f"组件端口数不一致（{os.path.basename(raw)}）：{'；'.join(diffs)}。"
+            f"两边数量必须相等才能按序对上，否则多传的值被丢弃、少传的端口读到空值。"
+            f"请手动把本节点端口数改成与组件一致（编辑器不会自动改，避免重建端口导致断线）。",
+            n.id,
+        ))
+
+
+def _check_required_params(n: Node, issues: List[ValidationIssue], graph: BlueprintGraph = None):
     def _not_empty(v) -> bool:
         if v is None:
             return False
@@ -135,8 +216,16 @@ def _check_required_params(n: Node, issues: List[ValidationIssue]):
     elif t == "PressKey":
         kb_mode = str(n.params.get("kb_mode", "text") or "text")
         if kb_mode == "text":
-            if not _not_empty(n.params.get("text")):
-                issues.append(ValidationIssue("WARN", "PRESS_NO_TEXT", "PressKey.text 为空（输入文本模式）。", n.id))
+            # 文本可能来自参数 text，也可能来自左侧「文本内容」端口（接了上游就有值），
+            # 两者都没有才是真·空。
+            port_linked = bool(graph) and any(
+                e.to_node == n.id and e.to_port == "in_text" for e in graph.edges.values()
+            )
+            if not port_linked and not _not_empty(n.params.get("text")):
+                issues.append(ValidationIssue(
+                    "WARN", "PRESS_NO_TEXT",
+                    "PressKey.text 为空（输入文本模式），且左侧「文本内容」端口没有连线。", n.id,
+                ))
         else:
             # 按键组合模式：检查 key_combo（JSON数组）是否为空
             key_combo_raw = str(n.params.get("key_combo", "[]") or "[]")
@@ -154,6 +243,18 @@ def _check_required_params(n: Node, issues: List[ValidationIssue]):
         has_batch = bool(str(n.params.get("batch_text", "") or "").strip())
         if not has_batch:
             issues.append(ValidationIssue("WARN", "SET_EMPTY", "SetVariable 未设置任何变量：batch_text 为空。", n.id))
+        else:
+            # 写法不对的行认不下来 → 既不会变成变量，也不会生成右侧数据出口。
+            # 运行前先明确点出来，别让用户对着「写了变量却没有出参」猜。
+            from ..core.node_library import _setvar_parse_issues
+            names, errs = _setvar_parse_issues(n.params.get("batch_text"))
+            if errs:
+                head = "; ".join(errs[:3])
+                if len(errs) > 3:
+                    head += f" …等{len(errs)}行"
+                issues.append(ValidationIssue("WARN", "SET_SYNTAX",
+                    f"SetVariable 有 {len(errs)} 行写法不正确、不会生效（已认下 {len(names)} 个变量）：{head}",
+                    n.id))
     elif t == "VarSwitch":
         from ..core.node_library import parse_varswitch_conditions
         raw = n.params.get("cases", "") or ""

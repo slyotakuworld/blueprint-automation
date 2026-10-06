@@ -372,8 +372,24 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
                 editor=EDITOR_MULTILINE,
                 default="",
                 label="条件设置",
-                placeholder="hp >= 30\nhp <= 100\nscore >= 60\ngender != \"female\"\nlevel > {min_level}\n# ↓ 多端口用法：__INPUTS__0=第1个、__INPUTS__1=第2个端口值\n== 1\n== {id}\n>= {min_score}\n# 复杂表达式：\n__INPUTS__0 >= {min_score} AND __INPUTS__1 != {exclude_status}",
-                help='每行写一个条件（全部 AND 逻辑，同时满足才走 yes）\n\n两种写法，推荐简写：\n① 完整写法：「变量名 运算符 值」例：score >= 60、level > {min_level}\n   多输入端口引用就这一种：__INPUTS__0=第1个、__INPUTS__1=第2个、...\n② 【简写语法】（连了第1个输入端口时用）：行首直接写运算符，省掉左变量名\n   左值自动 = __INPUTS__0（想主动写表达式时直接写这个名）\n   例：\n     == 1              → 意思：第1个输入 == 数字 1\n     == {id}           → 意思：第1个输入 == 变量 id\n     != {exclude}      → 意思：第1个输入 != 变量 exclude\n     >= {min_score}    → 意思：第1个输入 >= 变量 min_score\n\n运算符：== 等于、!= 不等于、> 大于、< 小于、>= 大于等于、<= 小于等于\n值：字符串加引号 "abc" 或 \'abc\'；数字直接写；布尔写 true/false；支持 {变量} / ${变量} / {= expr} 插值\n空行 和 // 或 # 开头的行 作为注释忽略'
+                placeholder="hp >= 30\nhp <= 100\nscore >= 60\ngender != \"female\"\nlevel > {min_level}\n# ↓ 简写写法（连了第 1 个数据端口时用）\n== 1\n== {id}\n>= {min_score}\n# ↓ 多端口：一行写一条，逐行分开写（不要在一行里用 AND）\n__INPUTS__0 >= {min_score}\n__INPUTS__1 != {exclude_status}",
+                help='每行写一个条件，行与行之间自动 AND（全部满足才走 yes）。\n'
+                     '⚠ 不要在一行里写 AND / OR：本节点不支持行内 AND，写了会被判成格式错误（因为那一行会被当成「值」）。想要 OR，请串两个条件判断节点。\n\n'
+                     '两种写法，推荐简写：\n'
+                     '① 完整写法：「变量名 运算符 值」例：score >= 60、level > {min_level}\n'
+                     '   多输入端口引用就这一种：__INPUTS__0=第1个、__INPUTS__1=第2个、...（全大写，两侧双下划线）\n'
+                     '② 【简写语法】（连了第1个输入端口时用）：行首直接写运算符，省掉左变量名\n'
+                     '   左值自动 = __INPUTS__0（想主动写表达式时直接写这个名）\n'
+                     '   例：\n'
+                     '     == 1              → 意思：第1个输入 == 数字 1\n'
+                     '     == {id}           → 意思：第1个输入 == 变量 id\n'
+                     '     != {exclude}      → 意思：第1个输入 != 变量 exclude\n'
+                     '     >= {min_score}    → 意思：第1个输入 >= 变量 min_score\n\n'
+                     '左值只能是「裸变量名」，不能写成 {变量}；只有右边才支持插值。\n'
+                     '运算符：== 等于、!= 不等于、> 大于、< 小于、>= 大于等于、<= 小于等于\n'
+                     '值：字符串加引号 "abc" 或 \'abc\'；数字直接写；布尔写 true/false；支持 {变量} / ${变量} / {= expr} 插值\n'
+                     '空行 和 // 或 # 开头的行 作为注释忽略\n'
+                     '运行时如果条件写错（语法错误、变量名拼错、插值没生效），运行日志里会有 WARN 明确指出来。'
             ),
         ],
         type_short_name="var_switch",
@@ -585,7 +601,8 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         description="键盘交给咱~要么输入一段文字（还能用剪贴板粘贴防乱码、末尾按回车），要么按组合键（ctrl+c、alt+f4这种，还能重复按好几次）。",
         color="#B62324",
         accent="#FF7B72",
-        inputs=[_exec_in()],
+        # in_text 只在「输入文本」模式存在（见 _resolve_input_ports_default），这里只是静态兜底
+        inputs=[_exec_in(), _data_in("in_text", "str", label="文本内容(连线优先)")],
         outputs=[_exec_out()],
         params=[
             # 模式选择（第一位）
@@ -593,10 +610,18 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
                      options=["text", "key"],
                      option_labels={"text": "输入文本", "key": "按键组合"},
                      label="输入模式",
-                     help="输入文本模式(text)：输入一段文字，可选粘贴模式防乱码、可选末尾按回车；\n按键组合模式(key)：按下组合键，如 ctrl+c、alt+f4、win+r。"),
+                     help="输入文本模式(text)：输入一段文字 —— 内容可来自下方「文本内容」参数，"
+                          "也可由左侧「文本内容」端口从上游传入（如文字识别、命令输出）。可选粘贴模式防乱码、可选末尾按回车；\n"
+                          "按键组合模式(key)：按下组合键，如 ctrl+c、alt+f4、win+r（此模式不使用左侧「文本内容」端口）。"),
             # --- 输入文本模式参数 ---
             ParamDef(name="text", editor=EDITOR_MULTILINE, default="", label="文本内容",
-                     help="【输入文本模式】要输入的文本内容，支持 {var} 变量插值。"),
+                     help="【输入文本模式】手写要输入的文字，支持 {var} / ${var} / {= 表达式 } 插值。\n"
+                          "若左侧「文本内容」端口连了上游且值非空 → 优先用连线值，这里写的内容被忽略；\n"
+                          "没连线时用这里写的内容（空则本节点不输入任何文字）。",
+                     placeholder="手写要输入的文字，支持 {var} 变量插值。\n"
+                                 "例：你好，{user_name}！\n"
+                                 "例：识别结果 {ocr_text}\n"
+                                 "也可留空，把左侧「文本内容」端口连到上游节点，直接输入上游拿到的内容。"),
             ParamDef(name="use_paste", editor=EDITOR_BOOL, default=True, label="粘贴模式",
                      help="【输入文本模式】勾选=用剪贴板粘贴（快速、防中文乱码）；不勾=逐字符输入。"),
             ParamDef(name="press_enter", editor=EDITOR_BOOL, default=False, label="末尾按回车",
@@ -695,7 +720,7 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         type="SetVariable",
         category=CATEGORY_LOGIC,
         title="设置变量",
-        description="存变量用的小盒子~每行写 名字=值，还能塞别的变量进去算一算，存好了后面所有节点都能拿来用哟。",
+        description="存变量用的小盒子~每行写 名字=值，还能塞别的变量进去算一算，存好了后面所有节点都能拿来用哟。\n\n每个变量还会在右侧长出一个同名「数据出口」（○），可把值直接连给「组件」节点的入参端口，或组件蓝图里「结束」节点的返回值端口。",
         color="#2D333B",
         accent="#F778BA",
         inputs=[
@@ -714,7 +739,18 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
             ),
             ParamDef(name="batch_text", editor=EDITOR_MULTILINE, default="", label="批量设置",
                      placeholder="# 用法1：字面量\nuser = Alice\nport = 8080\n\n# 用法2：多输入端口数组（先在上方加端口数 N，再连 N 条线）\ncmd_out   = {__INPUTS__0}\nclip_text = {__INPUTS__1}\ntotal     = {= {__INPUTS__0} + {__INPUTS__1}}",
-                     help="每行 name=value。value 支持 {var}/${var}/{= expr} 插值。\n【多输入端口用法】\n- 先调整上方「数据输入端口数」加需要的 N 个端口，连线到上游节点\n- 每个端口按顺序存为临时变量，就这一种写法：\n  __INPUTS__0（第1个端口）、__INPUTS__1（第2个端口）、__INPUTS__2 ...\n- 示例：\n  cmd_out   = {__INPUTS__0}      # 把第1个端口接的 Command stdout 存成变量 cmd_out\n  clip_text = {__INPUTS__1}      # 把第2个端口接的 Clipboard 存成 clip_text\n  total     = {= {__INPUTS__0} + {__INPUTS__1}}\n- 也可以直接在表达式里写：{= {__INPUTS__2} * 2}"),
+                     help="每行 name=value。value 支持 {var}/${var}/{= expr} 插值。\n"
+                          "空行、以 # 或 // 开头的整行算注释，忽略。\n"
+                          "【变量名写法】必须以字母/下划线/汉字开头，后面可以是字母/数字/下划线，允许点号（如 target.hwnd）。\n"
+                          "⚠ 不能以数字开头，也不能含空格或横杠（写成这样这一行不成立、不会生成出参，画布上会标 ⚠）。\n"
+                          "【右侧出参】每认下一个变量名，节点右侧就长出一个同名 ○ 数据出口；\n"
+                          "写错的行不会生成出口 —— 画布上会标 ⚠，点上方「✓ 检查格式」看具体是哪一行。\n"
+                          "【多输入端口用法】\n- 先调整上方「数据输入端口数」加需要的 N 个端口，连线到上游节点\n"
+                          "- 每个端口按顺序存为临时变量，就这一种写法：\n  __INPUTS__0（第1个端口）、__INPUTS__1（第2个端口）、__INPUTS__2 ...\n"
+                          "- 示例：\n  cmd_out   = {__INPUTS__0}      # 把第1个端口接的 Command stdout 存成变量 cmd_out\n"
+                          "  clip_text = {__INPUTS__1}      # 把第2个端口接的 Clipboard 存成 clip_text\n"
+                          "  total     = {= {__INPUTS__0} + {__INPUTS__1}}\n"
+                          "- 也可以直接在表达式里写：{= {__INPUTS__2} * 2}"),
         ],
         type_short_name="set_var",
         has_dynamic_ports=True,
@@ -749,7 +785,8 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
             ),
             ParamDef(name="duration_sec", editor=EDITOR_FLOAT, default=3.0, label="持续(s)",
                      min=0.5, max=3600.0, step=0.5,
-                     help="系统弹窗/通知显示持续时间（秒）"),
+                     help="主窗口右上角浮动提示（Toast）停留几秒后自动消失。\n"
+                          "勾了「系统弹窗」时不受本参数影响 —— 那是阻塞弹窗，要点确定才关。"),
             ParamDef(name="show_popup", editor=EDITOR_BOOL, default=False, label="系统弹窗",
                      help="勾选后额外弹出系统原生阻塞弹窗（用于打断用户注意，会阻塞蓝图直到关闭）；\n"
                           "不勾选时（默认）：右上角主窗口弹非阻塞浮动Toast + 日志面板记录（不卡蓝图执行，推荐）"),
@@ -766,7 +803,7 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         description="管系统剪贴板的小助手~要么读出来存变量还顺带给下游数据线；要么把汝写的（或上游传进来的）内容写进去；也能一键清空剪贴板哟。",
         color="#4527a0",
         accent="#7e57c2",
-        inputs=[_exec_in(), _data_in("in_text", "str", label="写入文本")],
+        inputs=[_exec_in(), _data_in("in_text", "str", label="写入内容(连线优先)")],
         outputs=[
             _exec_out("out_done", label="完成"),
             _exec_out("err", label="失败"),
@@ -777,10 +814,19 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
                      options=["read", "write", "clear"],
                      option_labels={"read": "读取", "write": "写入", "clear": "清空"},
                      label="操作模式",
-                     help='read=读剪贴板→out_text；write=写剪贴板→in_text或下面value；clear=清空剪贴板'),
+                     help='read：读剪贴板 → 数据出口 out_text（并同时存为变量）；\n'
+                          'write：把文本写进剪贴板，内容来自左侧「写入内容」连线，或用下面的「写入内容」参数；\n'
+                          'clear：清空剪贴板。\n'
+                          '注意：左侧「写入内容」端口一直存在（切模式不会消失、不会断线），但只有 write 模式会用它；'
+                          'read / clear 模式下连了也不会写。'),
             ParamDef(name="value", editor=EDITOR_MULTILINE, default="",
                      label="写入内容",
-                     help='仅 mode=write 生效；支持 {var} 插值。若 in_text 有连线则用连线值优先，空则用本参数值'),
+                     help='仅「操作模式=写入」生效：手写要写进剪贴板的文本，支持 {var} / ${var} / {= 表达式 } 插值。\n'
+                          '与左侧「写入内容」端口二选一 —— 端口有连线且值非空时用连线值，否则用本参数。',
+                     placeholder="手写要写进剪贴板的文本，支持 {var} 变量插值。\n"
+                                 "例：{user_name}\n"
+                                 "例：识别结果 {ocr_text}\n"
+                                 "也可留空，把左侧「写入内容」端口连到上游节点，直接写入上游拿到的内容。"),
             ParamDef(name="output_var_name", editor=EDITOR_STRING, default="clip_text",
                      label="输出变量名",
                      help='仅 mode=read 生效：读到的文本同时存到 ctx.variables，后续节点 {clip_text} 直接用'),
@@ -1220,8 +1266,11 @@ def parse_varswitch_conditions(raw: str) -> List[Dict[str, Any]]:
 
     # 整行正则：^\s* (合法变量名) \s* (双字符运算符优先 == != >= <= | 单字符 > <) \s* (值) \s*$
     # 注意：运算符顺序必须双字符在前，否则 "==" 会被错拆成 "=" + "="
+    # 变量名字符集与 SetVariable 的 batch_text **完全一致**（变量名允许汉字/点号，
+    # 见 variable_engine._RE_VAR_NAME）：读侧 {血量} 早就支持，写侧不能只认 ASCII。
+    _var_name = r"[^\W\d]\w*(?:\.[^\W\d]\w*)*"
     line_re = re.compile(
-        r'^\s*([A-Za-z_][A-Za-z0-9_]*)\s*(==|!=|>=|<=|>|<)\s*(.+?)\s*$',
+        rf'^\s*({_var_name})\s*(==|!=|>=|<=|>|<)\s*(.+?)\s*$',
         re.DOTALL,
     )
     for idx, line in enumerate(raw_normalized.split("\n"), 1):
@@ -1232,11 +1281,11 @@ def parse_varswitch_conditions(raw: str) -> List[Dict[str, Any]]:
         m = line_re.match(ln)
         if not m:
             # 给更精确的错误提示：判断是哪一部分缺失
-            head_re = re.compile(r'^\s*([A-Za-z_][A-Za-z0-9_]*)')
+            head_re = re.compile(rf'^\s*({_var_name})')
             hm = head_re.match(ln)
             if not hm:
                 results.append({
-                    "error": "条件开头不合法：变量名必须是字母/下划线开头，后接字母数字下划线",
+                    "error": "条件开头不合法：变量名须字母/下划线/汉字开头（数字开头、含空格或横杠都不行）",
                     "raw_line": ln, "line_no": idx,
                 })
                 continue
@@ -1272,6 +1321,21 @@ def parse_varswitch_conditions(raw: str) -> List[Dict[str, Any]]:
                 "raw_line": ln, "line_no": idx,
             })
             continue
+        # 一行里塞 AND / OR 是「语法看似合法、其实永远判错」的典型陷阱：
+        # 它会被当成「值」的一部分（例如值变成 '1 AND y != 2'），既不可能相等、也不报错。
+        # 本节点是「每行写一条条件、多行之间自动 AND」，所以这里直接判为格式错误。
+        _v = val_raw.strip()
+        _quoted = (_v.startswith('"') and _v.endswith('"') and len(_v) >= 2) or \
+                  (_v.startswith("'") and _v.endswith("'") and len(_v) >= 2)
+        if not _quoted:
+            _m_and = re.search(r"(?<![A-Za-z0-9_])(AND|OR|and|or|&&|\|\|)(?![A-Za-z0-9_])", _v)
+            if _m_and:
+                results.append({
+                    "error": f"一行里出现了 '{_m_and.group(1)}'：本节点是「每行写一条条件、多行之间自动 AND」，"
+                             f"请把 '{_m_and.group(1)}' 两侧拆成两行（想要 OR 可以串两个条件判断节点）",
+                    "raw_line": ln, "line_no": idx,
+                })
+                continue
         parsed_val, val_err = _parse_condition_value(val_raw)
         if val_err:
             results.append({"error": val_err, "raw_line": ln, "line_no": idx})
@@ -1323,6 +1387,50 @@ def _parse_condition_value(s: str) -> Tuple[Any, str]:
     return None, f"无法识别的值格式（字符串需加引号）：'{s2[:30]}'"
 
 
+def _setvar_parse_issues(batch_text: Any) -> Tuple[List[str], List[str]]:
+    """解析 SetVariable 的 batch_text，返回 `(变量名列表, 逐行错误说明列表)`。
+
+    唯一解析口径：内部调 `variable_engine.parse_batch_var_lines`（与运行时 `execute_SetVariable`
+    完全同一个函数），所以「画布上看到的出参」「检查格式按钮的结论」「运行时真正生效的变量」
+    三者必然一致。
+
+    ⚠ 只有**被认下来的行**才会成为变量、才会生成数据出口。解析失败的行必须由调用方
+    显示出来（画布摘要 / 检查格式 / 编辑器日志），不能静默丢掉 ——
+    否则用户会看到「批量设置里明明写了变量，画布右侧却没有出参」而毫无线索。
+
+    返回的变量名按书写顺序、已去重、最多 20 个；与固定执行出口 `out_exec` 重名的会被跳过。
+    """
+    if not isinstance(batch_text, str) or not batch_text.strip():
+        return [], []
+    try:
+        from .variable_engine import parse_batch_var_lines
+        kv, err = parse_batch_var_lines(batch_text)
+    except Exception as e:
+        return [], [f"解析异常：{e}"]
+    names: List[str] = []
+    for k in kv.keys():
+        if not k or str(k) == "out_exec":
+            continue
+        names.append(str(k))
+        if len(names) >= 20:
+            break
+    errs = [ln.strip() for ln in str(err or "").splitlines() if ln.strip()]
+    return names, errs
+
+
+def _setvar_output_var_names(batch_text: Any) -> List[str]:
+    """解析 SetVariable 的 batch_text，返回「按书写顺序、已去重」的变量名列表（最多 20 个）。
+
+    这些名字**就是本节点数据输出端口的名字与标签** —— 用户写几个变量，节点就长出几个出参，
+    可直接连到「组件」节点的入参端口，或组件蓝图里「结束」节点的返回值端口。
+    执行时每个端口输出「本次刚设置的那个值」。
+
+    ⚠ 与固定执行出口 `out_exec` 重名的变量会被跳过（避免同名端口打架）。
+    ⚠ 变量名允许含点号（如 target.hwnd），端口名照样用它，不做改名。
+    """
+    return _setvar_parse_issues(batch_text)[0]
+
+
 def _resolve_output_ports_default(node_type: str, params: Optional[Dict[str, Any]] = None) -> List[Port]:
     """返回给定节点类型的默认输出端口列表（动态端口节点按参数生成）。
 
@@ -1355,6 +1463,13 @@ def _resolve_output_ports_default(node_type: str, params: Optional[Dict[str, Any
             outs.append(Port(name=f"out_{i}", type=PortType.DATA, direction=PortDirection.OUT,
                              data_type="any", label=f"返回{i+1}"))
         return outs
+    if node_type == "SetVariable":
+        # 数据出口 = batch_text 里设置的变量（一个变量一个出参，端口名/标签就是变量名）
+        outs = [Port(name="out_exec", type=PortType.EXEC, direction=PortDirection.OUT, label="▶")]
+        for nm in _setvar_output_var_names(params.get("batch_text")):
+            outs.append(Port(name=nm, type=PortType.DATA, direction=PortDirection.OUT,
+                             data_type="any", label=nm))
+        return outs
     if node_type == "Parallel":
         # 并行：完成/失败 两个执行出口（分支在子画布里，不体现在端口上）
         return [
@@ -1377,7 +1492,7 @@ def _resolve_input_ports_default(node_type: str, params: Optional[Dict[str, Any]
     # -------- 动态端口节点的默认输入 --------
     if node_type == "VarSwitch":
         # 固定有一个执行输入 in_exec，后面跟 num_data_inputs 个 in_0 / in_1 ... 数据输入
-        n = max(0, min(20, int(params.get("num_data_inputs", 1))))
+        n = max(0, min(20, int(params.get("num_data_inputs", 1) or 1)))
         ins: List[Port] = [
             Port(name="in_exec", type=PortType.EXEC, direction=PortDirection.IN, label="▶"),
         ]
@@ -1387,7 +1502,7 @@ def _resolve_input_ports_default(node_type: str, params: Optional[Dict[str, Any]
         return ins
     if node_type == "SetVariable":
         # 固定有一个执行输入 in_exec，后面跟 num_data_inputs 个 in_0 / in_1 ... 数据输入
-        n = max(0, min(20, int(params.get("num_data_inputs", 0))))
+        n = max(0, min(20, int(params.get("num_data_inputs", 0) or 0)))
         ins: List[Port] = [
             Port(name="in_exec", type=PortType.EXEC, direction=PortDirection.IN, label="▶"),
         ]
@@ -1421,6 +1536,8 @@ def _resolve_input_ports_default(node_type: str, params: Optional[Dict[str, Any]
             Port(name="in_exec", type=PortType.EXEC, direction=PortDirection.IN, label="▶"),
         ]
     # -------- 默认：返回 NodeMeta 静态 inputs --------
+    # 注：PressKey 的「文本内容」/ Clipboard 的「写入内容」端口**固定存在，不随模式增减**
+    #     （用户明确要求：切模式不能让端口消失、连带把连线断掉）。只在对应模式下会被执行器使用。
     return list(meta.inputs)
 
 

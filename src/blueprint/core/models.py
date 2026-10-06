@@ -188,6 +188,19 @@ class Node:
             except Exception:
                 pass
 
+        # 4.6 SetVariable 特例：它的数据输出端口完全由 batch_text 决定（写几个变量就几个出参），
+        #     所以即使 JSON 里存的是旧端口（以前只有 out_exec），也按当前定义对齐一次 ——
+        #     否则会出现「打开已有蓝图看不到出参，非要再动一下那段文本才冒出来」。
+        #     端口名不变的那些连线不受影响（连线按端口名重挂）。
+        if ba_type == "SetVariable":
+            try:
+                from .node_library import _resolve_output_ports_default
+                want_out = _resolve_output_ports_default(ba_type, params)
+                if [pp.name for pp in outputs] != [pp.name for pp in want_out]:
+                    outputs = [Port(**pp.__dict__) for pp in want_out]
+            except Exception:
+                pass
+
         n = Node(
             id=d["id"],
             type=ba_type,

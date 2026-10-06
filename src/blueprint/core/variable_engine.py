@@ -422,30 +422,64 @@ def _iter_one_expr_token(s: str):
 # ------------------------------------------------------------
 # 辅助：SetVariable 批量文本解析（name=value 多行格式）
 # ------------------------------------------------------------
-_RE_VAR_DEFINE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_\.]*)\s*=\s*(.*?)\s*$")
+# 变量名：必须以「非数字的单词字符」开头（字母 / 下划线 / 汉字等），后面可接单词字符，允许点号（target.hwnd）。
+# ⚠ 汉字是**故意允许**的（2026-10-06 用户确认）：读侧插值 `{血量}` 一直就能用
+#   （`_PATTERN_BRACE_BARE` 是 `[^{}]+`），写侧原来只认 `[A-Za-z_]` → 读写不对称，
+#   用户写 `血量 = 100` 会既不生效、也不生成数据出口，还没有任何提示。现在两边口径一致。
+#   `[^\W\d]` = 单词字符里去掉数字 ⇒ 天然排除 "1a" 这类数字开头。
+_RE_VAR_NAME = r"[^\W\d]\w*(?:\.[^\W\d]\w*)*"
+_RE_VAR_DEFINE = re.compile(rf"^\s*({_RE_VAR_NAME})\s*=\s*(.*?)\s*$")
+_RE_VAR_NAME_ONLY = re.compile(rf"^{_RE_VAR_NAME}$")
+
+
+def _var_line_error_hint(line: str) -> str:
+    """给「这一行为什么没被认下来」一句具体原因（别让用户对着"格式错误"猜）。"""
+    s = (line or "").strip()
+    if ("＝" in s or "：" in s) and "=" not in s:
+        return "检测到全角符号，请改用半角 =（英文输入法下输入）"
+    if "=" not in s:
+        return "缺少 = 号（应为 变量名=值）"
+    name = s.split("=", 1)[0].strip()
+    if not name:
+        return "变量名为空"
+    if name[:1].isdigit():
+        return "变量名不能以数字开头"
+    if any(ch.isspace() for ch in name):
+        return f"变量名里不能有空格：'{name}'"
+    if not _RE_VAR_NAME_ONLY.match(name):
+        return "变量名含不支持的字符（须字母/下划线/汉字开头，可含字母数字下划线和点号）"
+    return "该行无法解析（请检查 = 后面是否有多余的 { } 等符号）"
 
 
 def parse_batch_var_lines(text: str) -> Tuple[Dict[str, str], str]:
     """解析多行 name=value 文本，返回 (变量dict, 错误信息)。
 
     语法：
-        # 行注释
+        # 行注释（也支持 // 开头的**整行**注释，与「条件判断」的 cases 解析口径保持一致）
         var1 = 字符串字面量（整行，允许前后空格被strip）
         port = 8080
         msg  = hello world
+        血量 = 100              # 变量名允许汉字（2026-10-06 起，与读侧 {血量} 口径一致）
         target.hwnd = 12345     # 允许点号（set 时按字典 key 的字符串存，实际访问交给 VariableEngine 点号解析）
     空行忽略。
+
+    ⚠ 行尾注释只按「空格 + #」截断（如 `a = 8080 # 备注`）；**不截 ` //`**——因为 `{= 10 // 3}`
+    里的 `//` 是 Python 整除运算符，截了会把表达式弄坏。`//` 只支持整行注释。
+
+    ⚠ 只有本函数**认下来的行**才会成为变量；写错的行会进「错误信息」。
+    调用方（画布摘要 / 检查格式 / 编辑器日志）必须把错误信息显示出来，
+    不要静默丢弃 —— 否则用户会看到「写了变量但右侧没有出参」而毫无线索。
     """
     result: Dict[str, str] = {}
     errors = []
     text = text or ""
     for idx, raw_line in enumerate(text.splitlines(), start=1):
         line = raw_line.strip()
-        if not line or line.startswith("#"):
+        if not line or line.startswith("#") or line.startswith("//"):
             continue
         m = _RE_VAR_DEFINE.match(line)
         if not m:
-            errors.append(f"第{idx}行格式错误（应为 name=value）: {raw_line}")
+            errors.append(f"第{idx}行格式错误: {raw_line}　→ {_var_line_error_hint(raw_line)}")
             continue
         name, val = m.group(1), m.group(2)
         # 去掉行尾注释（val 中若有'#'且前面是空格，视作注释开始——简化策略）

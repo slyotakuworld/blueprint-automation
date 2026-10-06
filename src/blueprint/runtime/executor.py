@@ -1,6 +1,7 @@
 import json
 import os
 import tempfile
+import threading
 import time
 import traceback
 import contextlib
@@ -19,7 +20,7 @@ from ..core.models import (
     Node,
     PortType,
 )
-from .debug_annotator import annotate_step
+from .debug_annotator import annotate_step, bump_step
 from .input_actions import InputActions
 from .screen_capture import ScreenCapture
 from .template_matcher import TemplateMatcher
@@ -32,6 +33,65 @@ from ...config.app_paths import debug_dir
 # 32 层对正常业务足够深（组件嵌套很少超过 5 层），又远小于 Python 递归上限。
 # ============================================================
 MAX_COMPONENT_DEPTH = 32
+
+
+# ============================================================
+# 剪贴板互斥锁：剪贴板是「系统级单例」资源，同一时刻只能有一个写入方。
+# 并行分支若同时「写剪贴板 → Ctrl+V」，后写入者会覆盖前者，表现为多条分支
+# 粘贴出同一份内容（实测：3 条分支全部粘出第 3 条分支的文本）。
+# 所以所有碰剪贴板的操作（按键节点粘贴、剪贴板节点读/写/清空）都要持有这把锁，
+# 把「写剪贴板 → 使用/读回」收敛成一段不可分割的临界区。
+# 锁只保证互斥，不改变各分支自己的文本内容，也不改变分支之间的先后（谁先拿到锁谁先粘）。
+# ============================================================
+_CLIPBOARD_LOCK = threading.Lock()
+
+
+# ============================================================
+# 执行路径（供编辑器把画布「跟随」进正在执行的子画布）
+# ------------------------------------------------------------
+# 子画布里的节点 id 是「每张图各自编号」的（父图有 1，循环体里第一个节点也叫 1），
+# 编辑器只看一个裸 id 无法知道它属于哪一层 —— 不带上路径，画布就只能停在当前层高亮，
+# 钻不进循环体 / 并行体。所以运行时把「容器链」一起告诉编辑器：
+#     根图 [] → 循环体 [LoopId] → 循环体里的并行体 [LoopId, ParId]
+# 用 thread-local 维护，并行分支各线程互不干扰（线程池里的线程由 walker 重新 seed）。
+# ============================================================
+_exec_path_tls = threading.local()
+
+
+def _exec_path_get():
+    """本线程当前的容器链（list）；None = 不可导航（如组件子蓝图内部）。"""
+    st = getattr(_exec_path_tls, "stack", None)
+    if not st:
+        return []
+    if any(x is None for x in st):
+        return None
+    return list(st)
+
+
+def _exec_path_set(path):
+    """walker 进入某张图时 seed 本线程的容器链（path=None → 标记为不可导航）。返回旧值。"""
+    prev = getattr(_exec_path_tls, "stack", None)
+    _exec_path_tls.stack = [None] if path is None else list(path)
+    return prev
+
+
+def _exec_path_restore(prev):
+    """还原 seed 前的容器链（与 _exec_path_set 配对使用）。"""
+    _exec_path_tls.stack = prev
+
+
+def _exec_path_of(graph):
+    """某张（子）图的容器链；未标记（组件子蓝图等）→ None（编辑器不做跟随）。"""
+    p = getattr(graph, "_runtime_path", None)
+    return list(p) if isinstance(p, list) else None
+
+
+def _exec_child_path(node):
+    """以本线程当前容器链为父，算出一个子画布容器的容器链；父级不可导航 → None。"""
+    cur = _exec_path_get()
+    if cur is None:
+        return None
+    return cur + [str(node.id)]
 
 
 # ============================================================
@@ -121,7 +181,7 @@ def _walk_branch_until_end(
 
         # UI 高亮 + 进度（复用 runner 信号） + 记录当前执行节点ID + 发 current_node_changed
         try:
-            runner.highlight_node.emit(curr_id)
+            runner.highlight_node.emit(curr_id, _exec_path_of(graph))
             runner.progress_step.emit(ctx.step_counter + 1, node.type)
         except Exception:
             pass
@@ -133,7 +193,7 @@ def _walk_branch_until_end(
 
         # 1) DATA 输入解析
         inputs = _resolve_data_inputs(graph, ctx, node)
-        ctx.step_counter += 1
+        bump_step(ctx)
 
         # 2) 执行（复用 EXECUTORS）
         ctx.log(f"[Node▶] {node.type}  id={curr_id[:8]} [seq分支]", "INFO")
@@ -276,6 +336,8 @@ def _run_subgraph_until_control(
     # 注入 graph/runner 引用，供子图内 Sequence 等需要递归 walk 的节点使用
     saved_graph = getattr(ctx, "_graph_ref", None)
     saved_runner = getattr(ctx, "_runner_ref", None)
+    # seed 本线程容器链 = 这张子图的路径：子图内如果再套容器，它的路径要接在这一层后面
+    saved_path = _exec_path_set(_exec_path_of(sub))
     ctx._graph_ref = sub
     ctx._runner_ref = runner
     try:
@@ -290,7 +352,7 @@ def _run_subgraph_until_control(
             wait_if_paused(ctx)
             # UI 高亮（子图节点）——尽量复用 runner 信号，失败则静默
             try:
-                runner.highlight_node.emit(curr_id)
+                runner.highlight_node.emit(curr_id, _exec_path_of(sub))
                 runner.progress_step.emit(ctx.step_counter + 1, node.type)
             except Exception:
                 pass
@@ -301,7 +363,7 @@ def _run_subgraph_until_control(
                 pass
 
             inputs = _resolve_data_inputs(sub, ctx, node, id_prefix=f"{sub_prefix}::")
-            ctx.step_counter += 1
+            bump_step(ctx)
             ctx.log(f"[Node▶] {node.type}  id={curr_id[:8]} [子图]", "INFO")
             fn = EXECUTORS.get(node.type)
             try:
@@ -346,6 +408,7 @@ def _run_subgraph_until_control(
             ctx._runner_ref = saved_runner
         else:
             ctx._runner_ref = None
+        _exec_path_restore(saved_path)
 
 
 def execute_Loop(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
@@ -422,6 +485,8 @@ def _execute_loop_body_container(
 
     sub = _subgraph_from_dict(loop_body, name=f"{node.id}::loop_body")
     sub._runtime_prefix = node.id
+    # 容器链：编辑器靠它把画布钻到正在执行的这一层（见文件头「执行路径」说明）
+    sub._runtime_path = _exec_child_path(node)
 
     # 找子图里的起始节点：优先 Start，否则第一个节点
     entry_id = None
@@ -1439,50 +1504,63 @@ def execute_PressKey(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
 
     if kb_mode == "text":
         # ---------- 输入文本模式 ----------
-        text = str(p.get("text", "") or "")
+        # 内容二选一（与 Clipboard.write 同一套约定）：
+        #   ① 左侧「文本内容」端口连了上游且值非空 → 用连线值（上游实时值，不再做插值）
+        #   ② 否则用参数 text（支持 {var} 插值）
+        port_text = inputs.get("in_text") if inputs else None
+        use_port = port_text is not None and str(port_text) != ""
+        if use_port:
+            text = str(port_text)
+        else:
+            text = str(p.get("text", "") or "")
+            # 变量插值
+            try:
+                from src.blueprint.core.variable_engine import VariableEngine
+                engine = getattr(ctx, "var_engine", None) or VariableEngine(ctx.variables)
+                if engine.has_any_marker(text):
+                    text = str(engine.interpolate(text))
+            except Exception:
+                pass
+
         use_paste = bool(p.get("use_paste", True))
         press_enter = bool(p.get("press_enter", False))
 
-        # 变量插值
-        try:
-            from src.blueprint.core.variable_engine import VariableEngine
-            engine = getattr(ctx, "var_engine", None) or VariableEngine(ctx.variables)
-            if engine.has_any_marker(text):
-                text = str(engine.interpolate(text))
-        except Exception:
-            pass
-
         if not text:
-            ctx.log("[PressKey] text 模式但文本为空，跳过。", "WARN")
+            ctx.log("[PressKey] text 模式但文本为空（参数为空，且「文本内容」端口无连线或值为空），跳过。", "WARN")
             annotate_step(ctx, node, "keypress", note="text mode: empty text")
             return {}, ["out_exec"], ""
 
-        ctx.log(f"[PressKey] text 模式 len={len(text)} paste={use_paste} enter={press_enter}", "INFO")
+        ctx.log(f"[PressKey] text 模式 len={len(text)} 来源={'端口' if use_port else '参数'} paste={use_paste} enter={press_enter}", "INFO")
         try:
             if use_paste:
                 # 粘贴模式：写剪贴板 + Ctrl+V（防中文乱码）
+                # ★ 整段「写剪贴板 → Ctrl+V → 等目标程序取走」必须持剪贴板锁串行执行。
+                #   并行分支里若不串行，两条分支会各自写剪贴板，后者覆盖前者，
+                #   于是所有分支粘出来的都是同一份（最后写入的那份）内容。
                 import pyperclip
-                pyperclip.copy(text)
-                time.sleep(0.05)
-                if ctx.input_actions is not None:
-                    # 用 SendInput 模拟 Ctrl+V（正确的组合键：按下Ctrl→按下V→释放V→释放Ctrl）
-                    ia = ctx.input_actions
-                    try:
-                        ia.key_down("lctrl")
-                        time.sleep(0.02)
-                        ia.key_down("v")
-                        time.sleep(0.03)
-                        ia.key_up("v")
-                        time.sleep(0.01)
-                        ia.key_up("lctrl")
-                    except Exception:
-                        # 回退到 pyautogui
+                with _CLIPBOARD_LOCK:
+                    pyperclip.copy(text)
+                    time.sleep(0.05)
+                    if ctx.input_actions is not None:
+                        # 用 SendInput 模拟 Ctrl+V（正确的组合键：按下Ctrl→按下V→释放V→释放Ctrl）
+                        ia = ctx.input_actions
+                        try:
+                            ia.key_down("lctrl")
+                            time.sleep(0.02)
+                            ia.key_down("v")
+                            time.sleep(0.03)
+                            ia.key_up("v")
+                            time.sleep(0.01)
+                            ia.key_up("lctrl")
+                        except Exception:
+                            # 回退到 pyautogui
+                            import pyautogui
+                            pyautogui.hotkey("ctrl", "v")
+                    else:
                         import pyautogui
                         pyautogui.hotkey("ctrl", "v")
-                else:
-                    import pyautogui
-                    pyautogui.hotkey("ctrl", "v")
-                time.sleep(0.05)
+                    # 锁内多留一拍：让目标程序把剪贴板内容真正读走，下一分支才能覆盖
+                    time.sleep(0.05)
             else:
                 # 逐字符输入
                 if ctx.input_actions is not None:
@@ -2022,7 +2100,9 @@ def execute_Clipboard(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any])
         _com_init()
 
         if mode == "read":
-            text = _read_text()
+            # 持剪贴板锁读：避免读到别的并行分支刚写一半的内容
+            with _CLIPBOARD_LOCK:
+                text = _read_text()
             if output_var:
                 ctx.variables[output_var] = text
             annotate_step(ctx, node, "clip_read", note=f"len={len(text)}")
@@ -2041,30 +2121,33 @@ def execute_Clipboard(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any])
             else:
                 text_to_write = str(in_text)
 
-            # 重试 2 次（防其他进程占用剪贴板）
+            # ★ 写 + 读回校验必须整体持锁：否则并行分支会在「写完」和「读回校验」之间
+            #   把剪贴板改掉，导致校验假失败（内容其实是对的）。
             write_ok = False
-            for _ in range(2):
-                if _write_text(text_to_write):
-                    write_ok = True
-                    break
-                import time
+            with _CLIPBOARD_LOCK:
+                # 重试 2 次（防其他进程占用剪贴板）
+                for _ in range(2):
+                    if _write_text(text_to_write):
+                        write_ok = True
+                        break
+                    import time
+                    try:
+                        time.sleep(0.02)
+                    except Exception:
+                        pass
+
+                # 二次校验：立即读回确认
                 try:
-                    time.sleep(0.02)
+                    verify = _read_text() or ""
+                    if verify != text_to_write:
+                        ctx.log(
+                            f"[Clipboard] ⚠️ write 二次校验不一致：写入len={len(text_to_write)} "
+                            f"实际读回len={len(verify)}，首次内容前60字：{verify[:60]!r}",
+                            "WARN",
+                        )
+                        write_ok = False
                 except Exception:
                     pass
-
-            # 二次校验：立即读回确认
-            try:
-                verify = _read_text() or ""
-                if verify != text_to_write:
-                    ctx.log(
-                        f"[Clipboard] ⚠️ write 二次校验不一致：写入len={len(text_to_write)} "
-                        f"实际读回len={len(verify)}，首次内容前60字：{verify[:60]!r}",
-                        "WARN",
-                    )
-                    write_ok = False
-            except Exception:
-                pass
 
             annotate_step(ctx, node, "clip_write", note=f"len={len(text_to_write)} ok={write_ok}")
             ctx.log(
@@ -2074,30 +2157,32 @@ def execute_Clipboard(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any])
             return {"out_text": text_to_write}, ["out_done"], ""
 
         elif mode == "clear":
-            # 重试 2 次（防其他进程占用剪贴板）
+            # ★ 清空 + 读回校验同样整体持锁（理由同 write）
             clear_ok = False
-            for _ in range(2):
-                if _clear():
-                    clear_ok = True
-                    break
-                import time
+            with _CLIPBOARD_LOCK:
+                # 重试 2 次（防其他进程占用剪贴板）
+                for _ in range(2):
+                    if _clear():
+                        clear_ok = True
+                        break
+                    import time
+                    try:
+                        time.sleep(0.02)
+                    except Exception:
+                        pass
+
+                # 二次校验：是否真的空了
                 try:
-                    time.sleep(0.02)
+                    verify = _read_text() or ""
+                    if verify:
+                        ctx.log(
+                            f"[Clipboard] ⚠️ clear 二次校验未空：实际读回len={len(verify)}，"
+                            f"前60字：{verify[:60]!r}",
+                            "WARN",
+                        )
+                        clear_ok = False
                 except Exception:
                     pass
-
-            # 二次校验：是否真的空了
-            try:
-                verify = _read_text() or ""
-                if verify:
-                    ctx.log(
-                        f"[Clipboard] ⚠️ clear 二次校验未空：实际读回len={len(verify)}，"
-                        f"前60字：{verify[:60]!r}",
-                        "WARN",
-                    )
-                    clear_ok = False
-            except Exception:
-                pass
 
             annotate_step(ctx, node, "clip_clear", note=f"ok={clear_ok}")
             ctx.log(
@@ -2616,9 +2701,22 @@ def execute_SetVariable(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any
     set_count = 0
     first_err = ""
     note_parts: list = []
+    # 数据出口：变量名 → 本次刚设置的值（节点右侧「同名出参」端口直接输出它，
+    # 下游可连到「组件」节点的入参端口 / 组件蓝图「结束」节点的返回值端口）
+    out_vals: Dict[str, Any] = {}
 
-    batch_raw = node.params.get("batch_text") or ""
-    if isinstance(batch_raw, str) and batch_raw.strip():
+    _batch_raw_any = node.params.get("batch_text")
+    if isinstance(_batch_raw_any, str):
+        batch_raw = _batch_raw_any
+    else:
+        batch_raw = ""
+        if _batch_raw_any not in (None, ""):
+            # 参数被意外写成了 list/dict（老蓝图或手改 JSON）→ 不崩，按空处理并提示
+            ctx.log(
+                f"[Var] SetVariable batch_text 类型异常（{type(_batch_raw_any).__name__}），已按空处理。",
+                "WARN",
+            )
+    if batch_raw.strip():
         kv_map, err_msg = parse_batch_var_lines(batch_raw)
         if err_msg:
             first_err = err_msg.splitlines()[0]
@@ -2631,6 +2729,7 @@ def execute_SetVariable(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any
             final_val = _auto_coerce(interpolated)
             ctx.set_var(k, final_val)
             engine.set(k, final_val)
+            out_vals[k] = final_val
             set_count += 1
             if len(note_parts) < 6:
                 note_parts.append(f"{k}={repr(final_val)[:40]}")
@@ -2649,7 +2748,20 @@ def execute_SetVariable(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any
             note += f" [端口={len(inputs_list)} 个]"
         ctx.log(f"[Var] {note} {first_err}".rstrip(), "WARN" if first_err else "DEBUG")
     annotate_step(ctx, node, "var", note=note)
-    return {}, ["out_exec"], first_err or ""
+    # 顺便核一下「变量数 vs 出参端口数」：出参只在画布右侧，数量对不上时下游会静默拿到 None
+    try:
+        from src.blueprint.core.node_library import _setvar_output_var_names
+        port_names = _setvar_output_var_names(node.params.get("batch_text"))
+        extra_vars = [k for k in out_vals.keys() if k not in port_names and k != "out_exec"]
+        if extra_vars:
+            ctx.log(
+                f"[Var] 有 {len(extra_vars)} 个变量没有对应的数据出口端口（{', '.join(extra_vars[:6])}），"
+                f"超出上限 20 个或与 out_exec 重名；这些值仍存进了变量，但没有端口可以往外连。",
+                "WARN",
+            )
+    except Exception:
+        pass
+    return out_vals, ["out_exec"], first_err or ""
 
 
 def _parse_varswitch_cases(raw: str) -> list:
@@ -2706,12 +2818,19 @@ def _varswitch_match(a, b) -> bool:
     return str(a).strip() == str(b).strip()
 
 
-def _varswitch_eval_condition(cond: Dict[str, Any], engine) -> Tuple[bool, str]:
-    """对解析后的单条条件做求值。返回 (命中, 可读说明)。"""
+def _varswitch_eval_condition(cond: Dict[str, Any], engine) -> Tuple[bool, str, str]:
+    """对解析后的单条条件做求值。返回 (命中, 可读说明, 警告)。
+
+    警告非空 = 这条条件「语法合法、但语义很可能写错了」（典型：右侧 {变量} 插值没生效，
+    说明变量名拼错/端口变量名写错）。调用方必须把它打到日志里 —— 否则用户写了
+    `ht == {__input__0}` 这种（正确写法是全大写 {__INPUTS__0}）会恒走「不满足」且毫无提示。
+    """
+    import re as _re
     label = cond.get("label", "")
     var = cond.get("var", "")
     op = cond.get("op", "==")
     target = cond.get("value")
+    warn = ""
     # 先取值：变量不存在 → None（比较时当作 falsy）
     try:
         actual = engine.get(var)
@@ -2723,6 +2842,15 @@ def _varswitch_eval_condition(cond: Dict[str, Any], engine) -> Tuple[bool, str]:
             target = engine.interpolate(target)
         except Exception:
             pass
+        # 插值之后仍留着 {名字} / ${名字} → 该变量不存在，被当成普通字符串参与比较
+        if isinstance(target, str):
+            # 变量名字符集不限 ASCII（汉字也能当变量名），所以这里只判断「插值后还剩没剩 {…}」
+            _m = _re.search(r"\$\{[^{}]+\}|\{[^{}]+\}", target)
+            if _m:
+                warn = (
+                    f"右侧 {_m.group(0)} 变量不存在、插值未生效（正按字符串 '{_m.group(0)}' 比较）；"
+                    f"端口值请写 {{__INPUTS__0}}（全大写），或检查变量名是否拼错"
+                )
     # 自动类型转换（两边都转数字试试）
     a = actual
     b = _auto_coerce(target)
@@ -2745,14 +2873,14 @@ def _varswitch_eval_condition(cond: Dict[str, Any], engine) -> Tuple[bool, str]:
                 hit = True
             elif str(a).strip() == str(b).strip():
                 hit = True
-            return hit, f"{var}={a!r} == {b!r} → {hit}"
+            return hit, f"{var}={a!r} == {b!r} → {hit}", warn
         if op == "!=":
-            hit_eq, _ = _varswitch_eval_condition({**cond, "op": "=="}, engine)
-            return (not hit_eq), f"{var}={a!r} != {b!r} → {not hit_eq}"
+            hit_eq, _eq_info, warn_eq = _varswitch_eval_condition({**cond, "op": "=="}, engine)
+            return (not hit_eq), f"{var}={a!r} != {b!r} → {not hit_eq}", (warn or warn_eq)
         if op in (">", "<", ">=", "<="):
             # 必须双方都能转数字才合法，否则 False
             if not a_ok or not b_ok:
-                return False, f"{var}={a!r} {op} {b!r} → 非数字无法比较"
+                return False, f"{var}={a!r} {op} {b!r} → 非数字无法比较", warn
             if op == ">":
                 hit = an > bn
             elif op == "<":
@@ -2761,10 +2889,10 @@ def _varswitch_eval_condition(cond: Dict[str, Any], engine) -> Tuple[bool, str]:
                 hit = an >= bn
             else:  # <=
                 hit = an <= bn
-            return hit, f"{var}={an} {op} {bn} → {hit}"
+            return hit, f"{var}={an} {op} {bn} → {hit}", warn
     except Exception as e:
-        return False, f"求值异常 {e}"
-    return False, f"未知运算符 {op}"
+        return False, f"求值异常 {e}", warn
+    return False, f"未知运算符 {op}", warn
 
 
 def execute_VarSwitch(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
@@ -2805,14 +2933,45 @@ def execute_VarSwitch(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any])
         )
 
     conditions = parse_varswitch_conditions(processed_raw if isinstance(processed_raw, str) else "")
+
+    # ② 条件语法错误必须打日志（以前是静默过滤 → 用户写错语法，运行时一个字提示都没有）
+    invalid = [c for c in conditions if c.get("error")]
+    if invalid:
+        _preview = "；".join(
+            f"第{c.get('line_no')}行「{str(c.get('raw_line', '')).strip()[:40]}」{c.get('error')}"
+            for c in invalid[:3]
+        )
+        ctx.log(
+            f"[VarSwitch] {node.id[:6]} 有 {len(invalid)} 条条件语法非法，这些行会被忽略："
+            f"{_preview}{' …' if len(invalid) > 3 else ''}",
+            "WARN",
+        )
+
     valid_conditions = [c for c in conditions if not c.get("error")]
+    if not valid_conditions:
+        ctx.log(
+            f"[VarSwitch] {node.id[:6]} 没有可用条件 → 直接走「不满足」出口"
+            + ("（条件行全部语法非法，见上方 WARN）" if invalid else "（条件设置为空）"),
+            "WARN",
+        )
+
     notes = []
+    warns = []
     all_true = True
     for c in valid_conditions:
-        hit, info = _varswitch_eval_condition(c, engine)
+        hit, info, _w = _varswitch_eval_condition(c, engine)
         notes.append(info)
+        if _w:
+            warns.append(f"第{c.get('line_no')}行「{str(c.get('raw_line', '')).strip()[:40]}」{_w}")
         if not hit:
             all_true = False
+    # ③ 「语法合法、语义写错」也要提示（例如 {__input__0} 少了大写 → 插值不生效，恒不满足）
+    if warns:
+        ctx.log(
+            f"[VarSwitch] {node.id[:6]} 有 {len(warns)} 条条件可能写错："
+            f"{'；'.join(warns[:3])}{' …' if len(warns) > 3 else ''}",
+            "WARN",
+        )
     if valid_conditions:
         port = "yes" if all_true else "no"
     else:
@@ -2844,6 +3003,7 @@ def execute_Sequence(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
 
     sub = _subgraph_from_dict(seq_body, name=f"{node.id}::seq_body")
     sub._runtime_prefix = node.id
+    sub._runtime_path = _exec_child_path(node)
 
     # 找子图入口：优先 Start，否则第一个节点
     entry_id = None
@@ -2908,6 +3068,7 @@ def execute_Parallel(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
 
     sub = _subgraph_from_dict(par_body, name=f"{node.id}::par_body")
     sub._runtime_prefix = node.id
+    sub._runtime_path = _exec_child_path(node)
 
     # 收集所有 Branch 分支入口
     branches = [n for n in sub.nodes.values() if n.type == "Branch"]
@@ -2955,6 +3116,10 @@ def _run_parallel_branch(ctx: ExecutionContext, sub: "BlueprintGraph", runner, b
     直接操作 sub 图；对共享 ctx 的写操作（log / variables / 计数）用锁保护。
     """
     sub_prefix = getattr(sub, "_runtime_prefix", "__sub__")
+    # 并行分支跑在线程池里，线程是新建或复用的 —— 本线程的容器链不继承父线程，
+    # 必须按「本图路径」重新 seed，否则分支内再套容器（如分支里放个循环）算出的路径会少一层。
+    # 刻意不 restore：每个分支进来都会重新 seed；这样也免去给整段 while 加缩进。
+    _exec_path_set(_exec_path_of(sub))
     edges = _exec_out_edges(sub, branch_id, "out_exec")
     if not edges:
         return False, f"分支入口 {branch_id[:8]} 无下游连线"
@@ -2972,7 +3137,7 @@ def _run_parallel_branch(ctx: ExecutionContext, sub: "BlueprintGraph", runner, b
 
         with lock:
             try:
-                runner.highlight_node.emit(curr_id)
+                runner.highlight_node.emit(curr_id, _exec_path_of(sub))
                 runner.progress_step.emit(ctx.step_counter + 1, node.type)
             except Exception:
                 pass
@@ -2982,7 +3147,7 @@ def _run_parallel_branch(ctx: ExecutionContext, sub: "BlueprintGraph", runner, b
             except Exception:
                 pass
             inputs = _resolve_data_inputs(sub, ctx, node, id_prefix=f"{sub_prefix}::")
-            ctx.step_counter += 1
+            bump_step(ctx)
             ctx.log(f"[Node▶] {node.type}  id={curr_id[:8]} [并行分支]", "INFO")
 
         fn = EXECUTORS.get(node.type)
@@ -3132,6 +3297,8 @@ def execute_Component(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any])
         return _empty_component_outputs(node), ["out_done"], ""
 
     sub._runtime_prefix = node.id
+    # ⚠ 刻意不设 sub._runtime_path：组件是「另一张蓝图」，不在当前画布上，编辑器无法跟随进去。
+    #   不设 → _exec_path_of() 返回 None → 编辑器不做画布跳转（只按 id 高亮，找不到就忽略）。
     annotate_step(ctx, node, "component", note=f"进入组件 {os.path.basename(path)}")
     ctx.log(f"[Component] {node.id[:6]} 执行子蓝图 {os.path.basename(path)}", "INFO")
 
@@ -3249,10 +3416,12 @@ def execute_Notify(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
         level_final = level_raw
 
     # 日志输出
+    # ⚠ 正文里不要再写一遍 [WARN]：日志面板会按 level 参数自己加 "[WARN]" 标签列，
+    #    运行日志文件也会写成 "[时间] [WARN] ..."。正文再加一遍就成了 "[WARN] [WARN] 标题"。
     log_body = str(msg_final)
     if len(log_body) > 4000:
         log_body = log_body[:4000] + "\n...（截断，完整内容看系统弹窗）"
-    ctx.log(f"[{level_final}] {title_final}\n{log_body}" if log_body else f"[{level_final}] {title_final}", level_final)
+    ctx.log(f"{title_final}\n{log_body}" if log_body else str(title_final), level_final)
 
     # 提示音
     if play_sound:
@@ -4058,12 +4227,15 @@ def _hit_node_breakpoint(ctx: ExecutionContext, node: Node, runner: "BlueprintRu
 class BlueprintRunner(QThread):
     """
     后台执行蓝图：
-      - Signal: log_message(str, str) / highlight_node(str) / finished_ok / finished_err(str)
+      - Signal: log_message(str, str) / highlight_node(str, object) / finished_ok / finished_err(str)
       - 严格不直接操作 Qt 控件
     """
 
     log_message = Signal(str, str)
-    highlight_node = Signal(str)
+    # 参数2 = 执行点所在的「容器链」（list / None）：
+    #   [] = 根图；[LoopId] = 循环体；[LoopId, ParId] = 循环体里的并行体；None = 不可导航（组件子蓝图）
+    # 编辑器靠它把画布「钻」进正在执行的子画布层再高亮（节点 id 各图独立编号，只看裸 id 无法定位层级）
+    highlight_node = Signal(str, object)
     highlight_clear = Signal()
     finished_ok = Signal()
     finished_err = Signal(str)
@@ -4077,10 +4249,14 @@ class BlueprintRunner(QThread):
     #  以及命中断点/暂停后快速跳画布
     current_node_changed = Signal(str, str)
 
-    def __init__(self, graph: BlueprintGraph, parent=None):
+    def __init__(self, graph: BlueprintGraph, parent=None, initial_variables: Optional[dict] = None):
         super().__init__(parent)
         self._graph = graph
         self._ctx: Optional[ExecutionContext] = None
+        # 仅编辑器「组件蓝图独立运行」使用：把临时测试入参（__arg_0…）预置进变量表，
+        # 让组件 Start 的 param_0… 端口能取到值。这只是运行时内存里的变量，
+        # 不写回蓝图文件；导出后的 EXE 不会传这个参数。
+        self._initial_variables: Dict[str, Any] = dict(initial_variables or {})
 
     def request_stop(self):
         if self._ctx is not None:
@@ -4230,6 +4406,18 @@ class BlueprintRunner(QThread):
         self._ctx = ctx
         ctx.last_progress_ts = time.time()
 
+        # 预置变量（组件蓝图独立运行时的临时入参）：只进变量表，不碰蓝图文件
+        if self._initial_variables:
+            try:
+                ctx.variables.update(self._initial_variables)
+                ctx.log(
+                    f"[Runtime] 已注入 {len(self._initial_variables)} 个临时入参"
+                    f"（__arg_0…），供本次运行调试使用；不会写入蓝图。",
+                    "INFO",
+                )
+            except Exception:
+                pass
+
         # 运行期不再有「全局目标窗口」概念：每个节点的操作范围 100% 由它自己的
         # range_mode + 目标窗口定位条件决定（window=只在该窗口内操作，fullscreen=整屏）。
         _write_log("[Runtime] 目标窗口由各节点的「范围模式」决定（目标窗口 / 全屏），无全局绑定。", "INFO")
@@ -4267,6 +4455,13 @@ class BlueprintRunner(QThread):
         # Sequence 短路OR分支需要：在 ctx 中注入 graph/runner 引用，供 execute_Sequence 同步walk子分支
         ctx._graph_ref = graph
         ctx._runner_ref = self
+        # 根图的执行路径 = []（编辑器把画布跟到根图这一层），并 seed 本线程的容器链，
+        # 供根图上的子画布容器算出自身路径（见文件头「执行路径」说明）
+        try:
+            graph._runtime_path = []
+            _exec_path_set([])
+        except Exception:
+            pass
         start_node = graph.find_start_node()
         if start_node is None:
             raise RuntimeError("蓝图没有 Start 节点（在校验阶段已报错，但仍被执行）")
@@ -4308,7 +4503,8 @@ class BlueprintRunner(QThread):
             return
         wait_if_paused(ctx)
         # UI 高亮（硬约束 §4 Signal 回传） + 记录当前执行节点ID + 发 current_node_changed
-        self.highlight_node.emit(node.id)
+        # 第二个参数 = 该节点所在的「容器链」：编辑器据此把画布跟随到对应子画布层
+        self.highlight_node.emit(node.id, _exec_path_of(graph))
         self.progress_step.emit(ctx.step_counter + 1, node.type)
         try:
             ctx.current_node_id = node.id

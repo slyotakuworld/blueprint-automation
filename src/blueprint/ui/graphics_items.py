@@ -470,6 +470,23 @@ class NodeItem(QGraphicsObject):
             pass
         super().mouseDoubleClickEvent(event)
 
+    def _in_port_has_edge(self, port_name: str) -> bool:
+        """画布用：判断本节点的某个输入端口是否连了上游。
+
+        只用于摘要文案（如「文本内容」为空时提示值来自连线），取不到图数据时一律返回 False。
+        """
+        try:
+            sc = self.scene()
+            g = getattr(sc, "graph", None)
+            if g is None or self.node is None:
+                return False
+            return any(
+                e.to_node == self.node.id and e.to_port == port_name
+                for e in g.edges.values()
+            )
+        except Exception:
+            return False
+
     def _summary_text(self) -> str:
         """返回节点关键参数摘要（显示在画布节点端口区域下方）。
         各节点类型显示不同关键信息，便于用户直观识别节点用途。"""
@@ -530,6 +547,11 @@ class NodeItem(QGraphicsObject):
             duration = float(p.get("duration_sec", 3.0) or 3.0)
             sound = bool(p.get("play_sound", False))
             popup = bool(p.get("show_popup", False))
+            # 级别放在最前面：INFO/WARN/ERROR/DEBUG 直接决定这条提示"有多严重"，
+            # 是用户在画布上一眼要认出来的信息（与 Clipboard 的 [读取]/[写入] 同款中文标记）。
+            level = str(p.get("level", "INFO") or "INFO").upper()
+            level_cn = {"INFO": "信息", "WARN": "警告",
+                        "ERROR": "错误", "DEBUG": "调试"}.get(level, level)
             tags = []
             if popup:
                 tags.append("弹窗")
@@ -539,7 +561,7 @@ class NodeItem(QGraphicsObject):
             msg_preview = msg.replace("\n", " ")[:30]
             if len(msg) > 30:
                 msg_preview += "…"
-            return f"{duration:g}s{tag_txt} {msg_preview}"
+            return f"[{level_cn}] {duration:g}s{tag_txt} {msg_preview}"
         if t == "VarSwitch":
             from ..core.node_library import parse_varswitch_conditions
             raw = str(p.get("cases", "") or "")
@@ -572,6 +594,9 @@ class NodeItem(QGraphicsObject):
                 preview = text.replace("\n", " ")[:24]
                 if len(text) > 24:
                     preview += "…"
+                if not preview:
+                    # 参数为空：文字可能由左侧「文本内容」端口从上游传入（识别结果 / 命令输出等）
+                    preview = "← 端口传入" if self._in_port_has_edge("in_text") else "(空)"
                 return f"[输入文本]{tag_txt} {preview}".strip()
             else:
                 # 读 key_combo（JSON数组）
@@ -586,7 +611,7 @@ class NodeItem(QGraphicsObject):
                     pass
                 count = int(p.get("count", 1) or 1)
                 cnt_txt = f" x{count}" if count > 1 else ""
-                return f"[按键组合] {keys_display}{cnt_txt}"
+                return f"[按键组合] {keys_display}{cnt_txt}".strip()
         if t == "Wait":
             delay_type = str(p.get("delay_type", "fixed") or "fixed")
             if delay_type == "random":
@@ -744,19 +769,26 @@ class NodeItem(QGraphicsObject):
             batch = str(p.get("batch_text", "") or "").strip()
             if not batch:
                 return ["（未设置变量）"]
-            lines = []
+            # 口径必须与「右侧出参」完全一致：走同一个解析器（parse_batch_var_lines），
+            # 认下来的行才会生成出参。写错的行照样画出来（否则用户会以为行丢了），
+            # 但要标 ⚠ 并汇总一行 —— 这正是「写了变量却没有出参」最需要的线索。
+            from ..core.node_library import _setvar_parse_issues
+            names, errs = _setvar_parse_issues(batch)
+            lines: List[str] = []
+            if errs:
+                lines.append(f"⚠ {len(errs)} 行不出出参（点「检查格式」）")
             for line in batch.splitlines():
                 line = line.strip()
-                if not line or line.startswith("#"):
+                if not line or line.startswith("#") or line.startswith("//"):
                     continue
                 if "=" in line:
                     name = line.split("=", 1)[0].strip()
                     val = line.split("=", 1)[1].strip()
                     if len(val) > 20:
                         val = val[:18] + "…"
-                    lines.append(f"{name} = {val}")
+                    lines.append(f"{name} = {val}" + ("" if name in names else "  ⚠"))
                 else:
-                    lines.append(line)
+                    lines.append(line + "  ⚠")
                 if len(lines) >= 8:
                     lines.append("…")
                     break

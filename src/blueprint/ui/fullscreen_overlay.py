@@ -62,7 +62,21 @@ class FullscreenOverlayBase(QWidget):
             已创建的 overlay 实例；结果通过 finished signal 异步返回
         """
         app_window.hide()
-        overlay = cls(*args, **kwargs)
+        try:
+            overlay = cls(*args, **kwargs)
+        except Exception:
+            # ⚠ 与上面的 hide() 严格配对：构造失败时遮罩根本不存在 → finished 永远不会
+            # 触发 → 主窗口再也回不来（现象同「弹了个错误框，然后界面凭空消失、
+            # 只能杀进程重启」，2026-10-06 与测试按钮同族的问题）。
+            # 调用方虽然 try/except 弹了「XX 启动失败」，但它并不知道主窗已被隐藏，
+            # 所以恢复只能在这里兜底；抛出的异常仍然照常向上传（保留原有提示）。
+            try:
+                app_window.show()
+                app_window.raise_()
+                app_window.activateWindow()
+            except Exception:
+                pass
+            raise
         overlay._app_window = app_window
 
         def _on_finished(_res):

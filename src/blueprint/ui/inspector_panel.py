@@ -321,7 +321,7 @@ class InspectorPanel(QWidget):
     request_snip_for_node = Signal(str, str)  # node_id, mode（"if_img_add" / "if_static_roi" / "if_img_replace_<idx>"）
     request_pick_coord = Signal(str, str)  # node_id, param_name（Mouse 点属性 📍 坐标拾取）
     request_open_component = Signal(str)   # 组件蓝图相对路径（点「打开这个组件」→ 主窗口跳转过去编辑）
-    component_chosen = Signal(str, str)    # (node_id, 组件蓝图相对路径)：选完组件 → 主窗口做端口自动对齐 + 循环引用检测
+    component_chosen = Signal(str, str)    # (node_id, 组件蓝图相对路径)：选完组件 → 主窗口核对端口数（只提示）+ 循环引用检测
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -743,14 +743,6 @@ class InspectorPanel(QWidget):
         self._clear_action_bar()
         if node is None:
             self._action_host.hide()
-            return
-        if node.type == "Notify":
-            btn = QPushButton("🔍 预览通知内容")
-            btn.setStyleSheet(self._btn_style("#0B3A5C", "#0F4A77"))
-            btn.clicked.connect(lambda _=False: self._show_notify_preview())
-            self._add_action_btn(btn)
-
-            self._action_host.show()
             return
         if node.type == "IfImageDetect":
             btn_add = QPushButton("📷 截图新增一张")
@@ -1642,68 +1634,6 @@ class InspectorPanel(QWidget):
 
         btn_save.clicked.connect(_save)
         btn_cancel.clicked.connect(dlg.reject)
-        dlg.exec()
-
-    def _show_notify_preview(self):
-        """Notify 两阶段预览：先 disable ALL_VARS 做普通插值，最后一步再单独替换 {ALL_VARS}"""
-        if self._current_node is None or self._current_node.type != "Notify":
-            return
-        node = self._current_node
-        try:
-            from src.blueprint.core.variable_engine import VariableEngine
-            # 取当前蓝图的 variables 字典（如果有）；取不到就空
-            vars_now: Dict[str, Any] = {}
-            try:
-                mw = getattr(self.window(), '__self__', None) or self.window()
-                if hasattr(mw, "project") and hasattr(mw.project, "variables"):
-                    vars_now = dict(mw.project.variables or {})
-            except Exception:
-                vars_now = {}
-            # 预览用：临时给点示例变量，让用户看得清效果
-            preview_vars = dict(vars_now)
-            if "user" not in preview_vars:
-                preview_vars["user"] = "Alice"
-            if "port" not in preview_vars:
-                preview_vars["port"] = 8080
-            engine = VariableEngine(preview_vars)
-            title_raw = str(node.params.get("title", "") or "")
-            msg_raw = str(node.params.get("message", "") or "")
-            level_raw = str(node.params.get("level", "INFO") or "INFO").upper()
-            title = engine.interpolate(title_raw) if engine.has_any_marker(title_raw) else title_raw
-            msg_stage1 = engine.interpolate(msg_raw, disable_all_vars=True) if engine.has_any_marker(msg_raw) else msg_raw
-            all_vars = engine._render_all_vars()
-            def _av(t: str) -> str:
-                if not isinstance(t, str): return t
-                return t.replace("${ALL_VARS}", all_vars).replace("{ALL_VARS}", all_vars)
-            title_final = _av(title if isinstance(title, str) else str(title))
-            msg_final = _av(msg_stage1 if isinstance(msg_stage1, str) else str(msg_stage1))
-        except Exception as e:
-            QMessageBox.critical(self, "预览失败", f"预览异常：\n{e}")
-            return
-        # 弹对话框
-        dlg = QDialog(self)
-        dlg.setWindowTitle(f"[预览] Notify  [{level_raw}] {title_final}")
-        dlg.resize(560, 460)
-        lay = QVBoxLayout(dlg)
-        info = QLabel(
-            f"<b>标题：</b><span style='color:#58A6FF'>{title_final}</span><br>"
-            f"<b>级别：</b>{level_raw}<br>"
-            f"<span style='color:#8B949E; font-size:9px;'>(预览用示例变量 user=Alice, port=8080；实际运行时用蓝图里的变量)</span>"
-        )
-        info.setWordWrap(True)
-        info.setTextFormat(Qt.RichText)
-        lay.addWidget(info)
-        box = QGroupBox("最终展开内容（{ALL_VARS} 已在最后一步单独替换）")
-        vlay = QVBoxLayout(box)
-        te = QPlainTextEdit()
-        te.setReadOnly(True)
-        te.setPlainText(str(msg_final) if msg_final is not None else "")
-        te.setStyleSheet(self._edit_style())
-        vlay.addWidget(te)
-        lay.addWidget(box, 1)
-        btns = QDialogButtonBox(QDialogButtonBox.Ok)
-        btns.accepted.connect(dlg.accept)
-        lay.addWidget(btns)
         dlg.exec()
 
     # ------------------------------------------------------------
@@ -3106,6 +3036,28 @@ class InspectorPanel(QWidget):
         dlg.resize(680, 560)
         dlg.exec()
 
+    def _restore_main_window_after_test(self, main_win, win_visible: bool) -> None:
+        """测试流程里「隐藏主窗口之后」的唯一恢复入口。
+
+        ⚠ 测试按钮为了不让主界面遮挡目标窗口，会先 `main_win.hide()`。**任何在
+        `hide()` 之后、正式截图/匹配之前的提前 `return`，都必须先调用本方法**，
+        否则主窗口再也不会 `show()` 回来 —— 现象是「弹了个错误框，然后程序界面
+        凭空消失，只能杀进程重启」（2026-10-06 实踩：「测试匹配」在
+        「目标窗口未找到」分支直接 return，漏了恢复）。
+        正常收尾路径由 `finally` 调用本方法，两条路径共用同一份逻辑，避免再次跑偏。
+        """
+        from PySide6.QtCore import QCoreApplication
+
+        try:
+            if main_win and win_visible and hasattr(main_win, "show"):
+                main_win.show()
+                main_win.raise_()
+                main_win.activateWindow()
+                for _ in range(3):
+                    QCoreApplication.processEvents()
+        except Exception:
+            pass
+
     def _ifimg_test_screen_match(self):
         """「测试当前屏幕匹配度」按钮：直接调用运行时 TemplateMatcher，保证测试=运行时预览。"""
         if getattr(self, "_ifimg_test_running", False):
@@ -3157,6 +3109,8 @@ class InspectorPanel(QWidget):
                     rect, rect_status = None, "notfound"
             if rect_status != "ok" or not rect:
                 self._ifimg_test_running = False
+                # ⚠ 主窗口此时已被 hide()：必须先恢复，否则界面消失只能杀进程（见 helper 注释）
+                self._restore_main_window_after_test(main_win, win_visible)
                 if rect_status == "notfound":
                     QMessageBox.warning(
                         self, "目标窗口未找到",
@@ -3282,14 +3236,8 @@ class InspectorPanel(QWidget):
             progress.close()
             results.append(f"匹配出错: {e}")
         finally:
-            # 恢复主窗口
-            try:
-                if main_win and win_visible and hasattr(main_win, "show"):
-                    main_win.show()
-                    for _ in range(3):
-                        QCoreApplication.processEvents()
-            except Exception:
-                pass
+            # 恢复主窗口（与提前 return 分支共用同一份逻辑，避免两处跑偏）
+            self._restore_main_window_after_test(main_win, win_visible)
             # 清理临时文件
             for tp in tmp_paths:
                 try:
@@ -3553,6 +3501,8 @@ class InspectorPanel(QWidget):
                     rect, rect_status = None, "notfound"
             if rect_status != "ok" or not rect:
                 self._findimg_test_running = False
+                # ⚠ 主窗口此时已被 hide()：必须先恢复，否则界面消失只能杀进程（见 helper 注释）
+                self._restore_main_window_after_test(main_win, win_visible)
                 if rect_status == "notfound":
                     QMessageBox.warning(
                         self, "目标窗口未找到",
@@ -3743,14 +3693,8 @@ class InspectorPanel(QWidget):
         except Exception as e:
             result_txt = f"匹配出错: {e}"
         finally:
-            # 恢复主窗口
-            try:
-                if main_win and win_visible and hasattr(main_win, "show"):
-                    main_win.show()
-                    for _ in range(3):
-                        QCoreApplication.processEvents()
-            except Exception:
-                pass
+            # 恢复主窗口（与提前 return 分支共用同一份逻辑，避免两处跑偏）
+            self._restore_main_window_after_test(main_win, win_visible)
             # 清理临时文件
             if tmp_tpl and os.path.exists(tmp_tpl):
                 try:
@@ -4505,7 +4449,8 @@ class InspectorPanel(QWidget):
         combo.currentIndexChanged.connect(
             lambda i, c=combo: self.param_changed.emit(self._nid(), "blueprint_path", c.currentData() or "")
         )
-        # 选完组件后通知主窗口：自动对齐端口数 + 循环引用检测（在参数已写入之后触发）
+        # 选完组件后通知主窗口：核对端口数是否与组件一致（只提示，不自动改）+ 循环引用检测
+        #（在参数已写入之后触发）
         combo.currentIndexChanged.connect(
             lambda i, c=combo: self.component_chosen.emit(self._nid(), str(c.currentData() or ""))
         )
@@ -4793,38 +4738,27 @@ class InspectorPanel(QWidget):
                 batch = w.toPlainText()
             else:
                 batch = str(self._current_node.params.get("batch_text", "") or "")
-            lines = [ln.strip() for ln in batch.split("\n") if ln.strip()]
-            if not lines:
+            if not str(batch or "").strip():
                 status_lbl.setText("⚠ 未设置任何变量")
                 status_lbl.setStyleSheet("color: #F0883E; font-size: 9px;")
                 return
-            import re
-            valid = 0
-            errors = []
-            for i, ln in enumerate(lines, 1):
-                if "=" not in ln:
-                    errors.append(f"第{i}行: 缺少 = 号")
-                    continue
-                name = ln.split("=", 1)[0].strip()
-                value = ln.split("=", 1)[1].strip()
-                if not name:
-                    errors.append(f"第{i}行: 变量名为空")
-                    continue
-                if not re.match(r"^[a-zA-Z_]\w*$", name):
-                    errors.append(f"第{i}行: 变量名 '{name}' 不合规（须字母/下划线开头）")
-                    continue
-                if not value:
-                    errors.append(f"第{i}行: 变量 '{name}' 的值为空")
-                    continue
-                valid += 1
+            # 与「右侧出参」同一个解析器：这里认下的才是真会生成出参的变量。
+            # （以前这里是另写一套正则：既会把 # 注释行报成"缺少 = 号"，又会把
+            #   合法的 target.hwnd 判成"变量名不合规" —— 三套口径互相打架。）
+            from ..core.node_library import _setvar_parse_issues
+            valid_names, errors = _setvar_parse_issues(batch)
             if not errors:
-                status_lbl.setText(f"✓ 全部合规（{valid} 个变量）")
+                status_lbl.setText(
+                    f"✓ 全部合规（{len(valid_names)} 个变量 → 右侧 {len(valid_names)} 个出参）"
+                )
                 status_lbl.setStyleSheet("color: #3FB950; font-size: 9px;")
             else:
                 err_preview = "; ".join(errors[:3])
                 if len(errors) > 3:
-                    err_preview += f" …等{len(errors)}处"
-                status_lbl.setText(f"✗ {len(errors)}处问题: {err_preview}")
+                    err_preview += f" …等{len(errors)}行"
+                status_lbl.setText(
+                    f"✗ {len(errors)} 行不会生成出参（已认下 {len(valid_names)} 个变量）: {err_preview}"
+                )
                 status_lbl.setStyleSheet("color: #F85149; font-size: 9px;")
 
         btn_check.clicked.connect(lambda _=False: _do_check())
