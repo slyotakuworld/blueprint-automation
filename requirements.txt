@@ -13,5 +13,15 @@ psutil
 # IMPORTANT: paddleocr depends on opencv-contrib-python. opencv-python and
 # opencv-contrib-python both ship a cv2/ package and MUST NOT be installed
 # together -- keep contrib only (it is a superset of opencv-python).
-paddlepaddle
+# MUST pin paddlepaddle==3.2.2: 3.3.0/3.3.1 has a oneDNN PIR-conversion regression
+# that crashes PP-OCRv6 inference with MKLDNN enabled
+# (NotImplementedError: ConvertPirAttribute2RuntimeAttribute not support ...).
+# See upstream issue paddlepaddle/paddle#77340. 3.2.2 works fine and is 3-6x
+# faster than running without oneDNN.
+paddlepaddle==3.2.2
 paddleocr
+# onnxruntime is the *inference backend* (not a model library). On CPUs where
+# paddle's oneDNN convolution kernels regress badly (e.g. AVX2-only Skylake-U),
+# OCR via ONNX Runtime measured ~5x faster with identical output. If it is
+# missing, ocr_engine silently falls back to the native paddle backend.
+onnxruntime

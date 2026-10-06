@@ -3924,11 +3924,26 @@ def execute_OcrRecognize(ctx: ExecutionContext, node: Node, inputs: Dict[str, An
     if result.get("error"):
         ctx.log(f"[OCR] 引擎返回异常: {result['error']}", "WARN")
 
+    # 耗时证据：区分「引擎初始化/首跑慢」和「稳态单张推理慢」（解法完全不同）
+    infer_ms = result.get("infer_ms")
+    init_ms = result.get("init_ms") or 0
+    engine_info = result.get("engine_info") or ""
+    timing = ""
+    if infer_ms is not None:
+        timing = f" 推理={infer_ms}ms 图={img.shape[1]}x{img.shape[0]}"
+        first = []
+        if engine_info:
+            first.append(engine_info)
+        if init_ms:
+            first.append(f"引擎初始化 {init_ms}ms")
+        if first:
+            timing += "（本条首次：" + " + ".join(first) + "，仅出现一次）"
+
     out = {"text": text, "items": items}
 
     # 一条文字都没识别到 -> 走「无文字」（与「失败」分开，也不再往下做匹配）
     if not items:
-        note = f"lang={lang} items=0 无文字"
+        note = f"lang={lang} items=0 无文字{timing}"
         annotate_step(ctx, node, "ocr", note=note)
         ctx.log(f"[OCR] {note}", "WARN")
         return empty_out, ["out_done", "no_text"], ""
@@ -3951,7 +3966,7 @@ def execute_OcrRecognize(ctx: ExecutionContext, node: Node, inputs: Dict[str, An
         ports.append("matched" if hit else "not_matched")
         match_note = f"match[{match_mode}]={match_text!r} -> {'命中' if hit else '未命中'}"
 
-    note = f"lang={lang} items={len(items)} text={text[:30]!r} {match_note}"
+    note = f"lang={lang} items={len(items)} text={text[:30]!r} {match_note}{timing}"
     annotate_step(ctx, node, "ocr", note=note)
     ctx.log(f"[OCR] {note}", "SUCCESS")
     return out, ports, ""

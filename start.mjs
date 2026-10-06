@@ -140,7 +140,38 @@ async function ensureVenv() {
 
 const KEY_IMPORTS = ['PySide6', 'cv2', 'numpy', 'PIL', 'win32gui', 'psutil', 'pynput'];
 
-/** 检查关键依赖；缺失（或 force）时按 requirements.txt 安装 */
+/**
+ * 核对 requirements.txt 里用 `==` 钉死版本的包（如 paddlepaddle==3.2.2）：
+ * 光「装了」不算数，已装版本与钉定不一致也要重装，否则钉版永远不生效
+ * （快路径只查包存在性，pip 不会被触发）。
+ */
+function checkPinnedVersions(py) {
+  const mismatched = [];
+  try {
+    const text = fs.readFileSync(REQUIREMENTS, 'utf8');
+    const pins = [];
+    for (const line of text.split(/\r?\n/)) {
+      const s = line.trim();
+      if (!s || s.startsWith('#')) continue;
+      const m = s.match(/^([A-Za-z0-9_.\-]+)==([^\s;#]+)$/);
+      if (m) pins.push([m[1], m[2]]);
+    }
+    for (const [name, ver] of pins) {
+      const r = runSync(py, [
+        '-c',
+        `import importlib.metadata as m;print(m.version("${name}"))`,
+      ]);
+      const cur = (r.stdout || '').trim();
+      if (r.status !== 0) mismatched.push(`${name}（未安装，钉 ${ver}）`);
+      else if (cur !== ver) mismatched.push(`${name}（当前 ${cur}，钉 ${ver}）`);
+    }
+  } catch {
+    // 读不到 requirements.txt 就跳过钉版核对（后面安装步骤会报）
+  }
+  return mismatched;
+}
+
+/** 检查关键依赖；缺失/版本不符（或 force）时按 requirements.txt 安装 */
 async function ensureDeps(py, { force = false } = {}) {
   if (!force) {
     // 逐模块各起一个子进程检查（与 bp_dev.have_module 口径一致）。
@@ -153,21 +184,38 @@ async function ensureDeps(py, { force = false } = {}) {
     }
     // OCR 库单独查（find_spec 秒回，不触发 paddle 重型导入）
     let ocrReady = false;
+    let ocrBackend = 'paddle';
     if (missing.length === 0) {
       const ocr = runSync(py, [
         '-c',
         "import importlib.util,sys;sys.exit(0 if importlib.util.find_spec('paddleocr') else 1)",
       ]);
       ocrReady = ocr.status === 0;
+      // 推理后端：装了 onnxruntime 就用它（老 CPU 上快约 5 倍），缺了只是退回慢路径
+      const be = runSync(py, [
+        '-c',
+        "import sys;sys.path.insert(0,'scripts');import bp_dev;print(bp_dev.ocr_backend())",
+      ]);
+      if (be.status === 0) ocrBackend = (be.stdout || '').trim() || 'paddle';
     }
-    if (missing.length === 0 && ocrReady) {
-      ok('关键依赖已就绪（PySide6 / cv2 / numpy / PIL / win32gui / psutil / pynput + OCR 库）');
+    const mismatched = checkPinnedVersions(py);
+    if (missing.length === 0 && ocrReady && mismatched.length === 0) {
+      ok('关键依赖已就绪（PySide6 / cv2 / numpy / PIL / win32gui / psutil / pynput + OCR 库，版本符合钉定）');
+      if (ocrBackend === 'onnxruntime') {
+        ok('OCR 推理后端：onnxruntime');
+      } else {
+        warn('OCR 推理后端：paddle 原生（未装 onnxruntime，识别会明显偏慢）。');
+        warn('  如需提速：' + VENV_PY + ' -m pip install onnxruntime');
+      }
       return true;
     }
     if (missing.length > 0) {
       warn(`缺少依赖：${missing.join('、')}`);
-    } else {
+    } else if (!ocrReady) {
       warn('OCR 库（paddlepaddle/paddleocr）缺失，准备按 requirements.txt 一起安装。');
+    }
+    if (mismatched.length > 0) {
+      warn(`依赖版本与 requirements.txt 钉定的不一致，准备重装：${mismatched.join('、')}`);
     }
   }
   if (!fs.existsSync(REQUIREMENTS)) {
@@ -186,13 +234,18 @@ async function ensureDeps(py, { force = false } = {}) {
   return true;
 }
 
-const OCR_MODELS_DIR = path.join(ROOT, 'ocr_runtime', 'models');
-
 /** OCR 识别模型预取：缺失时自动下载到 ocr_runtime/models（导出 EXE 时自动携带）。失败不阻塞主流程。 */
 async function ensureOcrModels(py) {
+  // 判据交给 Python 侧（bp_dev.ocr_models_ready）：要按当前后端核对**格式**，
+  // 只看「目录非空」会漏判 —— 老环境只有 paddle 格式模型，切到 onnxruntime 后端
+  // 后必须补下 ONNX 格式，否则导出物在离线机器上跑不起来。
   let has = false;
   try {
-    has = fs.existsSync(OCR_MODELS_DIR) && fs.readdirSync(OCR_MODELS_DIR).length > 0;
+    const res = runSync(py, [
+      '-c',
+      "import sys;sys.path.insert(0,'scripts');import bp_dev;sys.exit(0 if bp_dev.ocr_models_ready() else 1)",
+    ]);
+    has = res.status === 0;
   } catch {
     has = false;
   }
@@ -200,7 +253,7 @@ async function ensureOcrModels(py) {
     ok('OCR 模型已在位（ocr_runtime/models）。');
     return true;
   }
-  log('OCR 识别模型未预取，自动下载中（约 180MB，首次需要几分钟）……');
+  log('OCR 识别模型未预取或格式不符，自动下载中（约 150MB，首次需要几分钟）……');
   const code = await dispatch(py, 'ocr-runtime', ['--models-only']);
   if (code === 0) {
     ok('OCR 模型已就绪（导出含「文字」节点的 EXE 时自动携带）。');

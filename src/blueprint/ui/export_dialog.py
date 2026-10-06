@@ -241,7 +241,7 @@ class ExportDialog(QDialog):
             )
             return
 
-        # 「按需携带」前置告知：含 OCR 且目标还没有模型 → 要现拷约 180MB 模型。
+        # 「按需携带」前置告知：含 OCR 且目标还没有模型 → 要现拷百余 MB 模型。
         # 讲清楚避免被当成卡死；库已内置于模板，不用再拷几百 MB 的库目录。
         if self._uses_ocr and self._ocr_src:
             dst_rt = os.path.join(
@@ -256,7 +256,7 @@ class ExportDialog(QDialog):
                     mb = exporter.ocr_runtime_size_mb(self._ocr_src)
                 except Exception:
                     mb = 0.0
-                size_txt = f"约 {mb:.0f} MB" if mb else "约 180 MB"
+                size_txt = f"约 {mb:.0f} MB" if mb else "百余 MB"
                 r = QMessageBox.question(
                     self,
                     "需要携带 OCR 模型",

@@ -68,7 +68,14 @@ OCR_LIB_DIR = os.path.join(OCR_RUNTIME_DIR, "lib")   # 旧布局残留，仅用�
 OCR_MODELS_DIR = os.path.join(OCR_RUNTIME_DIR, "models")
 
 # OCR 引擎的包名（用于判定 lib/ 是否真的可用：只认包目录，空目录不算）
-OCR_PKGS = ("paddlepaddle", "paddleocr")
+# paddlepaddle 必须钉 3.2.2：3.3.0/3.3.1 的 oneDNN PIR 转换有回归，
+# PP-OCRv6 模型 + MKLDNN 一推理就报
+# NotImplementedError: ConvertPirAttribute2RuntimeAttribute not support [pir::ArrayAttribute<...>]
+# （官方 issue paddlepaddle/paddle#77340）。3.2.2 + MKLDNN 正常且比关 oneDNN 快 3~6 倍。
+# onnxruntime 是**推理后端**（不是模型库）：本机实测同一张图 0.86s vs paddle 原生 4.3s，
+# 约 5 倍且输出一致——paddle 的卷积走 oneDNN，在只有 AVX2 的老 CPU 上内核严重退化。
+# 缺了它功能不受影响（ocr_engine 会自动退回 paddle 后端），只是慢。
+OCR_PKGS = ("paddlepaddle==3.2.2", "paddleocr", "onnxruntime")
 
 # 运行时代码：改动这些文件后必须重打模板，否则导出的 EXE 跑的还是旧代码
 RUNTIME_SOURCES = [
@@ -266,17 +273,53 @@ def ensure_pyinstaller(*, auto_install: bool = True) -> bool:
     return True
 
 
+def _pinned_version_mismatches() -> list[str]:
+    """requirements.txt 里 `name==ver` 钉版的包，已装版本不一致的列表。
+
+    光查「包在不在」不够：钉版（如 paddlepaddle==3.2.2）必须核对版本，
+    否则快路径永远跳过安装、钉版形同虚设。
+    """
+    import importlib.metadata
+
+    bad: list[str] = []
+    try:
+        with open(REQUIREMENTS, "r", encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return bad
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        m = re.fullmatch(r"([A-Za-z0-9_.\-]+)==([^\s;#]+)", s)
+        if not m:
+            continue
+        name, want = m.group(1), m.group(2)
+        try:
+            got = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            bad.append(f"{name}（未安装，钉 {want}）")
+            continue
+        if got != want:
+            bad.append(f"{name}（当前 {got}，钉 {want}）")
+    return bad
+
+
 def ensure_requirements(*, force: bool = False, auto_install: bool = True) -> bool:
-    """检查关键依赖；缺失（或 --force）时按 requirements.txt 安装。"""
+    """检查关键依赖；缺失/版本不符（或 --force）时按 requirements.txt 安装。"""
     if not force:
         missing = [m for m in KEY_IMPORTS if not have_module(m)]
         if not missing and not ocr_lib_ready():
             # OCR 库单独查（find_spec 秒回，不触发 paddle 重型导入）
             missing = ["paddleocr（OCR 库，随 requirements.txt 一起安装）"]
         if not missing:
-            ok("关键依赖已就绪（PySide6 / cv2 / numpy / PIL / win32gui / psutil / pynput + OCR 库）")
-            return True
-        warn("缺少依赖：" + "、".join(missing))
+            bad = _pinned_version_mismatches()
+            if not bad:
+                ok("关键依赖已就绪（PySide6 / cv2 / numpy / PIL / win32gui / psutil / pynput + OCR 库，版本符合钉定）")
+                return True
+            warn("依赖版本与 requirements.txt 钉定的不一致：" + "、".join(bad))
+        else:
+            warn("缺少依赖：" + "、".join(missing))
     if not os.path.exists(REQUIREMENTS):
         fail(f"找不到依赖清单：{REQUIREMENTS}")
         return False
@@ -445,6 +488,13 @@ def cmd_build_runtime(args: argparse.Namespace) -> int:
         if _ilu.find_spec(pkg) is not None:
             log(f"  OCR 库内置：{pkg}（--collect-all）")
             pyi_args += ["--collect-all", pkg]
+    if _ilu.find_spec("onnxruntime") is not None:
+        # ONNX Runtime = OCR 的**推理后端**（可选但强烈建议）。本机实测同一张图
+        # 0.86s vs paddle 原生 4.3s（约 5 倍，输出一致）。同为懒加载，静态分析
+        # 看不到入口；它带一整套 C++ DLL，用 --collect-all 一次收齐。
+        # 纯 CPU 包（onnxruntime，非 -gpu），只有 ~20MB，对模板体积影响很小。
+        log("  OCR 库内置：onnxruntime（--collect-all，推理后端）")
+        pyi_args += ["--collect-all", "onnxruntime", "--copy-metadata", "onnxruntime"]
     if _ilu.find_spec("paddle") is not None:
         # paddle **不能**用 --collect-all / --collect-submodules：那会逐个 import
         # 子模块做枚举，而 paddle.jit.sot 在隔离子进程里 import 直接段错误
@@ -552,15 +602,83 @@ def ocr_lib_ready() -> bool:
         return False
 
 
+def ocr_backend() -> str:
+    """当前 venv 下 ocr_engine 会实际选用的推理后端（与运行时同一套 auto 规则）。"""
+    pref = (os.environ.get("BP_OCR_ENGINE") or "auto").strip().lower()
+    if pref in ("paddle", "paddle_static", "native"):
+        return "paddle"
+    if pref == "onnxruntime":
+        return "onnxruntime"
+    import importlib.util
+
+    try:
+        has = importlib.util.find_spec("onnxruntime") is not None
+    except Exception:
+        has = False
+    return "onnxruntime" if has else "paddle"
+
+
+# 运行时真正会用到的模型（必须与 ocr_engine 的配置一致：只开 det + rec 两个阶段）。
+# 后端决定需要哪一套格式 —— paddle 后端要 pdmodel/pdiparams，ONNX 后端要 *.onnx。
+_OCR_MODELS_PADDLE = ("PP-OCRv6_medium_det", "PP-OCRv6_medium_rec")
+_OCR_MODELS_ONNX = ("PP-OCRv6_medium_det_onnx", "PP-OCRv6_medium_rec_onnx")
+
+
+def ocr_models_ready() -> bool:
+    """ocr_runtime/models 里是否已有所需**格式**的 det+rec 模型。
+
+    ⚠ 不能只判断「目录非空」：老环境里只有 paddle 格式的模型，一旦后端切到
+    onnxruntime 就必须补下 ONNX 格式，否则导出物在离线机器上跑不起来。
+    """
+    base = os.path.join(OCR_MODELS_DIR, "official_models")
+    names = _OCR_MODELS_ONNX if ocr_backend() == "onnxruntime" else _OCR_MODELS_PADDLE
+    return all(os.path.isdir(os.path.join(base, n)) for n in names)
+
+
+def _unused_model_dirs() -> list:
+    """列出 ocr_runtime/models 里当前流水线用不到的模型目录（名, MB）。
+
+    用不到的来源有两类：① 另一后端格式的那一份；② 早就关掉的三个阶段
+    （doc_ori / textline_ori / UVDoc）残留 —— 它们对「屏幕截图」零贡献。
+    只报告不删除：导出会把整个 models/ 带走，白占体积，交给用户决定。
+    """
+    base = os.path.join(OCR_MODELS_DIR, "official_models")
+    need = set(_OCR_MODELS_ONNX if ocr_backend() == "onnxruntime" else _OCR_MODELS_PADDLE)
+    out = []
+    if not os.path.isdir(base):
+        return out
+    for name in sorted(os.listdir(base)):
+        path = os.path.join(base, name)
+        if name in need or not os.path.isdir(path):
+            continue
+        total = 0
+        for root_dir, _dirs, files in os.walk(path):
+            for f in files:
+                try:
+                    total += os.path.getsize(os.path.join(root_dir, f))
+                except OSError:
+                    pass
+        out.append((name, total / 1024 / 1024))
+    return out
+
+
 def _warmup_ocr_models() -> bool:
-    """用 venv 里的库触发一次初始化，把识别模型下到 ocr_runtime/models（供离线导出）。"""
+    """用 venv 里的库真跑一次识别，把所需模型下到 ocr_runtime/models（供离线导出）。
+
+    ⚠ 必须**复用运行时引擎本身**（`src.blueprint.runtime.ocr_engine`），不要另写一份
+    PaddleOCR(...) 参数：历史上这里写的是旧参数（开着 UVDoc/方向分类），导致把用不到的
+    模型也拉下来白占几十 MB；后端（paddle / onnxruntime）与模型格式也必须跟运行时一致，
+    否则会出现「预热下的是 paddle 模型、运行时却要 onnx 模型」→ 导出后联网才能跑。
+    """
     code = (
-        "import os\n"
+        "import os, sys\n"
         "os.environ.setdefault('FLAGS_enable_pir_api', '0')\n"
-        "os.environ.setdefault('FLAGS_use_mkldnn', '0')\n"
-        "from paddleocr import PaddleOCR\n"
-        "PaddleOCR(use_textline_orientation=True, lang='ch', enable_mkldnn=False)\n"
-        "print('OCR models ready')\n"
+        "sys.path.insert(0, os.getcwd())\n"
+        "import numpy as np\n"
+        "from src.blueprint.runtime.ocr_engine import recognize\n"
+        "r = recognize(np.full((32, 128, 3), 255, dtype=np.uint8), 'ch')\n"
+        "assert not r.get('error'), 'OCR 不可用: ' + str(r.get('error'))\n"
+        "print('OCR models ready:', r.get('engine_info'))\n"
     )
     env = dict(os.environ)
     env["PADDLE_PDX_CACHE_HOME"] = OCR_MODELS_DIR
@@ -578,7 +696,7 @@ def cmd_ocr_runtime(args: argparse.Namespace) -> int:
     """
     step("准备 OCR 运行时")
     log(f"  库   → .venv（随运行时模板打包，不再放 ocr_runtime/lib）")
-    log(f"  模型 → {OCR_MODELS_DIR}（导出含「文字」节点的 EXE 时自动携带）")
+    log(f"  模型 → {OCR_MODELS_DIR}（{ocr_backend()} 格式，导出含「文字」节点的 EXE 时自动携带）")
 
     models_only = getattr(args, "models_only", False)
     if models_only and not ocr_lib_ready():
@@ -592,11 +710,11 @@ def cmd_ocr_runtime(args: argparse.Namespace) -> int:
 
     if args.dry_run:
         if models_only:
-            log(f"[dry-run] （触发一次 PaddleOCR 初始化，把模型下到 {OCR_MODELS_DIR}）")
+            log(f"[dry-run] （跑一次真实识别，把所需模型下到 {OCR_MODELS_DIR}）")
         else:
             log("[dry-run] " + " ".join(pip_cmd))
             if not args.skip_models:
-                log(f"[dry-run] （随后触发一次 PaddleOCR 初始化，把模型下到 {OCR_MODELS_DIR}）")
+                log(f"[dry-run] （随后跑一次真实识别，把所需模型下到 {OCR_MODELS_DIR}）")
         log("[dry-run] 已跳过实际安装。")
         return 0
 
@@ -619,8 +737,8 @@ def cmd_ocr_runtime(args: argparse.Namespace) -> int:
     # ② 模型：首次识别会自动下载；这里提前取好，导出的 EXE 才能离线可用。
     if args.skip_models:
         warn("已按 --skip-models 跳过模型预取（首次识别时会联网下载）。")
-    elif os.path.isdir(OCR_MODELS_DIR) and os.listdir(OCR_MODELS_DIR):
-        ok(f"OCR 模型已在位：{OCR_MODELS_DIR}")
+    elif ocr_models_ready() and not args.force:
+        ok(f"OCR 模型已在位（后端 {ocr_backend()}）：{OCR_MODELS_DIR}")
     else:
         step("② 预取 OCR 模型到 ocr_runtime/models（首次约 180MB）")
         if _warmup_ocr_models():
@@ -632,6 +750,17 @@ def cmd_ocr_runtime(args: argparse.Namespace) -> int:
     if os.path.isdir(OCR_LIB_DIR):
         warn(f"检测到旧布局 {OCR_LIB_DIR}（已废弃，库现在装在 .venv 并随模板打包）。")
         log("  可整个删除该目录腾出约 550MB：ocr_runtime/lib 不会再被使用。")
+
+    # ④ 用不到的模型：导出会把整个 models/ 复制走，这些纯属白占
+    dead = _unused_model_dirs()
+    if dead:
+        keep = "、".join(_OCR_MODELS_ONNX if ocr_backend() == "onnxruntime" else _OCR_MODELS_PADDLE)
+        warn(f"models/ 里有 {len(dead)} 个用不到的模型目录（当前后端 {ocr_backend()}，只会用到 {keep}）：")
+        base = os.path.join(OCR_MODELS_DIR, "official_models")
+        for name, mb in dead:
+            log(f"      {mb:7.1f} MB  {name}")
+        log(f"  合计约 {sum(mb for _, mb in dead):.0f} MB，删掉不影响功能（导出会整个目录复制）。")
+        log(f"  确认后可删除：{base} 下的上述目录。")
 
     log("")
     ok("OCR 运行时准备完成。")
@@ -679,12 +808,15 @@ def cmd_env(args: argparse.Namespace) -> int:
     # OCR：库在 .venv（随模板打包），模型在 ocr_runtime/models（随导出携带）
     log("")
     log("OCR 运行时：")
+    _backend = ocr_backend()
     log(f"  {'✔' if ocr_lib_ready() else '✘'} 库（.venv 里的 paddlepaddle/paddleocr，随模板打包）")
-    if os.path.isdir(OCR_MODELS_DIR):
-        _n = len(os.listdir(OCR_MODELS_DIR))
-        log(f"  {'✔' if _n else '✘'} 模型 models/（{_n} 项）")
+    log(f"  {'✔' if _backend == 'onnxruntime' else '·'} 推理后端：{_backend}"
+        + ("（onnxruntime，比 paddle 原生快约 5 倍）" if _backend == "onnxruntime"
+           else "（未装 onnxruntime，退回 paddle 原生后端）"))
+    if ocr_models_ready():
+        log(f"  ✔ 模型 models/（{_backend} 格式，det+rec）")
     else:
-        log("  ✘ 模型 models/（未预取，首次识别会联网下载）")
+        log(f"  ✘ 模型 models/（缺 {_backend} 格式的 det/rec，跑 ocr-runtime 会补下）")
     if not ocr_lib_ready():
         log("      → 尚未准备：启动 start.cmd（菜单 1/2）时会自动装库并下载模型")
         log("        （也可手动执行：start.cmd ocr-runtime）")

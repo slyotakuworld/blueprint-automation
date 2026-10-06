@@ -143,7 +143,9 @@ def carry_ocr_runtime(out_exe_path: str) -> tuple:
     蓝图不含「文字」节点时不会调用本函数 —— 这就是「按需携带」：没用 OCR 的导出物
     一个字节都不多带。
 
-    库（paddle 等）已内置于模板 EXE，这里只带模型（约 180MB），几秒即完。
+    库（paddle / onnxruntime 等）已内置于模板 EXE，这里只带模型（百余 MB，取决于
+    目录里保留的模型格式），几秒到十几秒即完。整个 models/ 原样带走，运行时会按
+    当前推理后端自动挑用得到的那一份，导出端不需要知道后端是什么。
     仍保持**原子化**（先拷 `<dst>.copying` 再改名），中断不留残缺目录。
     """
     dst = os.path.join(
