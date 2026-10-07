@@ -581,19 +581,27 @@ def cmd_build_runtime(args: argparse.Namespace) -> int:
 
     step("部署运行时模板")
     for dst in targets:
-        d = os.path.dirname(dst)
-        if d and not os.path.exists(d):
-            os.makedirs(d, exist_ok=True)
+        # dst 可能是「目录」（发布版目录 / --out，copy2 会把 exe 拷进去），
+        # 也可能是「exe 文件路径」（仓库根模板）。先统一算出 exe 的最终落点，
+        # 再据此定位 app_dir —— 之前直接 dirname(dst) 在目录场景会多上跳一级，
+        # 把 ocr_runtime/ 复制到 dist\ 而不是 dist\BlueprintAutomation\。
+        if os.path.isdir(dst):
+            out_exe = os.path.join(dst, os.path.basename(built))
+        else:
+            out_exe = dst
+            d = os.path.dirname(out_exe)
+            if d and not os.path.exists(d):
+                os.makedirs(d, exist_ok=True)
         try:
             shutil.copy2(built, dst)
         except OSError as exc:
             fail(f"复制到 {dst} 失败（目标可能正在运行/被占用）：{exc}")
             return 2
-        ok(f"{dst}（{human_size(dst)}，{human_mtime(dst)}）")
+        ok(f"{out_exe}（{human_size(out_exe)}，{human_mtime(out_exe)}）")
         # 发布目录顺带带上 OCR 模型（项目根本来就有，跳过）——
         # 发布版编辑器没有项目根兜底，exe 同级没有 ocr_runtime/ 就用不了文字节点。
-        app_dir = os.path.dirname(os.path.abspath(dst))
-        if os.path.normcase(os.path.abspath(app_dir)) != os.path.normcase(os.path.abspath(ROOT)):
+        app_dir = os.path.dirname(os.path.abspath(out_exe))
+        if os.path.normcase(app_dir) != os.path.normcase(os.path.abspath(ROOT)):
             _deploy_ocr_runtime_to(app_dir)
 
     ok(f"运行时模板构建完成，耗时 {time.time() - t0:.1f}s")
