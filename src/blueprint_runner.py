@@ -80,6 +80,9 @@ PREFS_FILE = "runtime_prefs.json"
 
 _SUB_DIRS = ("resource", "cache", "debug", "assets")
 
+# 停止超时的孤儿 runner（防「窗口销毁连带析构在跑的 QThread → abort 闪退」，见 _quit）
+_ORPHAN_RUNNERS = []
+
 # 状态色（浅色主题）
 _C_READY = "#57606A"
 _C_RUNNING = "#1F883D"
@@ -611,6 +614,18 @@ class RuntimeWindow(QWidget):
             if r is not None and r.isRunning():
                 r.request_stop()
                 r.wait(3000)
+                # 3 秒还没停干净（当前节点是长等待/找图/网络，要等它跑完手上这个节点）
+                # → 孤儿化脱离父对象，绝不能让窗口销毁连带析构还在跑的 QThread
+                #（Qt 直接 abort = 退出时闪退）；然后立即结束进程，避免僵尸残留。
+                # 走到这里说明用户已确认「停止并退出」，运行日志每次 write 都已 flush，无数据可丢。
+                if r.isRunning():
+                    try:
+                        r.setParent(None)
+                        r.finished.connect(r.deleteLater)
+                        _ORPHAN_RUNNERS.append(r)
+                    except Exception:
+                        pass
+                    os._exit(0)
         except Exception:
             pass
         QApplication.quit()

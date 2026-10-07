@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QGraphicsSceneContextMenuEvent,
     QGraphicsSceneHoverEvent,
     QGraphicsSceneMouseEvent,
+    QInputDialog,
     QMenu,
     QStyle,
     QStyleOptionGraphicsItem,
@@ -105,6 +106,9 @@ def _decode_b64_pixmap(b64_text: str, size: int) -> Optional[QPixmap]:
             pil = pil.convert("RGBA")
         w, h = pil.size
         from PySide6.QtGui import QImage
+        # 注（2026-10-07 实测）：PySide6 6.11 的 QImage(bytes,…) 构造是**拷贝语义**
+        #   （bytearray 改写不回显、临时 bytes 释放后 copy() 仍正确），这里不存在
+        #   "缓冲区悬空"问题；tobytes 临时对象直接传参是安全的。
         qimg = QImage(pil.tobytes("raw", "RGBA"), w, h, QImage.Format_RGBA8888)
         return QPixmap.fromImage(qimg.copy())
     except Exception:
@@ -1407,10 +1411,38 @@ class EdgeItem(QGraphicsPathItem):
         return stroker.createStroke(self.path())
 
     def boundingRect(self) -> QRectF:
-        """重写：boundingRect 也要足够大以容纳 8px 宽的命中区域。"""
-        pad = 8
+        """重写：boundingRect 也要足够大以容纳 8px 宽的命中区域。
+        pad=16：还要容纳中点的「权重」徽标（权重≠1 时画在线中点附近）。"""
+        pad = 16
         base = self.path().boundingRect()
         return base.adjusted(-pad, -pad, pad, pad)
+
+    def paint(self, painter, option, widget=None):
+        super().paint(painter, option, widget)
+        # 权重徽标：只有权重≠1 的连线才画（默认线保持干净），画在曲线中点
+        if self.edge is None or self._temp_mode:
+            return
+        try:
+            prio = int(getattr(self.edge, "priority", 1) or 1)
+        except (TypeError, ValueError):
+            prio = 1
+        if prio == 1:
+            return
+        mid = self.path().pointAtPercent(0.5)
+        text = f"权重{prio}"
+        font = QFont()
+        font.setPointSizeF(max(7.0, font.pointSizeF() * 0.85))
+        painter.save()
+        painter.setFont(font)
+        fm = painter.fontMetrics()
+        tw, th = fm.horizontalAdvance(text), fm.height()
+        r = QRectF(mid.x() - tw / 2 - 5, mid.y() - th / 2 - 2, tw + 10, th + 4)
+        painter.setPen(QPen(QColor("#D29922")))
+        painter.setBrush(QColor("#3B2E04"))
+        painter.drawRoundedRect(r, 4, 4)
+        painter.setPen(QPen(QColor("#F0B429")))
+        painter.drawText(r, Qt.AlignCenter, text)
+        painter.restore()
 
     def hoverEnterEvent(self, event):
         self._hover = True
@@ -1429,3 +1461,60 @@ class EdgeItem(QGraphicsPathItem):
         if change == QGraphicsItem.ItemSelectedHasChanged:
             self._update_pen()
         return super().itemChange(change, value)
+
+    # ---------------- 优先级权重（fan-out 顺序） ----------------
+    def _set_priority(self, value: int) -> Optional[int]:
+        """把权重设为 value，返回旧值；刷新徽标并通知场景（主窗口记撤销/日志）。"""
+        if self.edge is None:
+            return None
+        old = int(getattr(self.edge, "priority", 1) or 1)
+        try:
+            new = max(1, int(value))
+        except (TypeError, ValueError):
+            return None
+        if new == old:
+            return None
+        self.edge.priority = new
+        self.update()
+        sc = self.scene()
+        if sc is not None and hasattr(sc, "edge_priority_changed"):
+            sc.edge_priority_changed.emit(self.edge.id, old, new)
+        return old
+
+    def contextMenuEvent(self, event):
+        """右键连线 → 设置「优先级权重」（fan-out：同端口多条线，权重大的先执行）。"""
+        if self.edge is None or self._temp_mode:
+            return
+        # 右键即选中该线（统一高亮，用户看得清在改哪根）
+        sc = self.scene()
+        if sc is not None:
+            sc.clearSelection()
+            self.setSelected(True)
+
+        cur = int(getattr(self.edge, "priority", 1) or 1)
+        menu = QMenu()
+        title = menu.addAction(f"连线优先级权重（当前 {cur}）")
+        title.setEnabled(False)
+        menu.addSeparator()
+        for w in (1, 2, 3, 5, 10):
+            act = menu.addAction(f"权重 {w}" + ("（默认）" if w == 1 else ""))
+            act.setCheckable(True)
+            act.setChecked(w == cur)
+            act.setData(w)
+        menu.addSeparator()
+        act_custom = menu.addAction("自定义…")
+
+        chosen = menu.exec(event.screenPos())
+        if chosen is None:
+            return
+        if chosen is act_custom:
+            val, ok = QInputDialog.getInt(
+                None, "连线优先级权重",
+                "同一条出端口上连了多条线时，权重大的先执行。\n（权重相同按连线先后；单线时此值无意义）",
+                cur, 1, 100000,
+            )
+            if not ok:
+                return
+            self._set_priority(val)
+            return
+        self._set_priority(int(chosen.data()))

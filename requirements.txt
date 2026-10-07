@@ -1,4 +1,11 @@
-PySide6
+# MUST pin PySide6==6.9.3: the 6.10.x/6.11.x family has a shiboken wrapper-cache
+# bug family (stale wrapper on address reuse -> SignalManager::retrieveMetaObject
+# NULL deref -> sporadic 0xC0000005 access violation, see forum.qt.io post 839034,
+# and the PYSIDE-86/3069/3115 QGraphicsObject lifecycle bug family). This app
+# churns dozens of QGraphicsObject items on every subcanvas enter/exit
+# (set_graph rebuild), which is exactly the trigger. Confirmed crash:
+# exit code 3221225477 in PortItem.__init__ during _exit_subgraph with 6.11.2.
+PySide6==6.9.3
 opencv-contrib-python>=4.10
 numpy>=2.3
 pillow

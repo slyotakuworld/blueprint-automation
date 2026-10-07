@@ -133,12 +133,22 @@ def _resolve_data_inputs(graph: BlueprintGraph, ctx: ExecutionContext, node: Nod
 
 
 def _exec_out_edges(graph: BlueprintGraph, node_id: str, out_port: str) -> List[Tuple[str, str]]:
-    """返回 (next_node_id, next_in_exec_port) 列表。"""
-    result = []
-    for e in graph.edges.values():
+    """返回 (next_node_id, next_in_exec_port) 列表。
+
+    顺序 = 连线的「优先级权重」降序（权重 2 比 1 先执行），同权重按连线存储序稳定
+    （= 本次会话内的连线先后）。根图队列 / 容器子图 walker / 并行分支入口全走这里，
+    排序在这一处生效。权重在编辑器右键连线上设置，默认 1（Edge.priority）。
+    """
+    tmp = []
+    for idx, e in enumerate(graph.edges.values()):
         if e.from_node == node_id and e.from_port == out_port:
-            result.append((e.to_node, e.to_port))
-    return result
+            try:
+                prio = int(getattr(e, "priority", 1) or 1)
+            except (TypeError, ValueError):
+                prio = 1
+            tmp.append((-prio, idx, e.to_node, e.to_port))
+    tmp.sort(key=lambda t: (t[0], t[1]))
+    return [(nid, np) for _, _, nid, np in tmp]
 
 
 # ============================================================
@@ -395,6 +405,9 @@ def _run_subgraph_until_control(
             # breakpoint=True 的节点进入即停（循环每轮都会命中）；step_mode=True 每节点自动停。
             # ⚠ 并行分支 walker 刻意**不调**这个 —— 并行是黑盒，断点/单步只停在并行节点本身。
             _hit_node_breakpoint(ctx, node, runner)
+            # 暂停期间用户点了停止 → 不执行手上这个节点（与根图 _execute_node 同口径）
+            if not ctx.is_running:
+                return None, False, "运行被用户停止"
             fn = EXECUTORS.get(node.type)
             try:
                 if fn is None:
@@ -3404,6 +3417,9 @@ def _run_parallel_branch(ctx: ExecutionContext, sub: "BlueprintGraph", runner,
         # 主线程分支：断点 / Step 生效（语义与根图一致；暂停期间其它分支照常跑）
         if is_main:
             _hit_node_breakpoint(ctx, node, runner)
+            # 暂停期间用户点了停止 → 不执行手上这个节点（与根图/子图 walker 同口径）
+            if not ctx.is_running:
+                return "fail", "运行被用户停止", None
 
         fn = EXECUTORS.get(node.type)
         try:
@@ -4698,13 +4714,18 @@ class BlueprintRunner(QThread):
         try:
             log_fp = open(log_path, "a", encoding="utf-8")
 
+            # 并行分支的多个线程会并发调 ctx.log → _write_log，write+flush 必须串行，
+            # 否则日志行可能交错（极端情况下并发 flush 会抛 io 异常）。
+            _log_lock = threading.Lock()
+
             def _write_log(msg: str, level: str = "INFO"):
                 ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 line = f"[{ts}] [{level}] {msg}\n"
                 if log_fp is not None:
                     try:
-                        log_fp.write(line)
-                        log_fp.flush()
+                        with _log_lock:
+                            log_fp.write(line)
+                            log_fp.flush()
                     except Exception:
                         pass
                 self.log_message.emit(msg, level)
@@ -4828,6 +4849,10 @@ class BlueprintRunner(QThread):
         if not ctx.is_running:
             return
         wait_if_paused(ctx)
+        # 暂停期间用户点了停止 → wait 返回后 is_running 已为 False，直接收工，
+        # 不执行手上这个节点（否则「停止」后还会多跑一次点击/按键，行为上像没停干净）
+        if not ctx.is_running:
+            return
         # UI 高亮（硬约束 §4 Signal 回传） + 记录当前执行节点ID + 发 current_node_changed
         # 第二个参数 = 该节点所在的「容器链」：编辑器据此把画布跟随到对应子画布层
         self.highlight_node.emit(node.id, _exec_path_of(graph))
@@ -4848,6 +4873,9 @@ class BlueprintRunner(QThread):
 
         # 3. 断点命中检查（主执行入口）
         _hit_node_breakpoint(ctx, node, self)
+        # 断点/Step 暂停期间用户点了停止 → 不执行手上这个节点，直接收工
+        if not ctx.is_running:
+            return
 
         # 4. 执行
         fn = EXECUTORS.get(node.type)
@@ -4885,11 +4913,8 @@ class BlueprintRunner(QThread):
                 if pname.startswith("out"):
                     ctx.log(f"[Node] {node.type}.{pname} 无下游，终止该分支。", "DEBUG")
                 continue
-            for nid, np in outs:
-                queue.append((node.id, pname))
-                # 这里注意：executor 主循环会再次用 _exec_out_edges 解析
-                # 所以我们在 queue 中存的是 (node.id, out_port_x)，循环会解析为下一跳
-                # 但当前我们的实现是：主循环出队 (curr_id, out_port)，然后找下游并执行
-                # 因此这里应当 append (node.id, pname)，保持一致即可
-                # 为避免重复查找，保持该语义：主循环会用 (curr_id, out_port) 查找下游 in_exec
-                # ——无需调整。
+            # ⚠ 每个端口只入队**一次**，不管该端口连了几条线——
+            #   主循环出队 (curr_id, out_port) 后会用 _exec_out_edges 把该端口**所有**下游
+            #   依序执行一遍。若按出边数入队（旧行为），fan-out 两条线 → 队列里两个相同
+            #   条目 → 下游整段被执行两遍（实测 a=2, b=2）。
+            queue.append((node.id, pname))

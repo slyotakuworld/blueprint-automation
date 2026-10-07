@@ -104,6 +104,37 @@ from src.config.user_settings import (
 )
 
 # ============================================================
+# 「孤儿 runner」池：停止请求发出后 3 秒内没停干净的 QThread（当前节点是长等待/
+# 找图/网络时，要等它跑完手上这个节点才真正退出）。
+# 必须脱离父对象 + 持有引用，否则关闭窗口/切换工程时会连带析构一个还在跑的
+# QThread —— Qt 直接 abort，表现就是「调试中停止/关窗偶发闪退」。
+# 线程真正跑完后由 finished→deleteLater 安全析构（编辑器还活着时）；
+# 若编辑器已在退出，残留至进程结束，无害。
+# ============================================================
+_ORPHAN_RUNNERS = []
+
+
+def _park_orphan_runner(runner):
+    try:
+        runner.setParent(None)
+    except Exception:
+        pass
+    try:
+        runner.finished.connect(runner.deleteLater)
+    except Exception:
+        pass
+    alive = []
+    for _r in _ORPHAN_RUNNERS:
+        try:
+            if _r.isRunning():
+                alive.append(_r)
+        except RuntimeError:
+            pass  # C++ 对象已被 deleteLater，无需再持引用
+    alive.append(runner)
+    _ORPHAN_RUNNERS[:] = alive
+
+
+# ============================================================
 # 通知节点：主窗口右上角非阻塞 Toast 浮层
 #   - 完全不阻塞蓝图执行（QTimer.singleShot 到时自动销毁）
 #   - 支持堆叠：多张 toast 自动从上向下铺
@@ -623,6 +654,7 @@ class BlueprintMainWindow(QMainWindow):
         self._scene.node_will_remove.connect(self._on_scene_node_will_remove)
         self._scene.edge_created.connect(self._on_scene_edge_created)
         self._scene.edge_will_remove.connect(self._on_scene_edge_will_remove)
+        self._scene.edge_priority_changed.connect(self._on_scene_edge_priority_changed)
         self._scene.nodes_dragged.connect(self._on_scene_nodes_dragged)
 
         self._view = NodeView(self._scene)
@@ -3937,6 +3969,11 @@ class BlueprintMainWindow(QMainWindow):
 
         # 2) 隐藏主窗口 → 截全屏
         self._log.append_log("[📍偏移拾取] 正在截取屏幕并匹配模板...", "INFO")
+        try:
+            from src.tools.crash_blackbox import log as _bb_log
+            _bb_log("[hide] 偏移拾取流程隐藏主窗口（若此后遮罩未恢复，窗口会凭空消失）")
+        except Exception:
+            pass
         self.hide()
         from PySide6.QtCore import QCoreApplication
         for _ in range(5):
@@ -4097,6 +4134,15 @@ class BlueprintMainWindow(QMainWindow):
         if hasattr(runner, "isRunning") and runner.isRunning():
             try:
                 runner.wait(3000)
+            except Exception:
+                pass
+            # 3 秒没停干净（当前节点可能是长等待 / 找图 / 网络，请求停止后要等它跑完手上
+            # 这个节点）→ **必须孤儿化**：脱离父对象 + 全局持引用，等线程真正跑完再析构。
+            # 否则关闭窗口时会连带析构一个还在跑的 QThread —— Qt 直接 abort，
+            # 表现就是「调试中停止/关窗偶发闪退」。
+            try:
+                if runner.isRunning():
+                    _park_orphan_runner(runner)
             except Exception:
                 pass
 
@@ -4730,6 +4776,7 @@ class BlueprintMainWindow(QMainWindow):
             from_port=snap.get("from_port"),
             to_node=snap.get("to_node"),
             to_port=snap.get("to_port"),
+            priority=int(snap.get("priority", 1) or 1),
         )
         if edge.from_node not in self._scene.graph.nodes or edge.to_node not in self._scene.graph.nodes:
             return None
@@ -4769,6 +4816,22 @@ class BlueprintMainWindow(QMainWindow):
         if snap is None:
             return
         self._push_undo({"kind": "add_edges", "edges": [snap]})
+
+    def _on_scene_edge_priority_changed(self, edge_id: str, old_w: int, new_w: int):
+        """右键连线改「优先级权重」：记日志 + 压撤销栈（Ctrl+Z 可还原旧权重）。"""
+        if self._applying_undo_redo:
+            return
+        self._push_undo({
+            "kind": "edge_priority",
+            "edge_id": edge_id,
+            "old_value": int(old_w),
+            "new_value": int(new_w),
+        })
+        self._log.append_log(
+            f"⛓ 连线优先级权重：{old_w} → {new_w}"
+            f"（同端口 fan-out 时权重大的先执行；权重相同按连线先后）",
+            "INFO",
+        )
 
     # ---- 删除操作的"合并"：Delete 键一次可能删多个节点/边，用 0ms Timer 合并成 1 条撤销项 ----
     def _on_scene_node_will_remove(self, node_id: str, node_snap: dict, related_edge_snaps: list):
@@ -4913,6 +4976,21 @@ class BlueprintMainWindow(QMainWindow):
                     f"[撤销] 恢复参数：节点 {nid} 的 {pname}",
                     "INFO",
                 )
+            elif kind == "edge_priority":
+                # 撤销"改连线权重"：恢复 old_value
+                eid = action.get("edge_id")
+                old_v = action.get("old_value")
+                edge = self._scene.graph.edges.get(eid) if self._scene and self._scene.graph else None
+                if edge is None:
+                    self._undo_stack.append(action)
+                    self._log.append_log(f"[撤销] 连线 {eid} 已不存在，无法还原它的权重", "WARN")
+                    return
+                edge.priority = int(old_v)
+                ei = self._scene._edge_items.get(eid)
+                if ei is not None:
+                    ei.update()
+                self._redo_stack.append(action)
+                self._log.append_log(f"[撤销] 连线权重恢复为 {old_v}（Ctrl+Y 重做）", "INFO")
             else:
                 # 不认识的操作：把 action 塞回栈
                 self._undo_stack.append(action)
@@ -4996,6 +5074,21 @@ class BlueprintMainWindow(QMainWindow):
                     f"[重做] 重新修改参数：节点 {nid} 的 {pname}",
                     "INFO",
                 )
+            elif kind == "edge_priority":
+                # 重做"改连线权重"：恢复 new_value
+                eid = action.get("edge_id")
+                new_v = action.get("new_value")
+                edge = self._scene.graph.edges.get(eid) if self._scene and self._scene.graph else None
+                if edge is None:
+                    self._redo_stack.append(action)
+                    self._log.append_log(f"[重做] 连线 {eid} 已不存在，无法重做它的权重", "WARN")
+                    return
+                edge.priority = int(new_v)
+                ei = self._scene._edge_items.get(eid)
+                if ei is not None:
+                    ei.update()
+                self._undo_stack.append(action)
+                self._log.append_log(f"[重做] 连线权重恢复为 {new_v}（Ctrl+Z 撤销）", "INFO")
             else:
                 self._redo_stack.append(action)
                 self._log.append_log(f"[重做] 暂不支持重做「{kind}」，后续版本会补齐。", "WARN")
@@ -5007,6 +5100,12 @@ class BlueprintMainWindow(QMainWindow):
     # ==================== 全局热键 ====================
     def closeEvent(self, event):
         """关闭窗口时：先检查蓝图是否有未保存修改 → 再释放 pynput 全局钩子，避免进程残留。"""
+        # 黑匣子：记录「窗口被关闭」——若用户没点 X 却出现这行，说明有代码在程序性关窗
+        try:
+            from src.tools.crash_blackbox import log as _bb_log
+            _bb_log("[closeEvent] 主窗口关闭流程触发（用户点X / Alt+F4 / 程序性 close 都会走到这里）")
+        except Exception:
+            pass
         # 1) 先检查并询问蓝图保存（用户明确要求：关程序前必须检测保存状态）
         try:
             if self._runner is not None and self._runner.isRunning():
@@ -5049,6 +5148,20 @@ class BlueprintMainWindow(QMainWindow):
             if "ui" in self._user_settings:
                 disk["ui"] = self._user_settings["ui"]
             save_user_settings(disk)
+        except Exception:
+            pass
+        # 3.5) 孤儿 runner 兜底：停止请求已发出但节点是长等待/找图/网络时，3 秒内停不干净。
+        #   再等最多 10 秒；仍没停干净就直接结束进程 —— 退出阶段绝不能让「还在跑的 QThread」
+        #   被窗口析构连带销毁（Qt 直接 abort = 关窗闪退）。用户走到这里已确认放弃运行，
+        #   运行日志每次 write 都已 flush，无数据可丢。
+        try:
+            deadline = time.time() + 10.0
+            while _ORPHAN_RUNNERS and time.time() < deadline:
+                if not any(r.isRunning() for r in list(_ORPHAN_RUNNERS)):
+                    break
+                time.sleep(0.1)
+            if any(r.isRunning() for r in list(_ORPHAN_RUNNERS)):
+                os._exit(0)
         except Exception:
             pass
         super().closeEvent(event)
@@ -5390,6 +5503,18 @@ def main() -> int:
     except Exception as e:
         print(f"[BOOT] ⚠️  ensure_user_config_file 异常：{type(e).__name__}: {e}")
 
+    # ============================================================
+    # 崩溃黑匣子（2026-10-07）：历次闪退在 Windows 事件日志里零记录，死因无法回溯。
+    # ① faulthandler 把原生崩溃的线程栈写进日志；② 记录退出轨迹，区分
+    #    「原生崩溃 / 窗口被关闭 / 进程被外部终止（杀软）」三种死法。
+    # ============================================================
+    try:
+        from src.tools.crash_blackbox import enable as _bb_enable, log as _bb_log, \
+            log_exception as _bb_exc
+        _bb_enable()
+    except Exception:
+        _bb_log = _bb_exc = None
+
     app = QApplication.instance() or QApplication(sys.argv)
     app.setStyle("Fusion")
     # ============================================================
@@ -5538,7 +5663,15 @@ def main() -> int:
         win.showMaximized()
     else:
         win.show()
-    return app.exec()
+    try:
+        rc = app.exec()
+        if _bb_log is not None:
+            _bb_log(f"[EXIT] 事件循环返回 rc={rc!r}（走正常 exec 退出路径）")
+        return rc
+    except BaseException as e:
+        if _bb_exc is not None:
+            _bb_exc("main()/app.exec() 抛出异常", e)
+        raise
 
 
 if __name__ == "__main__":

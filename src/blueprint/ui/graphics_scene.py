@@ -52,6 +52,7 @@ class NodeScene(QGraphicsScene):
     node_find_in_log = Signal(str)     # node_id，节点右键「在日志中查找」
     node_open_component = Signal(str)  # node_id，节点右键「打开引用的组件」
     asset_dropped = Signal(str, object)  # (蓝图绝对路径, 场景坐标 QPointF)，从资源面板拖入画布
+    edge_priority_changed = Signal(str, int, int)  # (edge_id, old_weight, new_weight)，右键连线改「优先级权重」
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -153,13 +154,17 @@ class NodeScene(QGraphicsScene):
         if self.graph is None or edge_id not in self.graph.edges:
             return None
         e = self.graph.edges[edge_id]
-        return {
+        snap = {
             "id": e.id,
             "from_node": e.from_node,
             "from_port": e.from_port,
             "to_node": e.to_node,
             "to_port": e.to_port,
         }
+        # 优先级权重一并入快照：连线删除→撤销恢复后权重不丢
+        if getattr(e, "priority", 1) != 1:
+            snap["priority"] = int(e.priority)
+        return snap
 
     # ---------------- 节点增删 ----------------
     def add_node_by_type(self, node_type: str, scene_pos: QPointF) -> Optional[Node]:

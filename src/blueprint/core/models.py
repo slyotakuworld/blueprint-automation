@@ -221,24 +221,36 @@ class Edge:
     from_port: str
     to_node: str
     to_port: str
+    # 「优先级权重」（默认 1）：同一个 out 端口连多条线（fan-out）时，权重大的先执行；
+    # 相同权重按连线存储序稳定排序。单线连一条时此值无意义。
+    priority: int = 1
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        d = {
             "id": self.id,
             "from_node": self.from_node,
             "from_port": self.from_port,
             "to_node": self.to_node,
             "to_port": self.to_port,
         }
+        # 只在非默认时写盘：旧文件/大多数连线不带该字段，文件 diff 最小化
+        if self.priority != 1:
+            d["priority"] = int(self.priority)
+        return d
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "Edge":
+        try:
+            prio = int(d.get("priority", 1))
+        except (TypeError, ValueError):
+            prio = 1
         return Edge(
             id=d.get("id") or d.get("from_node", "") + "/" + d.get("from_port", "") + "->" + d.get("to_node", "") + "/" + d.get("to_port", ""),
             from_node=d["from_node"],
             from_port=d["from_port"],
             to_node=d["to_node"],
             to_port=d["to_port"],
+            priority=prio,
         )
 
 
@@ -288,13 +300,17 @@ class BlueprintGraph:
         links: List[Dict[str, Any]] = []
         for eid, e in sorted(self.edges.items()):
             t = self._edge_exec_data_type(eid)
-            links.append({
+            link = {
                 "from_node": e.from_node,
                 "from_port": e.from_port,
                 "to_node": e.to_node,
                 "to_port": e.to_port,
                 "type": t,
-            })
+            }
+            # 优先级权重只在非默认时落盘（文件 diff 最小化；默认 1 的连线保持原样）
+            if getattr(e, "priority", 1) != 1:
+                link["priority"] = int(e.priority)
+            links.append(link)
         # ★ 注意：这里不再 self.updated_at = datetime.now()！改为只在 save 时 graph.touch() 刷新
         return {
             # bp_type 刻意放顶层：save 时 sort_keys=True 让它落在文件首行，
@@ -333,13 +349,17 @@ class BlueprintGraph:
                     str(link.get("to_port", "")),
                 )
                 eid = f"e_{abs(hash(key_tup)):010d}"
-                edges_d[eid] = {
+                ed = {
                     "id": eid,
                     "from_node": key_tup[0],
                     "from_port": key_tup[1],
                     "to_node": key_tup[2],
                     "to_port": key_tup[3],
                 }
+                # 优先级权重透传给 Edge.from_dict（缺省/非法值由它兜底为 1）
+                if "priority" in link:
+                    ed["priority"] = link.get("priority")
+                edges_d[eid] = ed
         else:
             edges_d = {}
 
