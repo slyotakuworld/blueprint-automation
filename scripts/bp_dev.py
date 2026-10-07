@@ -451,6 +451,43 @@ def cmd_build_editor(args: argparse.Namespace) -> int:
 # 子命令：build-runtime
 # ---------------------------------------------------------------------------
 
+def _deploy_ocr_runtime_to(app_dir: str) -> None:
+    """把项目根 ocr_runtime/（OCR 模型）带到发布目录（exe 同级）。
+
+    此前菜单 3/4 只部署 exe，发布目录里没有 ocr_runtime/ —— 发布版编辑器
+    （无项目根兜底）既没法在编辑器里测文字节点，导出含文字节点的蓝图时
+    exporter.carry_ocr_runtime 也找不到模型源（提示「OCR 未安装」）。
+    策略：目标缺 ocr_runtime/models（或 models 为空）才整目录复制（先
+    .copying 再原子替换）；已存在则跳过 —— 手动更新模型后删掉发布目录
+    里的 ocr_runtime/ 即可在下次打包时重新带上。
+    """
+    src_models = os.path.join(OCR_MODELS_DIR, "official_models")
+    if not os.path.isdir(src_models):
+        warn("项目根没有 ocr_runtime/models/（未准备过 OCR 模型），发布目录将不带模型。")
+        return
+    dst_root = os.path.join(app_dir, "ocr_runtime")
+    dst_models = os.path.join(dst_root, "models")
+    try:
+        if os.path.isdir(dst_models) and any(os.scandir(dst_models)):
+            log(f"  OCR 模型已在位，跳过复制：{dst_root}")
+            return
+    except OSError:
+        pass
+    try:
+        os.makedirs(app_dir, exist_ok=True)
+        tmp = dst_root + ".copying"
+        _rm_tree(tmp, "OCR 模型临时目录")
+        log(f"  复制 OCR 模型 → {dst_root}（整个 ocr_runtime/，首次几秒~十几秒）")
+        shutil.copytree(OCR_RUNTIME_DIR, tmp)
+        if os.path.isdir(dst_root):
+            shutil.rmtree(dst_root, ignore_errors=True)
+        os.replace(tmp, dst_root)
+        ok(f"OCR 模型已携带 → {dst_root}")
+    except OSError as exc:
+        warn(f"复制 OCR 模型到 {dst_root} 失败（目标可能正在运行/被占用）：{exc}")
+        warn("  可手动复制项目根 ocr_runtime/ 到发布目录补齐。")
+
+
 def cmd_build_runtime(args: argparse.Namespace) -> int:
     if not os.path.exists(ENTRY_RUNTIME):
         fail(f"找不到运行时入口：{ENTRY_RUNTIME}")
@@ -553,6 +590,11 @@ def cmd_build_runtime(args: argparse.Namespace) -> int:
             fail(f"复制到 {dst} 失败（目标可能正在运行/被占用）：{exc}")
             return 2
         ok(f"{dst}（{human_size(dst)}，{human_mtime(dst)}）")
+        # 发布目录顺带带上 OCR 模型（项目根本来就有，跳过）——
+        # 发布版编辑器没有项目根兜底，exe 同级没有 ocr_runtime/ 就用不了文字节点。
+        app_dir = os.path.dirname(os.path.abspath(dst))
+        if os.path.normcase(os.path.abspath(app_dir)) != os.path.normcase(os.path.abspath(ROOT)):
+            _deploy_ocr_runtime_to(app_dir)
 
     ok(f"运行时模板构建完成，耗时 {time.time() - t0:.1f}s")
     return 0
