@@ -28,6 +28,7 @@ class ExportResult:
     out_path: str = ""
     message: str = ""
     asset_count: int = 0
+    component_count: int = 0   # 随载荷打包的组件蓝图个数（2026-10-07 起支持）
     total_bytes: int = 0
     missing: List[str] = field(default_factory=list)
     ocr_carried: bool = False   # 是否已把 ocr_runtime/ 复制到导出 EXE 同级
@@ -417,6 +418,7 @@ def export_blueprint(
         ok=True,
         out_path=out_abs,
         asset_count=payload.asset_count,
+        component_count=int((payload.manifest or {}).get("component_count") or 0),
         total_bytes=total,
         missing=list(payload.missing),
         ocr_carried=ocr_carried,

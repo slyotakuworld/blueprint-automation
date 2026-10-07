@@ -178,6 +178,135 @@ def scan_assets(blueprint_dict: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], L
     return sc.assets, sc.missing
 
 
+# ============================================================
+# 组件蓝图打包（2026-10-07）
+# ============================================================
+# 组件 = 另一张 .bp.json（Component 节点的 blueprint_path 指向它）。
+# 2026-10-07 之前载荷只打主蓝图+图片，组件文件完全没进包 → 导出的 EXE 运行到
+# Component 节点找不到文件，按空操作跳过并打 WARN（用户实测踩中）。
+# 修法：把组件蓝图一并打进 zip 的 components/ 目录，主蓝图里的 blueprint_path
+# 换成 @@BPASSET:n@@ 记号（与图片共用同一 token 空间和 manifest 映射），
+# 还原后组件路径 = 解包目录下的绝对路径，executor 的 isabs 分支直接命中；
+# 组件文件内部引用的图片也用同一 scanner 记号化，由运行端解包后统一还原。
+_COMPONENT_ARC_DIR = "components"
+BlueprintFileSuffix = ".bp.json"
+
+
+def _component_type(s: Any) -> bool:
+    return isinstance(s, str) and s.lower() == "component"
+
+
+def _node_params_of(node: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """节点 dict 的参数容器：根图节点用 params，子画布 canonical 格式用 data。"""
+    p = node.get("params")
+    if isinstance(p, dict):
+        return p
+    d = node.get("data")
+    if isinstance(d, dict):
+        return d
+    return None
+
+
+def _rewrite_component_refs(obj: Any, resolve_fn, token_fn, depth: int = 0) -> Any:
+    """递归查找 component 节点，把 blueprint_path 替换成 token_fn(绝对路径, 原串)。
+
+    不修改原结构（边遍历边新建）。覆盖根图节点与循环体/顺序体/并行体等嵌套子画布。
+    token_fn 返回空串表示「打包不了」，保留原路径（运行端按既有 WARN 口径跳过）。
+    """
+    if depth > 32:
+        return obj
+    if isinstance(obj, dict):
+        if _component_type(obj.get("type")):
+            params = _node_params_of(obj)
+            if params is not None:
+                raw = str(params.get("blueprint_path", "") or "").strip()
+                if raw:
+                    abs_p = resolve_fn(raw)
+                    if abs_p:
+                        tok = token_fn(abs_p, raw)
+                        if tok:
+                            new_params = dict(params)
+                            new_params["blueprint_path"] = tok
+                            new_obj = dict(obj)
+                            if isinstance(obj.get("params"), dict):
+                                new_obj["params"] = new_params
+                            if isinstance(obj.get("data"), dict):
+                                new_obj["data"] = new_params
+                            obj = new_obj
+        return {k: _rewrite_component_refs(v, resolve_fn, token_fn, depth + 1)
+                for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_rewrite_component_refs(v, resolve_fn, token_fn, depth + 1) for v in obj]
+    return obj
+
+
+def _bundle_components(
+    main_dict: Dict[str, Any],
+    sc: "_Scanner",
+    source_project: Optional[str],
+) -> Tuple[Dict[str, Any], List[Dict[str, str]], List[str]]:
+    """收集并打包主蓝图引用的全部组件蓝图（递归、去重）。
+
+    返回 (改写后的主蓝图 dict, 组件条目列表 [{token,arc,text}], 失败列表)。
+    组件条目的 token 同时注册进 sc.assets（arc=components/xxxx_名字.bp.json），
+    因此运行端的记号还原映射对组件路径同样生效；组件自身引用的组件递归打包，
+    组件内引用的图片进同一资源池（同一张图在主/组件里只打一份）。
+    """
+    comp_items: List[Dict[str, str]] = []
+    comp_keys: Dict[str, str] = {}     # normcase(abs) -> token
+    failures: List[str] = []
+    base_dir = source_project or ""
+
+    def _resolve(raw: str) -> Optional[str]:
+        cand = raw if os.path.isabs(raw) else os.path.join(base_dir, raw)
+        return cand if _isfile(cand) else None
+
+    def _token_for(abs_p: str, raw: str) -> str:
+        key = os.path.normcase(os.path.abspath(abs_p))
+        hit = comp_keys.get(key)
+        if hit is not None:
+            return hit
+        try:
+            with open(abs_p, "r", encoding="utf-8") as f:
+                comp_dict = json.load(f)
+        except Exception:
+            if raw not in failures:
+                failures.append(raw)
+            return ""
+        if not isinstance(comp_dict, dict):
+            if raw not in failures:
+                failures.append(raw)
+            return ""
+        # 注册 token + arc（进 sc.assets：与图片共用 manifest 映射）
+        idx = len(sc.assets)
+        token = f"{TOKEN_PREFIX}{idx}@@"
+        base = os.path.basename(abs_p)
+        if base.lower().endswith(BlueprintFileSuffix):
+            base = base[: -len(BlueprintFileSuffix)]
+        arc = f"{_COMPONENT_ARC_DIR}/{idx:04d}_{_sanitize_name(base)}.bp.json"
+        try:
+            size = os.path.getsize(abs_p)
+        except Exception:
+            size = 0
+        sc.assets.append({
+            "token": token, "orig": os.path.abspath(abs_p), "arc": arc,
+            "size": size, "kind": "component",
+        })
+        comp_keys[key] = token
+        # 先递归处理组件自身引用的组件，再对组件 dict 做图片记号化（同一 scanner）
+        new_dict = _rewrite_component_refs(comp_dict, _resolve, _token_for)
+        tokenized = sc.walk(new_dict)
+        try:
+            text = json.dumps(tokenized, ensure_ascii=False, indent=2)
+        except Exception:
+            text = json.dumps(comp_dict, ensure_ascii=False, indent=2)
+        comp_items.append({"token": token, "arc": arc, "text": text})
+        return token
+
+    new_main = _rewrite_component_refs(main_dict, _resolve, _token_for)
+    return new_main, comp_items, failures
+
+
 def build_payload(
     blueprint_dict: Dict[str, Any],
     blueprint_name: str,
@@ -187,9 +316,13 @@ def build_payload(
     """把蓝图字典 + 图片资源打成载荷 zip。
 
     blueprint_dict 不会被修改（内部边遍历边新建结构）。
+    source_project：工程根（用于解析组件 blueprint_path 的相对路径）。
     """
     sc = _Scanner()
-    tokenized = sc.walk(blueprint_dict)
+    main_dict, comp_items, comp_failures = _bundle_components(
+        blueprint_dict, sc, source_project
+    )
+    tokenized = sc.walk(main_dict)
     blueprint_json = json.dumps(tokenized, ensure_ascii=False, indent=2)
 
     manifest: Dict[str, Any] = {
@@ -200,6 +333,8 @@ def build_payload(
         "source_project": str(source_project or ""),
         "exported_at": datetime.now().isoformat(timespec="seconds"),
         "asset_count": len(sc.assets),
+        "component_count": len(comp_items),
+        "component_files": [c["arc"] for c in comp_items],
         "settings": dict(settings or {}),
         "assets": {
             a["token"]: {"arc": a["arc"], "orig": a["orig"], "size": a["size"]}
@@ -207,18 +342,27 @@ def build_payload(
         },
     }
 
+    comp_arcs = {c["arc"] for c in comp_items}
+    comp_text_by_arc = {c["arc"]: c["text"] for c in comp_items}
     buf = io.BytesIO()
     skipped: List[str] = []
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
         z.writestr(MANIFEST_NAME, json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8"))
         z.writestr(BLUEPRINT_NAME, blueprint_json.encode("utf-8"))
         for a in sc.assets:
+            if a["arc"] in comp_arcs:
+                # 组件文件必须写【改写后的文本】（blueprint_path/图片已记号化），
+                # 直接拷磁盘原件会让运行端拿到未还原的绝对路径
+                z.writestr(a["arc"], comp_text_by_arc[a["arc"]].encode("utf-8"))
+                continue
             try:
                 z.write(a["orig"], a["arc"])
             except Exception:
                 # 单个图片读不了不应该让整包失败，记下来提示用户
                 skipped.append(a["orig"])
-    missing = list(sc.missing) + [p for p in skipped if p not in sc.missing]
+    missing = list(sc.missing) + [p for p in skipped if p not in sc.missing] + [
+        p for p in comp_failures if p not in sc.missing
+    ]
     return PayloadBuildResult(
         zip_bytes=buf.getvalue(), manifest=manifest, assets=sc.assets, missing=missing
     )

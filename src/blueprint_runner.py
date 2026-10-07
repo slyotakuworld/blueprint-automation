@@ -188,6 +188,21 @@ def _prepare(payload: bytes):
 
     manifest = extract_to(payload, work_dir)
 
+    # 组件蓝图文件（2026-10-07）：解包后把内部的 @@BPASSET:n@@ 记号还原成
+    # 解包目录下的真实路径（图片/嵌套组件），写回磁盘。之后 executor 按绝对路径
+    # 直接 BlueprintStore.load，无需感知记号机制。已还原过的文件再跑一遍是幂等的。
+    for arc in (manifest.get("component_files") or []):
+        try:
+            cp = os.path.join(work_dir, *str(arc).replace("\\", "/").split("/"))
+            if not cp.startswith(os.path.abspath(work_dir) + os.sep) or not os.path.isfile(cp):
+                continue
+            with open(cp, "r", encoding="utf-8") as f:
+                cdata = restore_blueprint_dict(f.read(), work_dir, manifest)
+            with open(cp, "w", encoding="utf-8") as f:
+                json.dump(cdata, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
     # 伪工程根：app_paths 不认识"工程"，这里用一个固定目录冒充，保证四个子目录可用
     def _provider(key: str):
         if key == "root":

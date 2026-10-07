@@ -287,11 +287,13 @@ class ExportDialog(QDialog):
             return
 
         self._result_path = res.out_path
+        comp_n = int(getattr(res, "component_count", 0) or 0)
         msg = (
             f"导出成功！\n\n"
             f"文件：{res.out_path}\n"
             f"大小：{_fmt_size(res.total_bytes)}\n"
-            f"打包图片：{res.asset_count} 个"
+            f"打包图片：{res.asset_count} 个\n"
+            f"打包组件蓝图：{comp_n} 个"
         )
         if self._uses_ocr:
             if res.ocr_carried:
