@@ -1495,6 +1495,21 @@ class BlueprintMainWindow(QMainWindow):
                 self._assets.set_current_path(self._current_path)
         except Exception:
             pass
+        # 6) 安全提示（2026-10-07）：打开含「执行命令」节点的蓝图就 WARN 一次。
+        #    蓝图是可导入/可分发的 JSON，别人的蓝图可能夹带危险命令——
+        #    打开时先提醒审查（真正的拦截在 ▶ 运行前的 DANGEROUS_CMD 弹窗）。
+        try:
+            from src.blueprint.runtime.validator import scan_command_nodes as _scan_cmd
+            _cmds = _scan_cmd(graph)
+            if _cmds and getattr(self, "_log", None) is not None:
+                self._log.append_log(
+                    f"⚠️ 安全提示：本蓝图包含 {len(_cmds)} 个「执行命令」节点，"
+                    f"运行时会以你的 Windows 权限原样执行其中的命令。"
+                    f"若蓝图来自他人，请先逐个审查命令内容。",
+                    "WARN",
+                )
+        except Exception:
+            pass
 
     # ==================== 编辑器视图记忆（下次启动接着看） ====================
     @staticmethod
@@ -4188,6 +4203,22 @@ class BlueprintMainWindow(QMainWindow):
                     return
             else:
                 self._log.append_log("静态校验提示：\n" + msg, "WARN")
+        # 1.2 高危命令二次确认（2026-10-07 免责/防误跑）：静态校验命中 DANGEROUS_CMD
+        #     特征（格式化/递归删除/关机/改注册表等）时，光靠日志不够——弹窗拦一道，
+        #     确认「命令是我有意写入的」才放行。不直接禁止：删文件/关机也可能是
+        #     挂机脚本的合法收尾，拦截权留给用户临场判断。
+        danger = [i for i in issues if i.code == "DANGEROUS_CMD"]
+        if danger:
+            dmsg = "\n".join("• " + i.message for i in danger)
+            ret = QMessageBox.question(
+                self, "发现高危命令",
+                f"以下命令包含高危特征，运行将以你的 Windows 权限<b>原样执行</b>：\n\n{dmsg}\n\n"
+                f"若蓝图来自他人，请先审查命令内容。仍要运行吗？",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if ret != QMessageBox.Yes:
+                self._log.append_log("已取消运行（高危命令未确认）。", "WARN")
+                return
         # 1.5 组件蓝图独立运行：没有调用方 → 没有人写 __arg_i → Start 的 param 端口会全空。
         #     先讲清楚，并允许临时填测试值（只注入本次运行，绝不写进蓝图文件）。
         preset_vars = self._collect_component_run_args()
@@ -5517,6 +5548,17 @@ def main() -> int:
 
     app = QApplication.instance() or QApplication(sys.argv)
     app.setStyle("Fusion")
+    # ============================================================
+    # 首次启动免责声明（2026-10-07）：本工具能执行系统命令/操控键鼠/发起网络请求，
+    # 全部以当前用户权限运行，蓝图又可导入可分发——先亮声明、同意后才进主界面。
+    # 只在首次（或声明升版后）弹出，记录在 config.json 的 disclaimer 键。
+    # ============================================================
+    try:
+        from src.tools.disclaimer import show_if_needed as _show_disclaimer
+        if not _show_disclaimer():
+            return 0
+    except Exception as e:
+        print(f"[BOOT] ⚠️ 免责声明模块异常（放行启动）：{type(e).__name__}: {e}")
     # ============================================================
     # Windows 图标设置（双保险：AppUserModelID + 全局 WindowIcon）
     #   AppUserModelID：解决 Windows 任务栏显示 Python 解释器图标的经典坑——

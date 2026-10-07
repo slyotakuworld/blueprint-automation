@@ -155,7 +155,101 @@ def validate_graph(graph: BlueprintGraph, project_root: Optional[str] = None) ->
     #     现在三个容器（Loop / Sequence / Parallel）都**不要求接「结束」节点**，
     #     判定口径是「只有节点执行异常 / 死循环才失败」，对缺 End 的蓝图报警属于误报。
     #     （2026-10-06 用户定案）
+
+    # 11. 「执行命令」节点安全审查（2026-10-07 免责/防误跑）
+    #
+    # 蓝图是可导入、可分发的 JSON，而 Command 节点会以**当前用户权限**原样执行
+    # 命令文本——「别人发来的蓝图夹带破坏性命令」是真实风险面。这类「静默做危险
+    # 事」必须在跑之前亮出来：① 有 Command 节点 → WARN 清点；② 命中高危特征
+    # → 额外发 DANGEROUS_CMD，编辑器运行前会**弹窗二次确认**（不直接禁止，
+    # 因为删文件/关机等也可能是合法的自动化需求，拦不拦由用户临场判断）。
+    cmd_nodes = scan_command_nodes(graph)
+    if cmd_nodes:
+        issues.append(ValidationIssue(
+            "WARN", "CMD_NODES",
+            f"本蓝图包含 {len(cmd_nodes)} 个「执行命令」节点：运行时会以当前用户权限"
+            f"原样执行其中的命令（命令支持 {{变量}} 插值，实际内容可能随变量变化）。"
+            f"若蓝图来自他人，请先逐个审查命令内容。",
+        ))
+        for nid, cmd in cmd_nodes:
+            low = cmd.lower()
+            hits = [p for p in DANGEROUS_CMD_PATTERNS if p in low]
+            if hits:
+                preview = cmd[:80] + ("…" if len(cmd) > 80 else "")
+                issues.append(ValidationIssue(
+                    "WARN", "DANGEROUS_CMD",
+                    f"高危命令特征（{'、'.join(hits[:3])}）：节点 {nid} 的命令为：{preview}。"
+                    f"请确认这是你有意写入的命令。",
+                    str(nid),
+                ))
+
     return issues
+
+
+# ============================================================
+# 「执行命令」节点安全审查（2026-10-07）
+# ============================================================
+
+# 高危命令特征：小写子串匹配。宁可多报（多一道人工确认）不可漏报；
+# 不直接禁止——删除/关机也可能是挂机脚本的合法收尾，拦截权留给用户临场判断。
+DANGEROUS_CMD_PATTERNS = (
+    "format ", "format/q",                 # 格式化磁盘
+    "del /s", "del /f", "erase /s",        # 递归/强制删除
+    "rd /s", "rmdir /s",                   # 递归删目录
+    "diskpart", "cipher /w", "vssadmin",   # 磁盘操作 / 抹除空闲空间 / 删卷影副本
+    "bcdedit",                             # 改启动配置
+    "reg delete", "reg add hkey",          # 改注册表
+    "remove-item -recurse", "rm -rf",      # PowerShell / 跨平台递归删除
+    "dd if=",                              # 跨平台裸写磁盘
+    "shutdown",                            # 关机/重启
+    "taskkill /f",                         # 强杀进程
+    "powershell -enc", "invoke-expression",# 混淆/动态执行代码
+)
+
+# 容器节点的子画布 body 参数键（与编辑器 _CONTAINER_BODY_KEYS / 执行器读取处一致）
+_CONTAINER_BODY_PARAM_KEYS = ("loop_body", "seq_body", "par_body")
+
+
+def scan_command_nodes(graph) -> list:
+    """递归收集一张图里的全部「执行命令」节点 → [(节点id, 命令文本)]。
+
+    递归范围：容器节点（Loop/Sequence/Parallel）params 里的子画布 body
+    （loop_body / seq_body / par_body），以及 body 里再嵌套的容器。
+    body 是编辑器 `_sub_canonical` / 加载落盘的 canonical dict：
+    nodes 为 {id: {"type": 短名, "data": {参数...}, ...}}（Node.to_dict 格式）。
+
+    供两处使用：validate_graph 的运行前校验、编辑器打开蓝图时的提示。
+    """
+    from ..core.node_library import NODE_LIBRARY
+
+    cmd_short = ""
+    meta = NODE_LIBRARY.get("Command")
+    if meta is not None:
+        cmd_short = getattr(meta, "type_short_name", "") or ""
+
+    out = []
+
+    def _grab(nid, ntype, params):
+        # 根图的 Node.type 是驼峰全名；body 里的 "type" 是短名（cmd）——两个都认
+        if ntype == "Command" or (cmd_short and ntype == cmd_short):
+            out.append((str(nid), str(params.get("command", "") or "")))
+        for key in _CONTAINER_BODY_PARAM_KEYS:
+            body = params.get(key)
+            if isinstance(body, dict) and isinstance(body.get("nodes"), dict) and body["nodes"]:
+                for cid, cd in body["nodes"].items():
+                    if not isinstance(cd, dict):
+                        continue
+                    cdata = cd.get("data")
+                    _grab(cid, str(cd.get("type", "") or ""),
+                          cdata if isinstance(cdata, dict) else {})
+
+    try:
+        nodes_iter = list(graph.nodes.values())
+    except Exception:
+        return out
+    for n in nodes_iter:
+        _grab(n.id, n.type, n.params)
+    return out
 
 
 def _check_component_ports(n: Node, project_root: str, issues: List[ValidationIssue]):

@@ -77,6 +77,11 @@
           "file": "node_OpenApp.md"
         },
         {
+          "id": "node_activatewindow",
+          "title": "激活窗口",
+          "file": "node_ActivateWindow.md"
+        },
+        {
           "id": "node_webbrowser",
           "title": "打开网页",
           "file": "node_WebBrowser.md"

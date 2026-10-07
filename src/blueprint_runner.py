@@ -678,6 +678,31 @@ def main() -> int:
         )
         return 3
 
+    # 安全提示（2026-10-07 免责）：导出的 EXE 会被分发给他人运行，含「执行命令」
+    # 节点的蓝图会以**运行者本人的 Windows 权限**原样执行命令。启动时检测到就
+    # 明确告知一次——⚠ 接收者手里没有编辑器，没法「去编辑器里审查」，所以把
+    # 将要执行的命令原文直接列进弹窗详细信息里，让他当场看、当场决定跑不跑。
+    try:
+        from src.blueprint.runtime.validator import scan_command_nodes
+        _probe_graph = loader()
+        _cmds = scan_command_nodes(_probe_graph)
+        if _cmds:
+            _detail = "\n".join(
+                f"[{i + 1}] 节点 {nid}：\n{cmd}\n"
+                for i, (nid, cmd) in enumerate(_cmds)
+            )
+            _box = QMessageBox(QMessageBox.Warning, "安全提示", "")
+            _box.setText(
+                f"该蓝图包含 {len(_cmds)} 个「执行命令」节点，运行时将以你的 Windows "
+                f"用户权限原样执行其中的命令（命令支持变量插值，实际内容可能随变量变化）。\n\n"
+                f"请确认本程序来自你信任的人。点开下方「显示详细信息(Show Details)」"
+                f"可查看将要执行的命令原文；来源不明或内容可疑的，请勿运行。"
+            )
+            _box.setDetailedText(_detail)
+            _box.exec()
+    except Exception:
+        pass
+
     win = RuntimeWindow(loader, manifest, work_dir, name)
     win.show()
     win.maybe_autostart()

@@ -43,9 +43,10 @@ CATEGORIES_ORDER = [
 CATEGORY_NODE_ORDER: Dict[str, List[str]] = {
     CATEGORY_APP: [
         "OpenApp",       # 1、打开程序
-        "WebBrowser",    # 2、打开网页（浏览器打开URL）
-        "Command",       # 3、系统命令
-        "HttpRequest",   # 4、HTTP请求（接口调用：GET/POST/PUT/DELETE/Header/Body/超时）
+        "ActivateWindow",# 2、激活窗口（把已打开的程序提到前台）
+        "WebBrowser",    # 3、打开网页（浏览器打开URL）
+        "Command",       # 4、系统命令
+        "HttpRequest",   # 5、HTTP请求（接口调用：GET/POST/PUT/DELETE/Header/Body/超时）
     ],
     CATEGORY_LOGIC: [
         "Start",         # 1、开始
@@ -541,6 +542,28 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
                      help="程序启动后先等这么多秒再继续跑下一节点（给程序留加载时间）。"),
         ],
         type_short_name="open_app",
+    ),
+    "ActivateWindow": NodeMeta(
+        type="ActivateWindow",
+        category=CATEGORY_APP,
+        title="激活窗口",
+        description="把已经打开的程序窗口提到前台~最小化的会先还原。后续键盘/鼠标等前台操作就会落进这个窗口（比如激活记事本后直接打字）。找不到窗口走「失败」。",
+        color="#8957E5",
+        accent="#A371F7",
+        inputs=[_exec_in()],
+        outputs=[
+            _exec_out("success", label="成功"),
+            _exec_out("fail", label="失败"),
+        ],
+        params=[
+            ParamDef(name="target_title", editor=EDITOR_STRING, default="", label="窗口标题",
+                     help="窗口标题子串匹配，不用完全一样；支持 {变量} 插值。例：无标题 - 记事本"),
+            ParamDef(name="target_exe", editor=EDITOR_STRING, default="", label="程序名",
+                     help="进程 exe 名（子串匹配），例：notepad.exe；支持 {变量} 插值。"),
+            ParamDef(name="target_class", editor=EDITOR_STRING, default="", label="窗口类名",
+                     help="窗口类名（精确匹配，不常用）；用「工具 → 窗口信息拾取器」获取。支持 {变量} 插值。"),
+        ],
+        type_short_name="act_win",
     ),
     # ---------------- 动作 / 识别 ----------------
     "FindImage": NodeMeta(

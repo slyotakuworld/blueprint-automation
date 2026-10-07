@@ -772,6 +772,73 @@ def execute_OpenApp(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
         return {}, ["fail"], str(e)
 
 
+def execute_ActivateWindow(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
+    """【激活窗口】把已经打开的程序窗口提到前台（最小化会先还原）。
+
+    与「启动程序」互补：程序已在跑、只想把它切到最前（比如激活记事本后让
+    键盘节点直接打字）。三个定位条件（标题/程序名/类名）填了就得全对上。
+    注意：本节点只负责「前台」；找图/截图等视觉节点的「目标窗口」仍由
+    各节点自己的目标参数决定（本版本已无全局绑定机制）。
+    """
+    title_raw = str(node.params.get("target_title", "") or "")
+    exe_raw = str(node.params.get("target_exe", "") or "")
+    class_raw = str(node.params.get("target_class", "") or "")
+
+    # ---------- 变量插值（如 title="{game_title}"）----------
+    try:
+        from src.blueprint.core.variable_engine import VariableEngine
+
+        engine = getattr(ctx, "var_engine", None) or VariableEngine(ctx.variables)
+        if engine.has_any_marker(title_raw):
+            title_raw = str(engine.interpolate(title_raw))
+        if engine.has_any_marker(exe_raw):
+            exe_raw = str(engine.interpolate(exe_raw))
+        if engine.has_any_marker(class_raw):
+            class_raw = str(engine.interpolate(class_raw))
+    except Exception:
+        pass
+
+    title = title_raw.strip()
+    exe_name = exe_raw.strip()
+    class_name = class_raw.strip()
+    if not (title or exe_name or class_name):
+        msg = "[ActivateWindow] 定位条件全为空（窗口标题/程序名/类名至少填一个）。"
+        ctx.log(msg, "WARN")
+        annotate_step(ctx, node, "act_win", note="FAIL 条件全空")
+        return {}, ["fail"], msg
+
+    hwnd = _find_window_3d(title=title, exe_name=exe_name, class_name=class_name)
+    if hwnd is None:
+        msg = (
+            f"[ActivateWindow] 未找到匹配窗口。"
+            f"title='{title}'  exe='{exe_name}'  class='{class_name}'"
+        )
+        ctx.log(msg, "WARN")
+        annotate_step(ctx, node, "act_win", note="FAIL 未找到窗口")
+        return {}, ["fail"], msg
+
+    # bring_window_to_front 内部已处理：最小化先 SW_RESTORE、SetForegroundWindow
+    # 失败回退 Alt 键 trick、前置后等 0.15s 让切换生效
+    from src.tools.window_utils import bring_window_to_front
+
+    if not bring_window_to_front(hwnd, log_fn=ctx.log):
+        msg = f"[ActivateWindow] 窗口已找到（HWND={hwnd}）但置前台失败（可能被系统前台锁限制）。"
+        ctx.log(msg, "WARN")
+        annotate_step(ctx, node, "act_win", note="FAIL 置前台失败")
+        return {}, ["fail"], msg
+
+    try:
+        import win32gui as _wg
+
+        wtitle = _wg.GetWindowText(hwnd) or ""
+    except Exception:
+        wtitle = ""
+    note = f"HWND={hwnd} title='{wtitle[:32]}'"
+    ctx.log(f"[ActivateWindow] ✅ 已置前台 {note}  后续键盘/鼠标前台操作会落进该窗口。", "SUCCESS")
+    annotate_step(ctx, node, "act_win", note=note)
+    return {}, ["success"], ""
+
+
 def _enum_windows_win32():
     """兜底：如果 pywin32 装了，用 EnumWindows 返回 [(hwnd, title, classname, pid)]。"""
     results = []
@@ -2386,6 +2453,17 @@ def execute_Command(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
             except Exception:
                 # shlex 解析失败时 fallback 到空白字符拆分
                 args = command.split()
+            if os.name == "nt":
+                # Windows 的 shlex posix=False 会把外层引号留在 token 里
+                # （例："C:\Program Files\x.exe" → '"C:\Program Files\x.exe"'）。
+                # subprocess 拼 Windows 命令行时会把这些内嵌引号转义成 \"，
+                # 程序收到的参数就带上了字面引号（路径含空格 + 手动加引号时必炸）。
+                # 这里剥掉每个 token 首尾的一对匹配引号：subprocess 拼接时会按需
+                # 重新加引号，最终命令行语义才正确。
+                args = [
+                    a[1:-1] if len(a) >= 2 and a[0] == '"' and a[-1] == '"' else a
+                    for a in args
+                ]
         elif shell_mode == "powershell":
             use_shell = False
             # 包装成 powershell -Command
@@ -2653,7 +2731,8 @@ def execute_HttpRequest(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any
     headers_template = str(p.get("headers_json", "") or "")
     body_template = str(p.get("body_text", "") or "")
     content_type_override = str(p.get("content_type", "") or "").strip()
-    timeout_ms = max(500, int(p.get("timeout_ms", 10000) or 10000))
+    # 超时下限 500ms；走 param_num——不能用 `x or 10000`，用户填 0 会被静默吃成 10000
+    timeout_ms = param_num(p.get("timeout_ms"), 10000, int, lo=500)
     save_to_vars = bool(p.get("save_json_to_vars", True))
 
     try:
@@ -4121,6 +4200,7 @@ EXECUTORS = {
     "VarSwitch": execute_VarSwitch,
     "Notify": execute_Notify,
     "OpenApp": execute_OpenApp,
+    "ActivateWindow": execute_ActivateWindow,
     "FindImage": execute_FindImage,
     "Mouse": execute_Mouse,
     "PressKey": execute_PressKey,

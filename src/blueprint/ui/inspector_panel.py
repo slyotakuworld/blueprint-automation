@@ -917,6 +917,19 @@ class InspectorPanel(QWidget):
                 self._add_action_btn(btn_list)
             self._action_host.show()
             return
+        if node.type == "ActivateWindow":
+            btn_pick = QPushButton("🎯 拾取目标窗口")
+            btn_pick.setStyleSheet(self._btn_style("#8957E5", "#BC8CFF"))
+            btn_pick.setToolTip("点击后用鼠标点击窗口，自动回填目标窗口标题/程序名/类名")
+            btn_pick.clicked.connect(lambda _=False: self._pick_window_for_actwin_temp())
+            self._add_action_btn(btn_pick)
+            btn_list = QPushButton("📋 从列表选择")
+            btn_list.setStyleSheet(self._btn_style("#238636", "#2EA043"))
+            btn_list.setToolTip("列出当前所有窗口（含最小化）供选择作为激活目标")
+            btn_list.clicked.connect(lambda _=False: self._list_windows_for_actwin_temp())
+            self._add_action_btn(btn_list)
+            self._action_host.show()
+            return
         self._action_host.hide()
 
     # ---- Mouse 目标窗口拾取 ----
@@ -2576,8 +2589,22 @@ class InspectorPanel(QWidget):
             return
         self._list_windows_generic_temp("文字")
 
-    def _pick_window_generic_temp(self, node_title: str):
-        """通用：智能拾取窗口 → 回填当前节点的 target_title/exe/class。"""
+    def _pick_window_for_actwin_temp(self):
+        if self._current_node is None or self._current_node.type != "ActivateWindow":
+            return
+        self._pick_window_generic_temp(
+            "激活窗口", "将把该窗口提到前台，后续键盘/鼠标前台操作会落进这个窗口。")
+
+    def _list_windows_for_actwin_temp(self):
+        if self._current_node is None or self._current_node.type != "ActivateWindow":
+            return
+        self._list_windows_generic_temp("激活窗口")
+
+    def _pick_window_generic_temp(self, node_title: str, success_tip: str = ""):
+        """通用：智能拾取窗口 → 回填当前节点的 target_title/exe/class。
+
+        success_tip：成功弹窗的自定义说明（留空用默认的「以该窗口为基准」文案）。
+        """
         app_window = self.window()
         from .window_picker_overlay import WindowPickerOverlay
 
@@ -2592,7 +2619,8 @@ class InspectorPanel(QWidget):
             from PySide6.QtCore import QTimer
             def _show():
                 QMessageBox.information(self, "目标窗口拾取成功",
-                    f"已设置目标窗口：\n标题：{res.get('title','')}\n程序：{res.get('exe_name','')}\n\n{node_title}将以该窗口为基准。")
+                    f"已设置目标窗口：\n标题：{res.get('title','')}\n程序：{res.get('exe_name','')}\n\n"
+                    + (success_tip or f"{node_title}将以该窗口为基准。"))
             QTimer.singleShot(250, _show)
         try:
             overlay = WindowPickerOverlay.prepare_and_run(app_window, delay_ms=300)
