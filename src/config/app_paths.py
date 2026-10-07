@@ -120,32 +120,12 @@ def ocr_runtime_view_dir() -> str:
     except Exception:
         return real
     return link if os.path.isdir(link) else real
-# CACHE_DIR / TEMPLATE_CACHE_FILE / TEMPLATE_META_FILE：
-#   有工程时用工程目录的 cache/（通过 cache_dir()）
-#   未开工程时回退到全局 APP_DIR/cache/
 DEFAULT_IMAGES_DIRNAME = "1080p"
 
 
-def cache_dir() -> str:
-    """
-    有工程时：<project>/cache/
-    未开工程：直接抛 RuntimeError（禁止写入全局 APP_DIR/cache/，避免串工程和污染 src/ 代码目录）
-    """
-    p = _project_sub("cache")
-    if p:
-        return p
-    raise RuntimeError(
-        "[cache_dir] 尚未打开任何 BlueprintAutomation 工程，无法获取缓存目录。"
-        "请先新建或打开一个工程后再执行此操作。"
-    )
-
-
-def template_cache_file() -> str:
-    return os.path.join(cache_dir(), "template_cache.pkl")
-
-
-def template_meta_file() -> str:
-    return os.path.join(cache_dir(), "template_meta.json")
+# （2026-10-07 清理）曾经的 cache_dir() / template_cache_file() / template_meta_file() 已删除：
+# 定义以来没有任何调用方（找图缓存在 template_matcher 的内存字典里，不落盘），
+# 工程的 cache/ 目录因此始终为空——建工程模板也不再创建它。
 
 
 CURRENT_VERSION = "4.1"

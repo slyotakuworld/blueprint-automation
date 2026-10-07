@@ -22,7 +22,8 @@ def bump_step(ctx) -> int:
 
 
 def _safe_dirs(run_id: str) -> str:
-    out_dir = os.path.join(debug_dir(), "runs", run_id)
+    # 2026-10-07 拍平：debug 下只有运行档这一类内容，直接 debug/{run_id}/，去掉 runs 中间层
+    out_dir = os.path.join(debug_dir(), run_id)
     os.makedirs(out_dir, exist_ok=True)
     return out_dir
 

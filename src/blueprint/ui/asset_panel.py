@@ -41,6 +41,13 @@ _PRUNE_DIRS = {
     ".git", ".bp", ".idea", ".vscode", ".workbuddy",
     "backup", "backups", "dist", "build", "node_modules",
 }
+
+# 文件监听（QFileSystemWatcher）专用剪枝：在 _PRUNE_DIRS 之上追加。
+# debug/ 是运行期产物目录（每次运行新建 run_* 子目录、停止/清理时整目录删除）——
+# 监听它毫无收益，反而：①每次运行都触发重注册；②被删目录的句柄失效后 Windows 端
+# FindNextChangeNotification 会持续刷「拒绝访问」警告（2026-10-07 实测）。
+# 只剪「监听」，不剪资源树扫描（树里仍显示 debug/，供右键清理运行日志）。
+_WATCH_PRUNE_DIRS = _PRUNE_DIRS | {"debug", "cache"}
 # 在资源树中永远隐藏的文件（工程元数据，不是用户资源）
 _HIDE_FILES = {"project_meta.json"}
 # 展示的扩展名（其余文件不进资源树）
@@ -171,6 +178,8 @@ class AssetPanel(QWidget):
     request_delete = Signal(list)     # 删除选中的文件/目录（list[绝对路径]）
     request_set_bp_type = Signal(str, str)  # 改蓝图类型（绝对路径, "blueprint"|"component"）
     request_cleanup_assets = Signal()  # 清理未被任何蓝图引用的资源
+    request_clean_run_logs = Signal()  # 清理运行日志/步骤截图（debug/ 运行档）
+    request_clean_backups = Signal(str)  # 清理蓝图备份（递归删除目录下的 *.bp.backup_*.json）
     save_current = Signal()           # 保存当前蓝图
     save_as_component = Signal()      # 把当前蓝图另存为组件（原「工程 ▾」里的入口迁到这里）
     open_from_disk = Signal()         # 从文件浏览打开任意位置的蓝图（原「加载蓝图 → 从文件浏览打开…」）
@@ -294,8 +303,8 @@ class AssetPanel(QWidget):
         hl.addWidget(title)
         hl.addStretch(1)
         for text, tip, kind in (
-            ("＋蓝图", "在选中的目录下新建普通蓝图（未选中则建在工程根）", "blueprint"),
-            ("＋组件", "在选中的目录下新建组件蓝图（组件放哪由你决定）", "component"),
+            ("＋蓝图", "在选中的目录下新建普通蓝图（未选中则建到 blueprints/）", "blueprint"),
+            ("＋组件", "在选中的目录下新建组件蓝图（未选中则建到 components/）", "component"),
             ("📁", "新建文件夹", "folder"),
             ("🧹", "清理没有被任何蓝图引用的资源", "cleanup"),
             ("🔄", "刷新资源树", "refresh"),
@@ -492,7 +501,11 @@ class AssetPanel(QWidget):
         self._watcher.fileChanged.connect(self._on_fs_event)
 
     def _collect_dirs(self, root: str) -> List[str]:
-        """收集需要监听的子目录（剪枝隐藏/运行产物目录，限制数量）。"""
+        """收集需要监听的子目录（剪枝隐藏/运行产物目录，限制数量）。
+
+        用 _WATCH_PRUNE_DIRS（比资源树的 _PRUNE_DIRS 多剪 debug/cache）：
+        运行产物目录不进监听，避免每次运行的建删都打穿监听器。
+        """
         out: List[str] = []
         stack = [(root, 1)]
         while stack and len(out) < _MAX_WATCH_DIRS:
@@ -504,7 +517,7 @@ class AssetPanel(QWidget):
                     if not ent.is_dir():
                         continue
                     name = ent.name
-                    if name.lower() in _PRUNE_DIRS or name.startswith("."):
+                    if name.lower() in _WATCH_PRUNE_DIRS or name.startswith("."):
                         continue
                     out.append(ent.path)
                     stack.append((ent.path, depth + 1))
@@ -883,6 +896,18 @@ class AssetPanel(QWidget):
         has_proj = bool(proj_root and os.path.isdir(proj_root))
         is_dir = (kind == "dir")
 
+        def _has_backups(d: str) -> bool:
+            """该目录子树里是否存在蓝图备份（.bp.backup_*.json）——没有就不显示清理项。"""
+            try:
+                for _dp, _dn, fn in os.walk(d):
+                    for f in fn:
+                        fl = f.lower()
+                        if fl.endswith(".json") and ".backup_" in fl:
+                            return True
+            except OSError:
+                pass
+            return False
+
         def _act(text: str, cb, enabled: bool = True):
             a = QAction(text, menu)
             a.setEnabled(enabled)
@@ -900,7 +925,15 @@ class AssetPanel(QWidget):
                 _act("✏ 重命名…", lambda: self.request_rename.emit(path))
                 _act("🗑 删除文件夹…", lambda: self.request_delete.emit([path]))
                 menu.addSeparator()
-                _act("🧹 清理未使用资源…", lambda: self.request_cleanup_assets.emit())
+                # 清理类入口按目录归位：「清理未使用资源」只在 resource/ 上，「清理运行日志」只在 debug/ 上
+                _res_dir = os.path.join(proj_root, "resource") if proj_root else ""
+                if _res_dir and os.path.normpath(path) == os.path.normpath(_res_dir):
+                    _act("🧹 清理未使用资源…", lambda: self.request_cleanup_assets.emit())
+                _debug_dir = os.path.join(proj_root, "debug") if proj_root else ""
+                if _debug_dir and os.path.normpath(path) == os.path.normpath(_debug_dir):
+                    _act("🧹 清理运行日志…", lambda: self.request_clean_run_logs.emit(), has_proj)
+                if has_proj and _has_backups(path):
+                    _act("🧹 清理蓝图备份…", lambda: self.request_clean_backups.emit(path))
                 _act("📂 在资源管理器中打开", lambda: self.reveal_path.emit(path))
             else:
                 is_bp = path.lower().endswith(".bp.json")
@@ -933,6 +966,9 @@ class AssetPanel(QWidget):
             _act("💾 保存当前蓝图", lambda: self.save_current.emit(), bool(self._current_path))
             _act("🧩 将当前蓝图另存为组件…", lambda: self.save_as_component.emit(), bool(self._current_path))
             _act("🧹 清理未使用资源…", lambda: self.request_cleanup_assets.emit(), has_proj)
+            _act("🧹 清理运行日志…", lambda: self.request_clean_run_logs.emit(), has_proj)
+            if has_proj and proj_root and _has_backups(proj_root):
+                _act("🧹 清理蓝图备份…", lambda: self.request_clean_backups.emit(proj_root))
             _act("📂 从文件浏览打开…", lambda: self.open_from_disk.emit())
             menu.addSeparator()
             _act("🔄 刷新", lambda: self.refresh())

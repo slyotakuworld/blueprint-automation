@@ -689,8 +689,7 @@ class BlueprintMainWindow(QMainWindow):
         dock_assets.setWidget(self._assets)
         dock_assets.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
         dock_assets.setFeatures(QDockWidget.DockWidgetMovable)
-        dock_assets.setMinimumWidth(230)
-        dock_assets.setMaximumWidth(340)
+        dock_assets.setFixedWidth(300)   # 工程资源面板固定宽度（用户要求不可拖动）
         self.addDockWidget(Qt.LeftDockWidgetArea, dock_assets)
         dock_assets.setStyleSheet(_dock_stylesheet)
         dock_assets.show()
@@ -813,6 +812,7 @@ class BlueprintMainWindow(QMainWindow):
         # 保存仍留一个入口（Ctrl+S 也能用）；新建/另存/加载/删除请看左侧资源面板
         self._menu_proj_saveas.addSeparator()
         self._menu_proj_saveas.addAction(self._act_save)
+        # （2026-10-07 晚）「🧹 清理运行日志」入口已迁出：资源树右键 debug 目录即可，这里不再重复
 
         # === 把构建好的菜单挂到 ToolButton ===
         tb.addSeparator()
@@ -1416,6 +1416,8 @@ class BlueprintMainWindow(QMainWindow):
         self._assets.request_delete.connect(self._on_asset_delete)
         self._assets.request_set_bp_type.connect(self._on_asset_set_bp_type)
         self._assets.request_cleanup_assets.connect(self._on_asset_cleanup_assets)
+        self._assets.request_clean_run_logs.connect(self._on_clean_debug)
+        self._assets.request_clean_backups.connect(self._on_clean_backups)
         self._assets.save_current.connect(self._on_save)
         self._assets.save_as_component.connect(self._on_save_as_component)
         self._assets.open_from_disk.connect(self._on_open)
@@ -1910,10 +1912,10 @@ class BlueprintMainWindow(QMainWindow):
         self._refresh_assets(reveal_path=final_path)
 
     def _on_new(self):
-        """新建空白蓝图（落在工程根目录）。"""
+        """新建空白蓝图（落在 blueprints/ 目录，与资源面板快捷创建同口径）。"""
         if not self._ensure_project_open("新建蓝图"):
             return
-        self._create_blueprint_at(self._pm.project_root, as_component=False)
+        self._create_blueprint_at(os.path.join(self._pm.project_root, "blueprints"), as_component=False)
 
     def _on_save_as_component(self):
         """把当前蓝图另存一份（默认落在当前蓝图所在目录）并标记为组件蓝图。
@@ -1925,6 +1927,125 @@ class BlueprintMainWindow(QMainWindow):
             return
         self._create_blueprint_at(self._default_component_dir(), as_component=True,
                                   use_current_graph=True)
+
+    def _on_clean_debug(self):
+        """🧹 一键清理当前工程的运行档（2026-10-07）。
+
+        清理范围（保守口径，防误删）：
+          - debug/ 顶层的 run_*.log（运行日志）
+          - debug/ 下的时间戳子目录（每次运行的步骤截图证据）
+        其他文件（用户手动放进 debug 的东西）一律不动；目录本身保留。
+        运行中不可清理——executor 正在往里写。清理前弹窗确认并显示可释放空间。
+        """
+        if not self._ensure_project_open("清理运行日志"):
+            return
+        if self._runner is not None and self._runner.isRunning():
+            QMessageBox.warning(self, "无法清理", "蓝图正在运行中，请先停止再清理运行日志。")
+            return
+        try:
+            from src.config.app_paths import debug_dir as _debug_dir
+            debug_root = _debug_dir()
+        except Exception:
+            debug_root = None
+        if not debug_root or not os.path.isdir(debug_root):
+            QMessageBox.information(self, "没有可清理的内容", "当前工程还没有运行档（debug 目录为空）。")
+            return
+        targets = []
+        total_bytes = 0
+        for name in os.listdir(debug_root):
+            p = os.path.join(debug_root, name)
+            if os.path.isfile(p) and name.startswith("run_") and name.endswith(".log"):
+                targets.append(p)
+            elif os.path.isdir(p):
+                targets.append(p)
+        if not targets:
+            QMessageBox.information(self, "没有可清理的内容", "当前工程还没有运行档（debug 目录为空）。")
+            return
+        for p in targets:
+            try:
+                if os.path.isfile(p):
+                    total_bytes += os.path.getsize(p)
+                else:
+                    for dirpath, _dirnames, filenames in os.walk(p):
+                        for f in filenames:
+                            try:
+                                total_bytes += os.path.getsize(os.path.join(dirpath, f))
+                            except OSError:
+                                pass
+            except OSError:
+                pass
+        mb = total_bytes / (1024 * 1024)
+        ret = QMessageBox.question(
+            self, "清理运行日志",
+            f"将删除 debug/ 下的 {len(targets)} 项运行档（约 {mb:.1f} MB）：\n{debug_root}\n\n"
+            f"删除后不可恢复，确定清理吗？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if ret != QMessageBox.Yes:
+            self._log.append_log("已取消清理运行日志。", "INFO")
+            return
+        import shutil as _shutil
+        deleted = 0
+        for p in targets:
+            try:
+                if os.path.isdir(p):
+                    _shutil.rmtree(p)
+                else:
+                    os.remove(p)
+                deleted += 1
+            except Exception as e:
+                self._log.append_log(f"清理失败（跳过）：{p} —— {type(e).__name__}: {e}", "WARN")
+        self._log.append_log(
+            f"🧹 已清理运行日志：{deleted}/{len(targets)} 项，释放约 {mb:.1f} MB。", "SUCCESS")
+
+    def _on_clean_backups(self, root_dir: str = ""):
+        """🧹 清理蓝图备份（2026-10-07）。
+
+        备份 = 每次保存已有蓝图时生成的 <名字>.bp.backup_时间戳.json（graph_store 自动只留每蓝图 5 份）。
+        清理范围 = root_dir 子树内递归的全部 *.bp.backup_*.json，与 graph_store 的命名严格对应，
+        用户自己的其他 .json 一律不动。右键哪个目录就清哪个子树；空白处=整工程。
+        """
+        if not self._ensure_project_open("清理蓝图备份"):
+            return
+        if not root_dir:
+            root_dir = self._pm.project_root if (self._pm and self._pm.is_open()) else ""
+        if not root_dir or not os.path.isdir(root_dir):
+            return
+        targets = []
+        total_bytes = 0
+        for dirpath, _dirnames, filenames in os.walk(root_dir):
+            for f in filenames:
+                fl = f.lower()
+                if fl.endswith(".json") and ".backup_" in fl:
+                    p = os.path.join(dirpath, f)
+                    targets.append(p)
+                    try:
+                        total_bytes += os.path.getsize(p)
+                    except OSError:
+                        pass
+        if not targets:
+            QMessageBox.information(self, "没有可清理的内容", "该目录下没有蓝图备份文件。")
+            return
+        mb = total_bytes / (1024 * 1024)
+        ret = QMessageBox.question(
+            self, "清理蓝图备份",
+            f"将删除 {len(targets)} 个蓝图备份文件（约 {mb:.1f} MB）：\n{root_dir}\n\n"
+            f"备份是保存时的回滚保险（每个蓝图自动保留最近 5 份），\n"
+            f"删除后无法恢复到之前的版本，确定清理吗？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if ret != QMessageBox.Yes:
+            self._log.append_log("已取消清理蓝图备份。", "INFO")
+            return
+        deleted = 0
+        for p in targets:
+            try:
+                os.remove(p)
+                deleted += 1
+            except Exception as e:
+                self._log.append_log(f"清理失败（跳过）：{p} —— {type(e).__name__}: {e}", "WARN")
+        self._log.append_log(
+            f"🧹 已清理蓝图备份：{deleted}/{len(targets)} 个，释放约 {mb:.1f} MB。", "SUCCESS")
 
     # ==================== 🗂 资源面板回调（面板只发意图，写文件在这里） ====================
     def _refresh_assets(self, reveal_path: Optional[str] = None):
@@ -1973,15 +2094,24 @@ class BlueprintMainWindow(QMainWindow):
         self._refresh_assets(reveal_path=self._current_path)
 
     def _on_asset_new(self, kind: str, target_dir: str):
-        """资源面板「新建蓝图/组件/文件夹」：落在面板当前选中的目录下（不再固定 components/）。"""
+        """资源面板「新建蓝图/组件/文件夹」：落在面板当前选中的目录下。
+
+        2026-10-07 用户定案：**快捷创建必须落到对应目录**——没有选中具体子目录时，
+        蓝图 → blueprints/、组件 → components/，不允许再兜底到工程根
+        （否则 blueprints/ 与 components/ 两个目录形同虚设）。
+        用户在树里选中了具体文件夹（或右键某个目录）则尊重用户的选择。
+        """
         if kind == "folder":
             self._on_asset_new_folder(target_dir)
             return
         if not self._ensure_project_open("新建资源"):
             return
         as_component = (kind == "component")
-        if not target_dir or not os.path.isdir(target_dir):
-            target_dir = self._pm.project_root
+        root = self._pm.project_root
+        target_invalid = (not target_dir) or (not os.path.isdir(target_dir))
+        target_is_root = (not target_invalid) and os.path.abspath(target_dir) == os.path.abspath(root)
+        if target_invalid or target_is_root:
+            target_dir = os.path.join(root, "components" if as_component else "blueprints")
         self._create_blueprint_at(target_dir, as_component=as_component)
 
     def _on_asset_new_folder(self, parent_dir: str):

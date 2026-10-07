@@ -14,8 +14,7 @@ class ProjectManager(QObject):
             ├── components/                # 组件蓝图默认目录（类型由蓝图自身 bp_type 决定，不强制）
             ├── resource/                  # 资源根：蓝图用到的图片按蓝图所在目录镜像存放
             │   └── <蓝图相对目录>/          #   例如 resource/blueprints/tpl_xxx.png
-            ├── cache/                     # 运行期缓存
-            └── debug/                     # 运行期debug输出
+            └── debug/                     # 运行期debug输出（运行日志 + 步骤截图证据）
       - 启动时必须先新建或打开一个工程（否则所有写资源操作都被拦截）。
       - 通过 register_path_provider() 把自身路径解析函数注入给 src.config.app_paths，
         这样 app_paths 下的资源/缓存/debug 路径解析自动路由到工程目录。
@@ -139,9 +138,6 @@ class ProjectManager(QObject):
         """资源根目录 <project>/resource/：蓝图用到的图片按蓝图所在目录镜像存进去。"""
         return self._sub("resource")
 
-    def cache_dir(self) -> Optional[str]:
-        return self._sub("cache")
-
     def debug_dir(self) -> Optional[str]:
         return self._sub("debug")
 
@@ -151,7 +147,7 @@ class ProjectManager(QObject):
     def path_provider(self, key: str) -> Optional[str]:
         """
         供 app_paths 注入回调时调用。
-        key ∈ {"root", "assets", "cache", "debug"}
+        key ∈ {"root", "assets", "debug"}
           root 用于把蓝图里的「相对工程根资源路径」解析成绝对路径（app_paths.project_root_dir）。
         """
         if not self.is_open():
@@ -160,8 +156,6 @@ class ProjectManager(QObject):
             return self.project_root
         if key == "assets":
             return self.asset_dir()
-        if key == "cache":
-            return self.cache_dir()
         if key == "debug":
             return self.debug_dir()
         return None
@@ -222,12 +216,11 @@ class ProjectManager(QObject):
             os.makedirs(project_root, exist_ok=True)
         except Exception:
             return None
-        # 子目录
+        # 子目录（2026-10-07：不再创建 cache/——找图缓存在内存里，cache 从未有文件，见 app_paths 注释）
         for sub in [
             "blueprints",   # 普通蓝图默认目录（系统默认蓝图放在这里）
             "components",   # 组件蓝图默认目录（类型仍以蓝图自身 bp_type 为准，不强制放这里）
             "resource",     # 资源根目录
-            "cache",
             "debug",
         ]:
             os.makedirs(os.path.join(project_root, sub), exist_ok=True)

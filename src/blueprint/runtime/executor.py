@@ -4786,8 +4786,8 @@ class BlueprintRunner(QThread):
             # 只是剪切板等 COM 依赖功能不可用，日志会在具体节点提示。
             _com_inited = False
 
-        # ---------- 运行日志落盘：debug/runs/{id}/run_{id}.log ----------
-        run_dir = os.path.join(debug_dir(), "runs", run_id)
+        # ---------- 运行日志落盘：debug/{id}/run_{id}.log（2026-10-07 拍平：debug 下只有运行档，去掉 runs 这层） ----------
+        run_dir = debug_dir()
         os.makedirs(run_dir, exist_ok=True)
         log_path = os.path.join(run_dir, f"run_{run_id}.log")
         log_fp = None
