@@ -1148,10 +1148,13 @@ class BlueprintMainWindow(QMainWindow):
         return cur != item.get("entry_hash")
 
     def _create_empty_subgraph(self, host_node, body_key: str, kind: str) -> dict:
-        """构造一个空的子图 body（含一个起始节点）并返回，**不写进 host_node.params**。
+        """构造一个空的子图 body（只含一个起始节点）并返回，**不写进 host_node.params**。
 
         起始节点按容器类型区分：并行体用「分支入口 Branch」（运行时只认 Branch，
         开始节点在并行体里不参与执行），循环体/顺序体用「开始 Start」。
+
+        **不预置「结束 End」节点**：三个容器都不要求接「结束」（执行流跑到最后一个节点、
+        或者末尾出口悬空，都算正常收尾），预置了反而让用户以为非接不可。
 
         ⚠ 只「造」不「写」是刻意的：双击进去看一眼不算修改。body 只有在用户真的在
         子画布里有改动时，才会在「退出子画布 / 保存」时写回宿主节点的 params。
@@ -1166,7 +1169,8 @@ class BlueprintMainWindow(QMainWindow):
         title = {"loop": "循环", "seq": "顺序执行", "parallel": "并行执行"}.get(kind, "子画布")
         self._log.append_log(
             f"「{title}」节点的子画布还是空的，已自动放入一个"
-            f"「{'分支入口' if kind == 'parallel' else '开始'}」节点。在里面编辑后退出/保存才会写回蓝图。",
+            f"「{'分支入口' if kind == 'parallel' else '开始'}」节点。"
+            f"在里面编辑后退出/保存才会写回蓝图。",
             "INFO",
         )
         return body
@@ -1179,12 +1183,17 @@ class BlueprintMainWindow(QMainWindow):
     }
 
     # 子画布专用上下文节点：在哪一层的容器里，左侧节点库就额外给出对应节点
-    _CONTEXT_NODES = {"loop": ["Continue", "Break"], "parallel": ["Branch"]}
+    _CONTEXT_NODES = {
+        "loop": ["Continue", "Break"],          # 再次循环 / 跳出循环
+        "seq": ["ExitSequence"],                # 退出串行
+        "parallel": ["Branch", "ExitParallel"], # 分支入口 / 退出并行
+    }
 
     def _apply_context_nodes(self, kind):
         """按「当前所在层的容器类型」刷新左侧节点库的上下文节点。
 
-        loop → Continue/Break；parallel → Branch；其余（根图 / 顺序体）→ 无。
+        loop → Continue/Break；seq → ExitSequence；parallel → Branch/ExitParallel；
+        其余（根图）→ 无。
 
         ⚠ 退出子画布时也必须按「新的当前层」重新套用 —— 否则
         「进循环体（有 Continue/Break）→ 再进并行体 → 退回循环体」时，
@@ -1285,7 +1294,7 @@ class BlueprintMainWindow(QMainWindow):
         self._scene.set_graph(sub)
         self._graph = sub
         self._inspector.set_node(None)
-        # 上下文节点：循环体注入 Continue/Break；并行体注入 Branch
+        # 上下文节点：循环体注入 Continue/Break；顺序体注入 ExitSequence；并行体注入 Branch/ExitParallel
         self._apply_context_nodes(kind)
         self._refresh_breadcrumb()
         if not quiet:
@@ -3083,6 +3092,20 @@ class BlueprintMainWindow(QMainWindow):
             except Exception:
                 _old_scene_rect = None
         node.params[param_name] = value
+        # ---- 并行体「主线程分支」唯一性（用户定案：有且只能有一个）----
+        # 在某个分支入口上勾了「主线程分支」→ 同一张并行体画布里的其它分支入口自动取消勾选。
+        # （处在并行体子画布时 self._graph 就是那张子图，兄弟分支入口都在里面。）
+        if node.type == "Branch" and param_name == "is_main" and bool(value):
+            for other in self._graph.nodes.values():
+                if other.id != node.id and other.type == "Branch" and other.params.get("is_main"):
+                    other.params["is_main"] = False
+                    oi = self._scene.node_item(other.id)
+                    if oi is not None:
+                        try:
+                            oi.update()
+                        except Exception:
+                            pass
+                    self._log.append_log(f"[Parallel] 主线程分支唯一 → 已取消节点 {other.id} 的「主线程分支」勾选", "INFO")
         # ---- 换模板 → 级联清空「特征识别辅助」里与旧模板绑定的数据 ----
         # 特征的 rel_x/rel_y、特征图、模板总宽高都是按「截取时那张模板」记录的：
         # 换了模板，旧特征既不可能命中（验证模式 100% 失败），还会让兜底模式推算的模板原点整体错位。
@@ -4131,6 +4154,7 @@ class BlueprintMainWindow(QMainWindow):
         #   这样「编辑器内点▶运行」与「导出后的挂机 EXE」行为完全一致，
         #   避免出现「编辑器里能跑、导出后找不到图」的口径偏差。
         runner = BlueprintRunner(self._graph, self, initial_variables=preset_vars)
+        self._hl_collision_notified = False   # 每次运行重置「撞名高亮已忽略」诊断（只提示一次）
         runner.log_message.connect(self._on_runner_log, Qt.QueuedConnection)
         runner.highlight_node.connect(self._on_runner_highlight, Qt.QueuedConnection)
         runner.highlight_clear.connect(
@@ -4265,7 +4289,8 @@ class BlueprintMainWindow(QMainWindow):
           []                  → 根图
           [LoopId]            → 循环体
           [LoopId, ParId]     → 循环体里的并行体
-          None                → 不可导航（如组件子蓝图内部）→ 不动画布，只按 id 高亮
+          None                → 不可导航（组件子蓝图内部）→ 不动画布、也**不按裸 id 高亮**，
+                                保持上一个高亮（进入组件前调用方已把组件节点点亮）
         为什么要带上 path：节点 id 是「每张图各自编号」的，父图的 1 和循环体里的 1 是同名不同人，
         只给一个裸 id 时画布只能停在当前层 —— 表现就是「高亮不跟着进循环/并行体」。
         """
@@ -4273,6 +4298,23 @@ class BlueprintMainWindow(QMainWindow):
             self._follow_exec_path(path)
         except Exception:
             pass
+        if path is None:
+            # ⚠ 组件子蓝图内部：绝不能按裸 id 高亮。组件是另一张图，它的节点 id 会与
+            # 当前画布上的节点同名（比如组件里的 id=4 撞上循环体里的串行节点 id=4），
+            # 按 id 点亮就会「明明该走组件、却把串行节点点亮」—— 用户实测踩过的坑。
+            # 组件节点本身在进入组件前已被调用方画布点亮，这里保持住即可。
+            try:
+                items = getattr(self._scene, "_node_items", {}) or {}
+                if node_id in items and not getattr(self, "_hl_collision_notified", False):
+                    self._hl_collision_notified = True
+                    self._log.append_log(
+                        f"[调试] 组件内部节点 id={node_id[:8]} 与当前画布节点同名，"
+                        f"其高亮已忽略（防串层误亮）。看到本行 = 高亮修复已生效。",
+                        "INFO",
+                    )
+            except Exception:
+                pass
+            return
         try:
             self._scene.set_running_node(node_id)
         except Exception:
@@ -4369,14 +4411,27 @@ class BlueprintMainWindow(QMainWindow):
                 try:
                     if self._view is not None and self._runner is not None:
                         curr_id = getattr(self._runner, "current_node_id", None)
+                        curr_path = getattr(self._runner, "current_node_path", None)
                         if isinstance(curr_id, str) and len(curr_id) > 0:
-                            ok = self._view.jump_to_node_by_id(curr_id, flash_ms=3200)
-                            if ok:
-                                ntype = getattr(self._runner, "current_node_type", None) or "节点"
+                            if curr_path is None:
+                                # 暂停点在「组件子蓝图」内部：绝不能按裸 id 跳画布 ——
+                                # 组件是另一张图，它的节点 id 会与当前画布上的节点同名
+                                # （比如组件里的 id=4 撞上循环体里的串行节点 id=4），
+                                # 跳过去就是「明明停在组件里、画布却定位到串行节点」。
+                                # 画布保持在调用方（组件节点本身已被运行高亮点亮）。
                                 self._log.append_log(
-                                    f"📍画布已自动定位到暂停节点 → {ntype} id={curr_id[:8]}",
+                                    "📍暂停点在组件内部（画布不跳转防串层误定位）——"
+                                    "组件节点亮着，组件内部执行细节看日志 [Node▶] … [子图] 行",
                                     "INFO",
                                 )
+                            else:
+                                ok = self._view.jump_to_node_by_id(curr_id, flash_ms=3200)
+                                if ok:
+                                    ntype = getattr(self._runner, "current_node_type", None) or "节点"
+                                    self._log.append_log(
+                                        f"📍画布已自动定位到暂停节点 → {ntype} id={curr_id[:8]}",
+                                        "INFO",
+                                    )
                 except Exception:
                     pass
         except Exception:

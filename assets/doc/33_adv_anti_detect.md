@@ -90,15 +90,15 @@ VarSwitch(today 存的 != 已完成日期 → 跑日常；默认 → 蓝图睡 1
 Start
  ├─ 1. OpenApp（游戏路径，等待 15 秒）
  ├─ 2. 各视觉/鼠标节点里填「目标窗口」定位（如 程序名=game.exe），坐标基准选「目标窗口」
- ├─ 3. Loop(count=10)   ← 假设 10 个每日任务
- │     loop_body →
+ ├─ 3. Loop(max_iterations=10)   ← 假设 10 个每日任务
+ │     循环体子画布（不需要接「结束」，跑到最后一个节点本轮就结束）：
  │       FindImage(接取任务按钮, click)
  │         ├─ 阈值 0.9，hybrid 模式
  │         ├─ scroll_dy=-200（找不到就往下滚列表）
  │       Wait(random 0.3~0.8)
  │       IfImageDetect（任务完成标记，OR 逻辑短路）
  │         yes → 继续；no → FindImage(自动寻路按钮, click)
- │       Wait(random 8.0~14.0)  ← 等任务跑完（拟人）
+ │       Wait(random 8.0~14.0)  ← 等任务跑完（拟人），跑到这里本轮就结束了
  ├─ 4. Notify("10 个日常全完成啦~ 苹果给咱当奖励 🍎")
  └─ 5. End
 ```

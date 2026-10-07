@@ -7,7 +7,7 @@ import traceback
 import contextlib
 from collections import deque
 from datetime import datetime
-from typing import Any, Deque, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 import numpy as np
 from PIL import Image
@@ -142,112 +142,6 @@ def _exec_out_edges(graph: BlueprintGraph, node_id: str, out_port: str) -> List[
 
 
 # ============================================================
-# Sequence 短路OR分支：语义常量
-# ============================================================
-# 失败语义出口：分支一旦走到这些端口之一 → 立即判定该分支失败，尝试下一条
-FAIL_SEMANTIC = {"fail", "timeout", "not_found", "no", "err", "abort", "skipped", "cancelled", "else"}
-# 成功语义出口：走到这些端口且无下游连线 → 视为分支到达终点（成功）
-# 注：中性端口（out_exec / 普通out）继续向下游走，不立即判定
-
-
-def _walk_branch_until_end(
-    ctx: ExecutionContext,
-    graph: BlueprintGraph,
-    runner: "BlueprintRunner",
-    seq_node_id: str,
-    branch_out_port: str,
-) -> Tuple[bool, str]:
-    """
-    同步 walk Sequence 的一条分支直到执行流终点：
-      - True 成功语义：
-        * 到达执行流终点（无下游可走），且过程中从未命中 FAIL_SEMANTIC
-      - False 失败语义：
-        * 任何节点返回 FAIL_SEMANTIC 端口；或分支起点无下游连线
-    返回 (success: bool, reason: str)
-    """
-    edges = _exec_out_edges(graph, seq_node_id, branch_out_port)
-    if not edges:
-        return False, f"路径#{branch_out_port}端口无下游连线"
-
-    curr_id, _curr_in = edges[0]
-    safety = 50000
-    while safety > 0 and ctx.is_running:
-        safety -= 1
-        node = graph.nodes.get(curr_id)
-        if node is None:
-            return False, f"分支节点不存在 id={curr_id[:8]}"
-
-        wait_if_paused(ctx)
-
-        # UI 高亮 + 进度（复用 runner 信号） + 记录当前执行节点ID + 发 current_node_changed
-        try:
-            runner.highlight_node.emit(curr_id, _exec_path_of(graph))
-            runner.progress_step.emit(ctx.step_counter + 1, node.type)
-        except Exception:
-            pass
-        try:
-            ctx.current_node_id = curr_id
-            runner.current_node_changed.emit(curr_id, node.type)
-        except Exception:
-            pass
-
-        # 1) DATA 输入解析
-        inputs = _resolve_data_inputs(graph, ctx, node)
-        bump_step(ctx)
-
-        # 2) 执行（复用 EXECUTORS）
-        ctx.log(f"[Node▶] {node.type}  id={curr_id[:8]} [seq分支]", "INFO")
-        # --- 断点命中检查（Sequence 分支入口）---
-        _hit_node_breakpoint(ctx, node, runner)
-        fn = EXECUTORS.get(node.type)
-        try:
-            if fn is None:
-                outputs, next_ports, _note = {}, ["out_exec"], ""
-            else:
-                outputs, next_ports, _note = fn(ctx, node, inputs)
-        except Exception as e:
-            tb = traceback.format_exc()
-            ctx.log(f"[Node] seq分支内执行异常 {node.type}: {e}\n{tb}", "ERROR")
-            outputs, next_ports = {}, []
-
-        if not ctx.is_running:
-            return False, "运行被用户停止"
-
-        # 3) 保存输出
-        ctx.set_outputs(curr_id, outputs or {})
-        ctx.last_progress_ts = time.time()
-
-        # 4) 下一步判定：先找下游，再根据「是否有下游 + 是否 FAIL_SEMANTIC」判断
-        if not next_ports:
-            # 无 next_ports：到达执行流终点 → 成功（流程跑完）
-            return True, f"分支#{branch_out_port} 执行完成到达终点"
-        pname = next_ports[0]
-
-        # 5) 找下游连线（先找，再根据有没有下游决定成败）
-        outs = _exec_out_edges(graph, curr_id, pname)
-        if not outs:
-            # 该端口无下游 → 到达执行流终点：根据端口名判定
-            if pname in FAIL_SEMANTIC:
-                return False, f"节点 {node.type} 终结于失败端口 {pname}（无下游，分支终止于失败状态）"
-            else:
-                return True, f"到达执行终点（{node.type}.{pname}无下游）"
-        # 有下游连线：
-        if pname in FAIL_SEMANTIC:
-            # 关键修复：虽然当前端口是 FAIL_SEMANTIC，但用户明确接了下游
-            # （典型场景：cmd 故意触发 err/timeout，后面接「断言成功 Notify」）
-            # → 不立刻判负，继续沿下游 walk 直到真正的终点，最后按终点状态判定
-            ctx.log(
-                f"[Sequence-Walk] {node.type}.{pname}（FAIL_SEMANTIC端口）有下游连线，继续遍历不提前判负",
-                "DEBUG",
-            )
-        curr_id, _curr_in = outs[0]
-
-    if not ctx.is_running:
-        return False, "运行被用户停止"
-    return False, "分支执行超过安全步数（疑似死循环）"
-
-
-# ============================================================
 # execute_*: 每类节点的执行函数
 # 返回 (outputs_dict, next_out_ports_list, extra_note_for_annotation)
 # ============================================================
@@ -306,28 +200,152 @@ def execute_End(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
     return {}, [], "结束"
 
 
-def _subgraph_from_dict(sub: Dict[str, Any], name: str = "__subgraph__") -> "BlueprintGraph":
-    """把一个「子图 dict」包成临时 BlueprintGraph，复用 _resolve_data_inputs / _exec_out_edges / _walk_branch_until_end。
+def _subgraph_from_dict(sub: Dict[str, Any], name: str = "__subgraph__",
+                        ctx: "ExecutionContext" = None) -> "BlueprintGraph":
+    """把一个「子图 dict」包成临时 BlueprintGraph，复用 _resolve_data_inputs / _exec_out_edges。
 
     子图 dict 结构对齐 BlueprintGraph.to_dict()：{"nodes": {...}, "links": [...]}
+
+    传了 ctx 时，会把「加载时被丢弃的悬空连线」打进运行日志 ——
+    from_dict 对「端口不存在 / 端点节点不存在」的连线是**丢弃**处理，不报出来就完全查不到
+    （子画布里断一根线，加载后无声消失）。见 BlueprintGraph.dropped_links。
     """
     d = {"nodes": sub.get("nodes", {}), "links": sub.get("links", []), "metadata": {"name": name}}
-    return BlueprintGraph.from_dict(d)
+    g = BlueprintGraph.from_dict(d)
+    dropped = getattr(g, "dropped_links", None) or []
+    if dropped and ctx is not None:
+        ctx.log(
+            f"[子画布] {name} 加载时有 {len(dropped)} 条连线被丢弃（端口或节点不存在），"
+            f"它们不会参与执行："
+            + "；".join(
+                f"{l.get('from_node', '?')}.{l.get('from_port', '?')}→{l.get('to_node', '?')}.{l.get('to_port', '?')}"
+                for l in dropped[:5]
+            )
+            + ("…" if len(dropped) > 5 else ""),
+            "WARN",
+        )
+    return g
+
+
+# ============================================================
+# 退出类节点的控制信号：**线程本地**（不放 ctx.runtime_attrs，也不靠前缀拼键）
+#
+# 谁在用：Continue（再次循环）、Break（跳出循环）、ExitSequence（退出串行）、
+# ExitParallel（退出并行）。
+#
+# 信号带四个信息：
+#   kind       —— "continue"（下一轮） | "exit"（退出当前结构）
+#   target     —— 想退出的容器类型："loop" / "seq" / "par"
+#   as_failure —— 仅 "exit" 有意义：该节点是否勾了「标记为失败」
+#   source     —— 发出信号的节点类型（只为日志 / 报错文案，便于排查）
+#
+# **穿透规则（2026-10-06 用户定案）**：容器只消费 target 指向自己的信号；
+# target 不是自己的**一律原样往上抛**，交给外层容器处理。
+# 于是「并行分支 → 顺序体 → 退出并行」也能一路穿透到并行结构，让整个并行提前收工，
+# 而不是被内层顺序体当成「退出顺序体」吃掉。
+#
+# 为什么线程本地：原先靠 ctx._graph_ref._runtime_prefix 拼 `_sub_control::<前缀>`，
+# 而并行分支跑在线程池里、刻意**不切** ctx._graph_ref（避免多线程互相覆盖），
+# 于是算出来的键名跟分支要取的键名对不上 —— 分支里的 Break 会静默失效。
+# 控制信号本质是「本线程当前这一趟 walk 被打断了」，用线程本地最贴切：
+# 不跨线程串味、不依赖任何前缀、也不会留残留键。每趟 walk 开始前清一次，
+# 防止在顶层误放一个退出节点后残留下来、被下一趟 walk 误吃。
+# ⚠ 并行分支之间不靠 thread-local 传信号 —— 信号随分支的**返回值**带回父线程，
+#   由 execute_Parallel 在主线程里重新发出（见 _run_parallel_branch）。
+# ============================================================
+TARGET_LOOP = "loop"
+TARGET_SEQ = "seq"
+TARGET_PAR = "par"
+
+
+class CtrlSignal(NamedTuple):
+    """退出类节点发出的控制信号（说明见上方注释块）。"""
+    kind: str                      # "continue" | "exit"
+    target: Optional[str] = None   # "loop" / "seq" / "par"
+    as_failure: bool = False       # 仅 kind == "exit" 有意义
+    source: str = ""               # 发出信号的节点类型（日志用）
+
+
+_ctl_local = threading.local()
+
+# 「调试主线程」（execute_Parallel 的 debug_main 参数）：并行分支线程进来时先打标
+# （in_branch=True，主线程分支再 + is_main=True；线程池线程会被复用，每次都无条件赋值）。
+# 主线程分支的断点 / Step 暂停发生时，ctx.runtime_attrs 上会带「_main_debug_pause」标记
+# → wait_if_paused 见到「非主线程分支 + 该标记」就**不跟停**：守护/保活分支照常跑，
+# 不会因为你在主逻辑上打断点而被卡死。分支里嵌套容器（循环/顺序体）在同一线程上跑，标记继续有效。
+_par_branch_tls = threading.local()
+
+
+def _main_debug_pause_active(ctx: "ExecutionContext") -> bool:
+    """当前是否正处于「主线程分支调试暂停」——此时并行体的其它分支不跟停。"""
+    attrs = getattr(ctx, "runtime_attrs", None)
+    if not isinstance(attrs, dict):
+        return False
+    return bool(attrs.get("_main_debug_pause"))
+
+
+def _ctl_reset():
+    _ctl_local.sig = None
+
+
+def _ctl_set(sig: Optional[CtrlSignal]):
+    """把信号放到本线程（传 None = 清空）。"""
+    _ctl_local.sig = sig
+
+
+def _ctl_peek() -> Optional[CtrlSignal]:
+    """看一眼本线程的信号，不取走。"""
+    return getattr(_ctl_local, "sig", None)
+
+
+def _ctl_pop() -> Optional[CtrlSignal]:
+    """取走本线程的控制信号；没有信号时返回 None。"""
+    sig = getattr(_ctl_local, "sig", None)
+    _ctl_local.sig = None
+    return sig
+
+
+def _ctl_emit(kind: str, target: Optional[str] = None, as_failure: bool = False, source: str = ""):
+    """退出类节点调用：发一个控制信号。"""
+    _ctl_set(CtrlSignal(kind=kind, target=target, as_failure=bool(as_failure), source=source))
+
+
+def _ctl_passes_through(sig: Optional[CtrlSignal], my_target: str) -> bool:
+    """该信号是不是「路过的」（target 不是我，要往上一层层抛）。
+
+    target 为 None（没指名道姓）时视为「最近的容器」，不算路过。
+    """
+    return bool(sig is not None and sig.target is not None and sig.target != my_target)
 
 
 def _run_subgraph_until_control(
     ctx: ExecutionContext,
     sub: "BlueprintGraph",
     runner,
-    entry_node_id: str,
-) -> str:
-    """同步执行一张子图，从 entry_node_id 出发走完整条执行流，直到：
-      - 遇到 Continue 节点 → 返回 "continue"
-      - 遇到 Break 节点 → 返回 "break"
-      - 执行流自然走到终点（无下游）→ 返回 "end"
-      - 运行被停止 → 返回 "stop"
+    entry_node_ids: Sequence[str],
+) -> Tuple[Optional[CtrlSignal], bool, str]:
+    """同步执行一张子画布，从 entry_node_ids 出发走完整条执行流，直到：
 
-    返回的控制信号供 execute_Loop 决定「继续下一轮 / 跳出循环 / 正常结束本轮」。
+      - 遇到 Continue 节点 → (CtrlSignal("continue",...), True, "")
+      - 遇到退出类节点（Break / 退出串行 / 退出并行）→ (CtrlSignal("exit",...), True, "")
+      - 执行流走到末尾（「结束」节点 / 没有下一步 / 出口悬空）→ (None, True, "")
+      - 执行流出错 → (None, False, 原因)    （节点抛异常 / 节点不存在 / 超步数）
+      - 运行被停止 → (None, False, "运行被用户停止")
+
+    **ok = 这一趟有没有按预期跑完**；第一个返回值是退出类节点发出的控制信号（没有则 None）。
+    信号**不做消费判断**，原样交回给调用方（容器）——由容器决定自己吃掉还是继续往上抛
+    （见 _ctl_passes_through）。
+
+    ⚠ 判定口径（2026-10-06 用户定案）：**只看有没有「异常报错」** —— 节点执行抛异常、
+    下一个节点不存在、执行步数超安全上限（疑似死循环）。除此之外一律算跑完（ok=True）。
+    也就是说：**不接「结束」节点也算完成**，三个容器口径一致。
+    刻意**不按端口名判失败** —— `not_found` / `no` / `err` 这类端口在轮询、重试、
+    条件分支里都可能是正常节奏，拿端口名判负会大面积误判。
+
+    **一个出口连多条线（fan-out）会被全部执行**（与根图 walker 一致）：
+    入口可以给多个起始 id，节点执行后把**所有**下游入队。
+    以前只取 `outs[0]`，子画布里多连一根线会被**静默丢掉** —— 最难查的那类 bug
+    （「根图上好好的，搬进循环体就少跑一步」）。
 
     子图内节点 id 是子图内部命名空间（与父图隔离）；输出写进 ctx.last_outputs 时
     加前缀 {sub_prefix}::{node_id} 避免与父图节点 id 撞车（子图节点 id 可能是纯数字，与父图同值）。
@@ -340,14 +358,18 @@ def _run_subgraph_until_control(
     saved_path = _exec_path_set(_exec_path_of(sub))
     ctx._graph_ref = sub
     ctx._runner_ref = runner
+    _ctl_reset()          # 清掉可能残留的控制信号（顶层误放的退出类节点）
     try:
-        curr_id = entry_node_id
+        pending: Deque[str] = deque(entry_node_ids)
         safety = 50000
-        while safety > 0 and ctx.is_running:
+        while pending and ctx.is_running:
+            if safety <= 0:
+                return None, False, "子画布执行步数超过安全上限（疑似死循环）"
             safety -= 1
+            curr_id = pending.popleft()
             node = sub.nodes.get(curr_id)
             if node is None:
-                return "end"
+                return None, False, f"节点不存在 id={curr_id[:8]}"
 
             wait_if_paused(ctx)
             # UI 高亮（子图节点）——尽量复用 runner 信号，失败则静默
@@ -358,6 +380,9 @@ def _run_subgraph_until_control(
                 pass
             try:
                 ctx.current_node_id = curr_id
+                # 同步记录当前容器链（组件子蓝图内部 = None）：编辑器暂停定位要用 ——
+                # 只给裸 id 时，组件里的 id=4 会撞上调用方画布同名节点，跳错楼层。
+                ctx.current_node_path = _exec_path_of(sub)
                 runner.current_node_changed.emit(curr_id, node.type)
             except Exception:
                 pass
@@ -365,6 +390,11 @@ def _run_subgraph_until_control(
             inputs = _resolve_data_inputs(sub, ctx, node, id_prefix=f"{sub_prefix}::")
             bump_step(ctx)
             ctx.log(f"[Node▶] {node.type}  id={curr_id[:8]} [子图]", "INFO")
+            # 断点 / Step 模式（用户定案：与运行高亮同口径）——并行体以外的子画布
+            # （循环体 / 顺序体 / 组件蓝图）都支持断点与逐步，语义与根图一致：
+            # breakpoint=True 的节点进入即停（循环每轮都会命中）；step_mode=True 每节点自动停。
+            # ⚠ 并行分支 walker 刻意**不调**这个 —— 并行是黑盒，断点/单步只停在并行节点本身。
+            _hit_node_breakpoint(ctx, node, runner)
             fn = EXECUTORS.get(node.type)
             try:
                 if fn is None:
@@ -374,30 +404,34 @@ def _run_subgraph_until_control(
             except Exception as e:
                 tb = traceback.format_exc()
                 ctx.log(f"[Node] 子图内执行异常 {node.type}: {e}\n{tb}", "ERROR")
-                outputs, next_ports = {}, []
+                return None, False, f"节点「{node.type}」执行异常：{e}"
 
-            # 控制节点（Continue/Break）在 execute_* 里直接 return 控制信号——这里用 next_ports 空列表 + 特殊标记识别
-            # 更稳的方式：execute_Continue/Break 通过 ctx.runtime_attrs 传递信号
-            ctrl = ctx.runtime_attrs.pop(f"_sub_control::{sub_prefix}", None)
-            if ctrl is not None:
-                return ctrl
+            # 退出类节点（Continue / Break / 退出串行 / 退出并行）通过线程本地信号传递
+            sig = _ctl_pop()
+            if sig is not None:
+                # 用户主动写的控制流，不属于失败；是否判失败由节点的「标记为失败」参数决定。
+                # 立刻返回给调用方（容器）——由它决定消费还是继续外抛。
+                return sig, True, ""
 
             # 保存输出（带前缀，避免与父图撞车）
             ctx.set_outputs(f"{sub_prefix}::{curr_id}", outputs or {})
 
             if not ctx.is_running:
-                return "stop"
+                return None, False, "运行被用户停止"
 
             if not next_ports:
-                return "end"
+                # 节点返回空出口列表 = 这条执行流到此为止 → 算跑完（**不要求必须接「结束」节点**）
+                continue
 
             pname = next_ports[0]
-            outs = _exec_out_edges(sub, curr_id, pname)
-            if not outs:
-                return "end"
-            curr_id, _curr_in = outs[0]
+            # fan-out：这个出口连了几条线就全跑（以前只取 outs[0]，多的会被静默丢掉）。
+            # 出口一条都没连 = 这条执行流自然收尾，不算失败，直接看队列里还有没有别的线。
+            for nid, _p in _exec_out_edges(sub, curr_id, pname):
+                pending.append(nid)
 
-        return "stop" if not ctx.is_running else "end"
+        if not ctx.is_running:
+            return None, False, "运行被用户停止"
+        return None, True, ""
     finally:
         # 恢复父图引用（若期间没有被其它递归层改写）
         if saved_graph is not None:
@@ -417,46 +451,16 @@ def execute_Loop(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
     interval = param_num(node.params.get("interval_sec"), 1.0, float, lo=0.0)
     if max_it <= 0:
         max_it = 5
-    counter = ctx.loop_counters.get(node.id, 0)
 
-    # ---------- 新模式：loop_body 子图容器（不靠拉线） ----------
+    # 循环体在**子画布**里（node.params["loop_body"]），反复执行由 _execute_loop_body_container 负责。
+    # 早期那套「从循环体端口拉线出去、末尾连回 in_exec」的回环写法已随端口一起移除。
     loop_body = node.params.get("loop_body")
-    if isinstance(loop_body, dict) and loop_body.get("nodes"):
-        return _execute_loop_body_container(ctx, node, loop_body, infinite, max_it, interval, counter)
-
-    # ---------- 旧模式：loop_body 端口拉线（向后兼容，蓝图未用子图容器时） ----------
-    if infinite:
-        ctx.loop_counters[node.id] = counter + 1
-        if interval > 0 and ctx.is_running:
-            t0 = time.time()
-            while ctx.is_running and (time.time() - t0) < interval:
-                wait_if_paused(ctx)
-                time.sleep(0.05)
-        wait_if_paused(ctx)
-        note = f"Loop ∞ i={counter+1} -> loop_body"
-        annotate_step(ctx, node, "loop", note=note)
-        ctx.log(f"[Loop] {node.id[:6]}  ∞ i={counter+1} -> loop_body", "DEBUG")
-        return {}, ["loop_body"], ""
-    elif counter < max_it:
-        ctx.loop_counters[node.id] = counter + 1
-        if interval > 0 and ctx.is_running:
-            t0 = time.time()
-            while ctx.is_running and (time.time() - t0) < interval:
-                wait_if_paused(ctx)
-                time.sleep(0.05)
-        wait_if_paused(ctx)
-        note = f"Loop i={counter+1}/{max_it} -> loop_body"
-        annotate_step(ctx, node, "loop", note=note)
-        ctx.log(f"[Loop] {node.id[:6]}  i={counter+1}/{max_it} -> loop_body", "DEBUG")
-        return {}, ["loop_body"], ""
-    else:
-        ctx.log(
-            f"[Loop] {node.id[:6]} 达到 max_iterations={max_it}，退出循环。",
-            "WARN",
-        )
-        annotate_step(ctx, node, "loop", note=f"EXIT: hit max={max_it}")
-        ctx.loop_counters.pop(node.id, None)
+    if not (isinstance(loop_body, dict) and loop_body.get("nodes")):
+        ctx.log(f"[Loop] {node.id[:6]} 循环体子画布为空，直接走「退出」。", "WARN")
+        annotate_step(ctx, node, "loop", note="空循环体→out_exit")
         return {}, ["out_exit"], ""
+
+    return _execute_loop_body_container(ctx, node, loop_body, infinite, max_it, interval)
 
 
 def _execute_loop_body_container(
@@ -466,14 +470,23 @@ def _execute_loop_body_container(
     infinite: bool,
     max_it: int,
     interval: float,
-    counter: int,
 ):
-    """循环体子图容器：递归执行 loop_body 子图，直到 Break / 达到次数 / 自然结束。
+    """循环体子图容器：反复执行 loop_body 子图，直到退出节点 / 跑满次数。
 
-    - 每次进入子图前，把 ctx._graph_ref 临时切到子图（Sequence 等依赖它），执行完恢复。
-    - 子图内 Continue → 立即进入下一轮（不跑后续节点）。
-    - 子图内 Break → 立即退出整个循环，走 out_exit。
-    - 子图自然走到终点 → 计一次迭代，进入下一轮，直到 max_iterations。
+    - 每轮把子画布交给 `_run_subgraph_until_control` 跑到底；它返回的控制信号分三种处理：
+      * `continue`（再次循环）→ 结束本轮，进入下一轮。
+      * `exit` 且 target 是 loop（「跳出循环」）→ 消费：整个循环结束，
+        出口由该节点的「标记为失败」参数决定（勾上 → err，不勾 → out_exit）。
+      * `exit` 但 target 是别的容器（如顺序体里的「退出并行」）→ **穿透**：
+        原样往上一层层抛，让真正该退出的那个容器去处理。
+      ⚠ 消费掉的退出节点**只看自己的「标记为失败」参数**决定出口 —— 前面轮次记过的异常
+        不再覆盖它（用户定案：这个参数就是用来表示走完成还是失败的）。
+    - **不要求接「结束」节点**：从「开始」往下跑到最后一个节点就是这一轮的终点，算完成；
+      末尾节点的出口悬空也是正常收尾。**只有节点执行异常 / 死循环**才记一次失败。
+    - 没有退出节点时，**跑完所有轮次后**统一定出口：有任何一轮出错 → err，否则 out_exit。
+      ⚠ 单轮出错**不中断**循环，下一轮照跑（用户定案：允许多次尝试，跑完所有轮次再定）。
+    - `interval_sec` 是**每轮之间的间隔**（跑完一轮、且还有下一轮时才等；第一轮不等、
+      最后一轮跑完也不等）。历史上它被错误地放在每轮**开始之前**，导致进循环先白等一次。
     """
     graph = getattr(ctx, "_graph_ref", None)
     runner = getattr(ctx, "_runner_ref", None)
@@ -481,9 +494,9 @@ def _execute_loop_body_container(
         msg = "[Loop] ctx 缺少 graph/runner 引用，无法执行循环体子图。"
         ctx.log(msg, "ERROR")
         annotate_step(ctx, node, "loop", note="FAIL: 缺少graph_ref/runner_ref")
-        return {}, ["out_exit"], msg
+        return {}, ["err"], msg
 
-    sub = _subgraph_from_dict(loop_body, name=f"{node.id}::loop_body")
+    sub = _subgraph_from_dict(loop_body, name=f"{node.id}::loop_body", ctx=ctx)
     sub._runtime_prefix = node.id
     # 容器链：编辑器靠它把画布钻到正在执行的这一层（见文件头「执行路径」说明）
     sub._runtime_path = _exec_child_path(node)
@@ -500,69 +513,160 @@ def _execute_loop_body_container(
         ctx.log(f"[Loop] {node.id[:6]} 循环体子图为空，直接退出。", "WARN")
         return {}, ["out_exit"], ""
 
+    # Start 自己不参与执行（它无输入、只产出 out_exec）：从它的**全部**下游开始跑，
+    # 这样 Start 后面连了多条线也一条都不会被丢。
+    start_node = sub.nodes.get(entry_id)
+    if start_node is not None and start_node.type == "Start":
+        outs = [nid for nid, _p in _exec_out_edges(sub, entry_id, "out_exec")]
+        if outs:
+            entry_ids = outs
+        else:
+            # Start 无下游，循环体只有 Start，直接判空结束
+            ctx.log(f"[Loop] {node.id[:6]} 循环体只有 Start 无内容。", "WARN")
+            return {}, ["out_exit"], ""
+    else:
+        entry_ids = [entry_id]
+
     def _interval_wait():
+        """每轮之间的间隔等待（调用点保证：只在「还有下一轮」时调）。"""
         if interval > 0 and ctx.is_running:
             t0 = time.time()
             while ctx.is_running and (time.time() - t0) < interval:
                 wait_if_paused(ctx)
                 time.sleep(0.05)
 
-    # 执行子图 Start 节点本身（Start 无输入，产出 out_exec）
-    start_node = sub.nodes.get(entry_id)
-    if start_node is not None and start_node.type == "Start":
-        # 直接找到 Start 的下游作为真正入口
-        outs = _exec_out_edges(sub, entry_id, "out_exec")
-        if outs:
-            entry_id, _ = outs[0]
-        else:
-            # Start 无下游，循环体只有 Start，直接判空结束
-            ctx.log(f"[Loop] {node.id[:6]} 循环体只有 Start 无内容。", "WARN")
-            return {}, ["out_exit"], ""
+    iteration = 0
+    failures: List[str] = []
+    exit_reason = ""
+    exit_consumed = False
+    exit_as_failure = False
+    passed_through: Optional[CtrlSignal] = None
 
-    iteration = counter
     while ctx.is_running:
-        if infinite:
-            ctx.loop_counters[node.id] = iteration + 1
-        else:
-            if iteration >= max_it:
-                ctx.log(f"[Loop] {node.id[:6]} 达到 max_iterations={max_it}，退出循环。", "WARN")
-                annotate_step(ctx, node, "loop", note=f"EXIT: hit max={max_it}")
-                ctx.loop_counters.pop(node.id, None)
-                return {}, ["out_exit"], ""
-            ctx.loop_counters[node.id] = iteration + 1
+        if not infinite and iteration >= max_it:
+            ctx.log(f"[Loop] {node.id[:6]} 达到 max_iterations={max_it}，退出循环。", "WARN")
+            annotate_step(ctx, node, "loop", note=f"EXIT: hit max={max_it}")
+            exit_reason = f"跑满 {max_it} 次"
+            break
 
-        _interval_wait()
         wait_if_paused(ctx)
         annotate_step(ctx, node, "loop", note=f"container i={iteration+1}" + ("/∞" if infinite else f"/{max_it}"))
         ctx.log(f"[Loop] {node.id[:6]} 循环体子图 i={iteration+1} 开始", "DEBUG")
 
-        ctrl = _run_subgraph_until_control(ctx, sub, runner, entry_id)
-        if ctrl == "break":
-            ctx.log(f"[Loop] {node.id[:6]} 循环体内 Break → 跳出循环。", "INFO")
-            annotate_step(ctx, node, "loop", note="Break → out_exit")
-            ctx.loop_counters.pop(node.id, None)
-            return {}, ["out_exit"], ""
-        if ctrl == "stop":
+        sig, ok, reason = _run_subgraph_until_control(ctx, sub, runner, entry_ids)
+        if not ctx.is_running:
             return {}, [], "运行被停止"
-        # ctrl == "continue" 或 "end"：进入下一轮
         iteration += 1
 
-    return {}, [], ""
+        if sig is not None and sig.kind == "continue":
+            # 「再次循环」→ 结束本轮，下一轮
+            pass
+        elif sig is not None and sig.kind == "exit":
+            if _ctl_passes_through(sig, TARGET_LOOP):
+                # 不是退给我这一层的（如循环体里的「退出并行」）→ 原样往上抛
+                passed_through = sig
+                ctx.log(f"[Loop] {node.id[:6]} 循环体内出现「{sig.source or '退出节点'}」"
+                        f"（它要退出的是 {sig.target} 层）→ 向上穿透，本循环提前收工", "INFO")
+                annotate_step(ctx, node, "loop", note=f"穿透({sig.source})→上抛")
+                break
+            exit_consumed = True
+            exit_as_failure = bool(sig.as_failure)
+            exit_reason = f"循环体内「{sig.source or '退出节点'}」退出循环"
+            if exit_as_failure:
+                ctx.log(f"[Loop] {node.id[:6]} {exit_reason}（标记为失败）。", "WARN")
+                annotate_step(ctx, node, "loop", note="退出(标记失败) → err")
+            else:
+                ctx.log(f"[Loop] {node.id[:6]} {exit_reason}。", "INFO")
+                annotate_step(ctx, node, "loop", note="退出 → 跳出")
+            break
+        elif not ok:
+            # 本轮中途出错（节点执行异常 / 死循环）：记一笔，但**不中断**循环（跑完所有轮次再定）
+            failures.append(f"第{iteration}轮 {reason}")
+            ctx.log(f"[Loop] {node.id[:6]} 第{iteration}轮出错：{reason}", "WARN")
+
+        # 还有下一轮才等（第一轮不白等、最后一轮跑完也不等）
+        if ctx.is_running and (infinite or iteration < max_it):
+            _interval_wait()
+
+    if not ctx.is_running:
+        return {}, [], "运行被停止"
+
+    if passed_through is not None:
+        # 把信号重新放回本线程，交给上一层的 walker / 容器继续处理。
+        # 端口返回值无所谓：直接调用方 walker 会立刻 pop 到信号并继续上抛。
+        _ctl_set(passed_through)
+        return {}, ["out_exit"], ""
+
+    if exit_consumed:
+        if exit_as_failure:
+            return {}, ["err"], f"{exit_reason}，并且退出节点勾选了「标记为失败」"
+        # user 定案：退出节点说「走完成」就是走完成 —— 前面轮次记过的异常不再覆盖它（只在日志里留痕）
+        if failures:
+            ctx.log(f"[Loop] {node.id[:6]} {exit_reason}（走「完成」）；但此前有 {len(failures)} 轮出错，"
+                    f"已被退出节点显式声明的「完成」覆盖：{'；'.join(failures[:5])}", "WARN")
+        ctx.log(f"[Loop] {node.id[:6]} {exit_reason} → out_exit", "INFO")
+        annotate_step(ctx, node, "loop", note="✓退出→out_exit")
+        return {}, ["out_exit"], ""
+
+    if failures:
+        detail = "；".join(failures[:5]) + ("…" if len(failures) > 5 else "")
+        ctx.log(
+            f"[Loop] {node.id[:6]} {exit_reason}，但有 {len(failures)} 轮出错 → err：{detail}",
+            "WARN",
+        )
+        annotate_step(ctx, node, "loop", note=f"✗{len(failures)}轮出错→err")
+        exit_reason = exit_reason or "结束"
+        return {}, ["err"], f"{exit_reason}，其中 {len(failures)} 轮出错：{detail}"
+    ctx.log(f"[Loop] {node.id[:6]} {exit_reason}，所有轮次都跑完了 → out_exit", "INFO")
+    annotate_step(ctx, node, "loop", note=f"✓{exit_reason}→out_exit")
+    return {}, ["out_exit"], ""
 
 
 def execute_Continue(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
-    """循环体子图专用：立即结束本轮、开始下一轮。"""
-    sub_prefix = getattr(getattr(ctx, "_graph_ref", None), "_runtime_prefix", "__sub__")
-    ctx.runtime_attrs[f"_sub_control::{sub_prefix}"] = "continue"
+    """循环体子图专用：立即结束本轮、开始下一轮。
+
+    只能被「循环(Loop)」消费；夹在中间的顺序体等容器会把它原样往上抛（见 _ctl_passes_through）。
+    """
+    _ctl_emit("continue", TARGET_LOOP, False, "再次循环")
     ctx.log(f"[Continue] {node.id[:6]} → 下一轮循环", "DEBUG")
     return {}, [], ""
 
 
 def execute_Break(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
-    """循环体子图专用：立即结束整个循环。"""
-    sub_prefix = getattr(getattr(ctx, "_graph_ref", None), "_runtime_prefix", "__sub__")
-    ctx.runtime_attrs[f"_sub_control::{sub_prefix}"] = "break"
-    ctx.log(f"[Break] {node.id[:6]} → 跳出循环", "DEBUG")
+    """跳出循环（循环体专用节点）：结束整个**循环**，走「退出」或「失败」出口。
+
+    出口由节点参数「标记为失败」(as_failure) 决定，默认 False = 走「退出」。
+    只对「循环(Loop)」生效：如果它被放在了并行分支里、外面又没有循环，
+    信号会一路上抛并最终被忽略（想退出并行请用「退出并行」节点）。
+    """
+    as_failure = bool(node.params.get("as_failure", False))
+    _ctl_emit("exit", TARGET_LOOP, as_failure, "跳出循环")
+    ctx.log(f"[Break] {node.id[:6]} → 跳出循环" + ("（标记为失败）" if as_failure else ""), "DEBUG")
+    return {}, [], ""
+
+
+def execute_ExitSequence(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
+    """退出串行：立即结束整个**顺序执行**，走「完成」或「失败」出口。
+
+    出口由节点参数「标记为失败」(as_failure) 决定，默认 False = 走「完成」。
+    它会**穿透**中间夹着的其它容器（比如顺序体里套了个循环），一路找到最近的那层顺序体。
+    """
+    as_failure = bool(node.params.get("as_failure", False))
+    _ctl_emit("exit", TARGET_SEQ, as_failure, "退出串行")
+    ctx.log(f"[ExitSequence] {node.id[:6]} → 退出顺序体" + ("（标记为失败）" if as_failure else ""), "DEBUG")
+    return {}, [], ""
+
+
+def execute_ExitParallel(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
+    """退出并行：中止整个**并行结构**（其它分支跑完手上这个节点后协作式退出），
+    走「完成」或「失败」出口。出口由节点参数「标记为失败」(as_failure) 决定，默认 False = 走「完成」。
+
+    它会**穿透**中间夹着的其它容器（比如并行分支里套了个顺序体），
+    一路找到最近的那层并行体 —— 不会被内层顺序体当成「退出顺序体」吃掉。
+    """
+    as_failure = bool(node.params.get("as_failure", False))
+    _ctl_emit("exit", TARGET_PAR, as_failure, "退出并行")
+    ctx.log(f"[ExitParallel] {node.id[:6]} → 退出并行" + ("（标记为失败）" if as_failure else ""), "DEBUG")
     return {}, [], ""
 
 
@@ -2984,7 +3088,14 @@ def execute_VarSwitch(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any])
 
 def execute_Sequence(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
     """顺序执行：纯串行队列。执行 seq_body 子画布（子图容器），从子图 Start 出发
-    一条线串行跑到终点，不做任何条件判断。跑完走 out_done。
+    一条线串行跑到终点，不做任何条件判断。
+
+    - **正常跑完（含不接「结束」节点）→ out_done；节点抛异常 / 死循环 → err。**
+    - 子图里放「退出串行」→ 立即结束整个顺序执行（后面的节点不再跑）：
+      默认走 out_done，勾了「标记为失败」则走 err。
+      ⚠ 消费掉的退出节点**只看自己的「标记为失败」参数**决定出口。
+    - 「跳出循环 / 再次循环 / 退出并行」这类**不属于顺序体**的信号 → **穿透**：
+      原样往上抛给外层容器，不被顺序体吃掉（`_ctl_passes_through`）。
 
     与 Loop 循环体一致：seq_body 是塞在 node.params 里的子图 dict，双击节点进入编辑。
     """
@@ -2999,9 +3110,9 @@ def execute_Sequence(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
         msg = "[Sequence] ctx 缺少 runner 引用，无法执行顺序体子画布。"
         ctx.log(msg, "ERROR")
         annotate_step(ctx, node, "seq", note="FAIL: 缺少runner_ref")
-        return {}, ["out_done"], msg
+        return {}, ["err"], msg
 
-    sub = _subgraph_from_dict(seq_body, name=f"{node.id}::seq_body")
+    sub = _subgraph_from_dict(seq_body, name=f"{node.id}::seq_body", ctx=ctx)
     sub._runtime_prefix = node.id
     sub._runtime_path = _exec_child_path(node)
 
@@ -3017,25 +3128,56 @@ def execute_Sequence(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
         ctx.log(f"[Sequence] {node.id[:6]} 顺序体为空，直接走完成。", "WARN")
         return {}, ["out_done"], ""
 
-    # Start 无 in_exec，直接跳到它的下游作为真正入口
+    # Start 自己不参与执行（它无输入、只产出 out_exec）：从它的**全部**下游开始跑，
+    # 这样 Start 后面连了多条线也一条都不会被丢（以前只取 outs[0]，多的静默丢掉）。
     start_node = sub.nodes.get(entry_id)
     if start_node is not None and start_node.type == "Start":
-        outs = _exec_out_edges(sub, entry_id, "out_exec")
+        outs = [nid for nid, _p in _exec_out_edges(sub, entry_id, "out_exec")]
         if outs:
-            entry_id, _ = outs[0]
+            entry_ids = outs
         else:
             ctx.log(f"[Sequence] {node.id[:6]} 顺序体只有 Start 无内容。", "WARN")
             return {}, ["out_done"], ""
+    else:
+        entry_ids = [entry_id]
 
     annotate_step(ctx, node, "seq", note="进入顺序体子画布")
     ctx.log(f"[Sequence] {node.id[:6]} 串行执行顺序体子画布", "DEBUG")
 
-    ctrl = _run_subgraph_until_control(ctx, sub, runner, entry_id)
-    # 顺序体里不应有 Continue/Break（那是循环体专用），出现则视为结束
-    if ctrl in ("break", "continue"):
-        ctrl = "end"
-    if ctrl == "stop":
+    sig, ok, reason = _run_subgraph_until_control(ctx, sub, runner, entry_ids)
+    if not ctx.is_running:
         return {}, [], "运行被停止"
+    if sig is not None and sig.kind == "exit":
+        if _ctl_passes_through(sig, TARGET_SEQ):
+            # 不是退给顺序体的（如顺序体里的「退出并行」）→ 原样往上抛，
+            # 让外层真正该退出的那个容器处理，而不是被本顺序体吃掉。
+            _ctl_set(sig)
+            ctx.log(f"[Sequence] {node.id[:6]} 顺序体里出现「{sig.source or '退出节点'}」"
+                    f"（它要退出的是 {sig.target} 层）→ 向上穿透，本顺序体提前收工", "INFO")
+            annotate_step(ctx, node, "seq", note=f"穿透({sig.source})→上抛")
+            return {}, ["out_done"], ""
+        # 顺序体的「退出串行」→ 立即结束整个顺序执行（后面的节点不再跑）
+        _src = sig.source or "退出节点"
+        if sig.as_failure:
+            ctx.log(f"[Sequence] {node.id[:6]} 顺序体里走了「{_src}」并标记为失败 → err", "WARN")
+            annotate_step(ctx, node, "seq", note=f"✗{_src}(标记失败)→err")
+            return {}, ["err"], f"顺序体里走了「{_src}」，并勾选了「标记为失败」"
+        ctx.log(f"[Sequence] {node.id[:6]} 顺序体里走了「{_src}」→ 提前结束 → out_done", "INFO")
+        annotate_step(ctx, node, "seq", note=f"{_src}→提前结束→out_done")
+        return {}, ["out_done"], ""
+    if sig is not None and sig.kind == "continue":
+        # 「再次循环」是退给**循环**的：本顺序体不消费，原样往上抛。
+        # 外面若套着循环，那一轮就会真正被跳过（比「当成顺序体结束」更符合用户意图）；
+        # 外面没有循环时它自然消失（根图 walker 不消费控制信号）。
+        _ctl_set(sig)
+        ctx.log(f"[Sequence] {node.id[:6]} 顺序体里出现「{sig.source or '再次循环'}」（它是给循环用的）"
+                f"→ 向上穿透", "INFO")
+        annotate_step(ctx, node, "seq", note="再次循环→上抛")
+        return {}, ["out_done"], ""
+    if not ok:
+        ctx.log(f"[Sequence] {node.id[:6]} 顺序体执行出错 → err：{reason}", "WARN")
+        annotate_step(ctx, node, "seq", note="✗执行出错→err")
+        return {}, ["err"], reason
     annotate_step(ctx, node, "seq", note="顺序体执行完成")
     ctx.log(f"[Sequence] {node.id[:6]} 顺序体执行完成 → out_done", "INFO")
     return {}, ["out_done"], ""
@@ -3050,8 +3192,18 @@ def execute_Parallel(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
     """并行执行：多分支并发。执行 par_body 子画布里的所有「分支入口(Branch)」节点，
     每条分支用线程并发 walk，各跑各的互不等待。
 
-    - 全部分支跑完 → out_done；任一条分支失败（终结于失败语义端口）→ err。
-    - 不中断其它分支：一条失败不影响其它分支继续跑完。
+    - 全部分支正常跑完 → out_done（**不要求接「结束」节点**，执行流自然收尾也算跑完）。
+    - 任一条分支里出现**退出类节点**（「退出并行」/「退出串行」/「跳出循环」，含穿透上来的）
+      → **中止整个并行结构**：给其它分支发停止信号，它们跑完当前节点后协作式退出。
+      * 该信号的 target 是「并行」→ 本并行**消费**它：默认走 out_done，
+        勾了「标记为失败」则走 err。
+      * target 是别的容器（如并行分支里套的顺序体里放「退出串行」）→ **不消费，原样往上抛**，
+        交给外层容器处理（穿透）。端口返回 out_done，实际出口由外层决定。
+      ⚠ Python 线程没法强杀，所以是「跑完手上这个节点就退」，不是中途硬切。
+    - 分支**出错**（节点抛异常 / 节点不存在 / 死循环）→ err。出错的判定**不打断**其它分支。
+      ⚠ 若同时有分支走了退出节点并声明「走完成」，以退出节点为准（用户定案：该参数就是用来
+        表示走完成还是失败的），但出错信息仍会打进日志。
+    - 没有退出节点时：有分支出错 → err，否则 out_done。
     """
     par_body = node.params.get("par_body")
     if not (isinstance(par_body, dict) and par_body.get("nodes")):
@@ -3066,7 +3218,7 @@ def execute_Parallel(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
         annotate_step(ctx, node, "parallel", note="FAIL: 缺少runner_ref")
         return {}, ["err"], msg
 
-    sub = _subgraph_from_dict(par_body, name=f"{node.id}::par_body")
+    sub = _subgraph_from_dict(par_body, name=f"{node.id}::par_body", ctx=ctx)
     sub._runtime_prefix = node.id
     sub._runtime_path = _exec_child_path(node)
 
@@ -3080,75 +3232,178 @@ def execute_Parallel(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any]):
     annotate_step(ctx, node, "parallel", note=f"进入并行体子画布（{len(branches)} 分支）")
     ctx.log(f"[Parallel] {node.id[:6]} 并行执行 {len(branches)} 条分支", "INFO")
 
+    # 「调试主线程」（用户定案）：开启后允许在并行体里调试——断点/单步/运行高亮只作用在
+    # 主线程分支上；其它分支（守护/保活类）**不受调试暂停影响**，在节点边界照常通过。
+    # 主线程分支 = 勾了「主线程分支(is_main)」的那个分支入口，**有且只能有一个**
+    # （勾了多个只认第一个 + WARN）；一个都没勾 → 默认第一个分支入口。
+    debug_main = bool(node.params.get("debug_main", False))
+    main_branch_id = None
+    if debug_main and branches:
+        marked = [b for b in branches if bool(b.params.get("is_main", False))]
+        if len(marked) > 1:
+            ctx.log(f"[Parallel] {node.id[:6]} 有 {len(marked)} 个分支入口勾了「主线程分支」，"
+                    f"有且只能有一个 → 只认第一个（id={marked[0].id[:8]}），其余标记被忽略", "WARN")
+        main_branch_id = marked[0].id if marked else branches[0].id
+        if not marked:
+            ctx.log(f"[Parallel] {node.id[:6]} 未勾选「主线程分支」，默认第一个分支入口"
+                    f"（id={branches[0].id[:8]}）为主线程", "INFO")
+        ctx.log(f"[Parallel] {node.id[:6]} 调试主线程已开启 → 主线程分支 id={main_branch_id[:8]}"
+                f"（断点/单步/高亮只作用在它上面，其它分支照常跑）", "INFO")
+
     # 每条分支在独立线程里并发 walk（从 Branch 的 out_exec 下游开始）
     import concurrent.futures as _cf
 
-    results: Dict[str, Tuple[bool, str]] = {}
+    # 退出类节点 → 中止整个并行：用一只共享事件给所有分支发信号，分支在每个节点边界上检查它。
+    stop_evt = threading.Event()
+
+    results: Dict[str, Tuple[str, str, Optional[CtrlSignal]]] = {}
     with _cf.ThreadPoolExecutor(max_workers=len(branches)) as pool:
         futures = {}
         for b in branches:
-            fut = pool.submit(_run_parallel_branch, ctx, sub, runner, b.id)
+            fut = pool.submit(_run_parallel_branch, ctx, sub, runner, b.id, stop_evt,
+                              debug_main and b.id == main_branch_id)
             futures[fut] = b
         for fut in _cf.as_completed(futures):
             b = futures[fut]
             try:
-                ok, reason = fut.result()
+                status, reason, sig = fut.result()
             except Exception as e:
-                ok, reason = False, f"分支执行异常: {type(e).__name__}: {e}"
-            results[b.id] = (ok, reason)
+                status, reason, sig = "fail", f"分支执行异常: {type(e).__name__}: {e}", None
+            results[b.id] = (status, reason, sig)
 
-    failed = [(bid, r) for bid, (ok, r) in results.items() if not ok]
+    failed = [(bid, r) for bid, (st, r, _s) in results.items() if st == "fail"]
+    exited = [(bid, sig) for bid, (st, _r, sig) in results.items()
+              if st == "exit" and sig is not None]
+
+    if exited:
+        own = [sig for _bid, sig in exited if not _ctl_passes_through(sig, TARGET_PAR)]
+        if own:
+            _src = own[0].source or "退出节点"
+            if any(s.as_failure for s in own):
+                ctx.log(f"[Parallel] {node.id[:6]} 有分支走了「{_src}」并标记为失败 → 提前结束整个并行结构", "WARN")
+                annotate_step(ctx, node, "parallel", note=f"{_src}(标记失败)→提前结束并行→err")
+                return {}, ["err"], f"并行体里有分支走了「{_src}」，并勾选了「标记为失败」"
+            if failed:
+                ctx.log(f"[Parallel] {node.id[:6]} 有分支走了「{_src}」（走「完成」）；但另有 "
+                        f"{len(failed)} 条分支出错，已被退出节点显式声明的「完成」覆盖：{failed[0][1][:60]}", "WARN")
+            ctx.log(f"[Parallel] {node.id[:6]} 有分支走了「{_src}」→ 提前结束整个并行结构", "INFO")
+            annotate_step(ctx, node, "parallel", note=f"{_src}→提前结束并行→out_done")
+            return {}, ["out_done"], ""
+        # 信号不是退给并行的（如分支内顺序体里的「退出串行」）→ 原样往上抛（穿透）
+        sig = exited[0][1]
+        _ctl_set(sig)
+        ctx.log(f"[Parallel] {node.id[:6]} 有分支出现「{sig.source or '退出节点'}」"
+                f"（它要退出的是 {sig.target} 层）→ 向上穿透，本并行提前收工", "INFO")
+        annotate_step(ctx, node, "parallel", note=f"穿透({sig.source})→上抛")
+        return {}, ["out_done"], ""
+
     if failed:
-        note = f"并行体有 {len(failed)} 条分支失败：{failed[0][1][:60]}"
+        note = f"并行体有 {len(failed)} 条分支出错：{failed[0][1][:60]}"
         ctx.log(f"[Parallel] {node.id[:6]} {note}", "WARN")
-        annotate_step(ctx, node, "parallel", note=f"✗{len(failed)}分支失败→err")
-        return {}, ["err"], ""
+        annotate_step(ctx, node, "parallel", note=f"✗{len(failed)}分支出错→err")
+        return {}, ["err"], f"并行体有 {len(failed)} 条分支出错：{failed[0][1]}"
+
     ctx.log(f"[Parallel] {node.id[:6]} 全部 {len(branches)} 条分支完成 → out_done", "INFO")
     annotate_step(ctx, node, "parallel", note=f"✓{len(branches)}分支→out_done")
     return {}, ["out_done"], ""
 
 
-def _run_parallel_branch(ctx: ExecutionContext, sub: "BlueprintGraph", runner, branch_id: str) -> Tuple[bool, str]:
-    """在独立线程里串行 walk 一条并行分支（从 Branch 节点的 out_exec 下游开始），
-    返回 (success, reason)。终结于失败语义端口（无下游）→ 失败。
+def _run_parallel_branch(ctx: ExecutionContext, sub: "BlueprintGraph", runner,
+                         branch_id: str,
+                         stop_evt: "threading.Event",
+                         is_main: bool = False) -> Tuple[str, str, Optional[CtrlSignal]]:
+    """在独立线程里 walk 一条并行分支（从 Branch 节点的 out_exec 下游开始）。
+
+    返回 (status, reason, sig)，status 有四种：
+
+      - "ok"      ：这条分支正常跑完（走到「结束」节点、或执行流自然收尾）。**不要求接「结束」**。
+      - "exit"    ：分支里出现了退出类节点（退出并行 / 退出串行 / 跳出循环）→ 请求中止整个并行结构
+                    （置位 stop_evt）。第 3 个返回值是该信号，由 execute_Parallel 主线程决定
+                    「自己消费」还是「继续往上抛」（穿透）。
+      - "aborted" ：被别的分支的 stop_evt 中止，手上这个节点跑完就退（不是失败）。
+      - "fail"    ：出错了（节点抛异常 / 节点不存在 / 超步数 / 被用户停止）。
+
+    is_main（用户定案「调试主线程」）：本分支是并行体的「主线程分支」——
+      - 断点 / Step 生效（_hit_node_breakpoint），运行高亮进入并行画布（编辑器跟着钻进来）；
+      - 它的调试暂停**不会**停住其它分支：暂停期间 ctx 上带「_main_debug_pause」标记，
+        非主线程分支在节点边界见到标记就照常通过（守护/保活分支不因调试主逻辑而停摆）。
+      非主线程分支：不发画布高亮（避免「多分支抢一个高亮位」的误导观感）、断点标记不生效。
 
     与主执行流不同：这里不切换 ctx._graph_ref（避免与其它分支线程互相覆盖），
     直接操作 sub 图；对共享 ctx 的写操作（log / variables / 计数）用锁保护。
+
+    ⚠ 控制信号**不能**靠 thread-local 跨线程传递，必须随返回值带回父线程
+    （thread-local 是本线程私有的，主线程看不到分支线程里发的信号）。
     """
     sub_prefix = getattr(sub, "_runtime_prefix", "__sub__")
     # 并行分支跑在线程池里，线程是新建或复用的 —— 本线程的容器链不继承父线程，
     # 必须按「本图路径」重新 seed，否则分支内再套容器（如分支里放个循环）算出的路径会少一层。
     # 刻意不 restore：每个分支进来都会重新 seed；这样也免去给整段 while 加缩进。
     _exec_path_set(_exec_path_of(sub))
-    edges = _exec_out_edges(sub, branch_id, "out_exec")
-    if not edges:
-        return False, f"分支入口 {branch_id[:8]} 无下游连线"
+    _ctl_reset()          # 本线程可能被线程池复用，先清掉上一条分支残留的控制信号
+    # 分支线程标记（thread-local）：线程可能被复用，必须无条件赋值。
+    # wait_if_paused 据此判断「主线程调试暂停期间非主线程分支不跟停」；
+    # 分支内嵌套容器（如主线程分支里放循环）在同一线程上跑，标记继续有效。
+    _par_branch_tls.in_branch = True
+    _par_branch_tls.is_main = is_main
+    # 分支入口的**全部**下游都要跑（以前只取 edges[0]，多连的线静默丢掉）
+    entry_ids = [nid for nid, _p in _exec_out_edges(sub, branch_id, "out_exec")]
+    if not entry_ids:
+        # 分支入口没连下游 = 这条分支是空的。按「只有异常报错才失败」的口径，这不算失败。
+        with _parallel_ctx_lock():
+            ctx.log(f"[Parallel] 分支入口 {branch_id[:8]} 没连下游，视为空分支", "WARN")
+        return "ok", f"分支入口 {branch_id[:8]} 没连下游（空分支）", None
 
     lock = _parallel_ctx_lock()
-    curr_id, _curr_in = edges[0]
+    pending: Deque[str] = deque(entry_ids)
     safety = 50000
-    while safety > 0 and ctx.is_running:
+    while pending and ctx.is_running:
+        if stop_evt.is_set():
+            # 别的分支走了退出节点 → 本分支协作式退出（跑完手上这个节点，不中途硬切）
+            with lock:
+                ctx.log(f"[Parallel] 分支 {branch_id[:8]} 因其它分支走了退出节点被中止", "INFO")
+            return "aborted", f"分支 {branch_id[:8]} 被其它分支的退出节点中止", None
+
+        if safety <= 0:
+            return "fail", "分支执行超过安全步数（疑似死循环）", None
         safety -= 1
+        curr_id = pending.popleft()
         node = sub.nodes.get(curr_id)
         if node is None:
-            return False, f"分支节点不存在 id={curr_id[:8]}"
+            return "fail", f"分支节点不存在 id={curr_id[:8]}", None
 
+        # 统一走 wait_if_paused：它内部会识别「主线程调试暂停」并让非主线程分支跳过
+        # （跳过逻辑下沉到 wait_if_paused 是因为 Wait 等很多执行器内部也会调它）
         wait_if_paused(ctx)
 
         with lock:
+            # 高亮口径（用户定案）：只有**主线程分支**发画布高亮（编辑器跟着钻进并行体，
+            # 配合断点/单步调试主逻辑）；非主线程分支刻意不发——避免「多分支抢一个高亮位」
+            # 的误导观感。根图 walker 在执行 Parallel 节点时已高亮过它。
+            if is_main:
+                try:
+                    runner.highlight_node.emit(curr_id, _exec_path_of(sub))
+                except Exception:
+                    pass
             try:
-                runner.highlight_node.emit(curr_id, _exec_path_of(sub))
                 runner.progress_step.emit(ctx.step_counter + 1, node.type)
             except Exception:
                 pass
             try:
                 ctx.current_node_id = curr_id
+                # 同步记录当前容器链（None = 组件内部，编辑器不可导航），见子图 walker 同名注释
+                ctx.current_node_path = _exec_path_of(sub)
                 runner.current_node_changed.emit(curr_id, node.type)
             except Exception:
                 pass
             inputs = _resolve_data_inputs(sub, ctx, node, id_prefix=f"{sub_prefix}::")
             bump_step(ctx)
-            ctx.log(f"[Node▶] {node.type}  id={curr_id[:8]} [并行分支]", "INFO")
+            ctx.log(f"[Node▶] {node.type}  id={curr_id[:8]} [并行分支"
+                    + ("·主线程]" if is_main else "]"), "INFO")
+
+        # 主线程分支：断点 / Step 生效（语义与根图一致；暂停期间其它分支照常跑）
+        if is_main:
+            _hit_node_breakpoint(ctx, node, runner)
 
         fn = EXECUTORS.get(node.type)
         try:
@@ -3160,29 +3415,44 @@ def _run_parallel_branch(ctx: ExecutionContext, sub: "BlueprintGraph", runner, b
             tb = traceback.format_exc()
             with lock:
                 ctx.log(f"[Node] 并行分支内执行异常 {node.type}: {e}\n{tb}", "ERROR")
-            return False, f"节点 {node.type} 执行异常: {e}"
+            return "fail", f"节点 {node.type} 执行异常: {e}", None
+
+        # 退出类节点（Continue / Break / 退出串行 / 退出并行）—— 分支线程里发信号，
+        # 随返回值带回主线程由 execute_Parallel 决定消费还是继续上抛（不能靠 thread-local）。
+        sig = _ctl_pop()
+        if sig is not None and sig.kind == "exit":
+            with lock:
+                ctx.log(f"[Parallel] 分支 {branch_id[:8]} 出现「{sig.source or '退出节点'}」"
+                        f"（目标 {sig.target} 层）→ 中止整个并行结构"
+                        + ("（标记为失败）" if sig.as_failure else ""), "INFO")
+            stop_evt.set()
+            return "exit", f"分支 {branch_id[:8]} 走了「{sig.source or '退出节点'}」", sig
+        if sig is not None and sig.kind == "continue":
+            # 「再次循环」是给循环用的；单条并行分支没有「下一轮」，视作本条分支到此结束。
+            # 信号不外抛：分支是独立线程，外抛要靠 Parallel 在全部汇聚后重发，语义太绕；
+            # 分支里真想 continue 外层循环，请在分支里自己套一个循环。
+            with lock:
+                ctx.log(f"[Parallel] 分支 {branch_id[:8]} 走了「再次循环」（它是给循环用的），"
+                        f"单条分支没有下一轮，视作本分支结束", "WARN")
+            return "ok", f"分支 {branch_id[:8]} 走了「再次循环」，视作本分支结束", None
 
         if not ctx.is_running:
-            return False, "运行被用户停止"
+            return "fail", "运行被用户停止", None
 
-        sub_prefix = getattr(sub, "_runtime_prefix", "__sub__")
         with lock:
             ctx.set_outputs(f"{sub_prefix}::{curr_id}", outputs or {})
             ctx.last_progress_ts = time.time()
 
         if not next_ports:
-            return True, f"分支 {branch_id[:8]} 到达终点"
+            # 走到执行流末尾（含「结束」节点）→ 这条线算跑完，继续跑队列里其它线
+            continue
         pname = next_ports[0]
-        outs = _exec_out_edges(sub, curr_id, pname)
-        if not outs:
-            if pname in FAIL_SEMANTIC:
-                return False, f"节点 {node.type} 终结于失败端口 {pname}"
-            return True, f"分支 {branch_id[:8]} 到达终点"
-        curr_id, _curr_in = outs[0]
+        for nid, _p in _exec_out_edges(sub, curr_id, pname):
+            pending.append(nid)
 
     if not ctx.is_running:
-        return False, "运行被用户停止"
-    return False, "分支执行超过安全步数（疑似死循环）"
+        return "fail", "运行被用户停止", None
+    return "ok", f"分支 {branch_id[:8]} 执行完成", None
 
 
 _parallel_lock = None
@@ -3288,17 +3558,16 @@ def execute_Component(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any])
     if start_node is None:
         ctx.log(f"[Component] {node.id[:6]} 子蓝图没有 Start 节点，跳过。", "WARN")
         return _empty_component_outputs(node), ["out_done"], ""
-    entry_id = start_node.id
-    outs = _exec_out_edges(sub, entry_id, "out_exec")
-    if outs:
-        entry_id, _ = outs[0]
-    else:
+    entry_ids = [nid for nid, _p in _exec_out_edges(sub, start_node.id, "out_exec")]
+    if not entry_ids:
         ctx.log(f"[Component] {node.id[:6]} 子蓝图只有 Start 无内容，视为空组件。", "WARN")
         return _empty_component_outputs(node), ["out_done"], ""
 
     sub._runtime_prefix = node.id
     # ⚠ 刻意不设 sub._runtime_path：组件是「另一张蓝图」，不在当前画布上，编辑器无法跟随进去。
-    #   不设 → _exec_path_of() 返回 None → 编辑器不做画布跳转（只按 id 高亮，找不到就忽略）。
+    #   不设 → _exec_path_of() 返回 None → 编辑器不跟随、也**不按裸 id 高亮**（2026-10-07 定案）。
+    #   以前编辑器会按裸 id 在当前画布上找同名节点点亮 —— 组件内部 id=4 会把循环体里
+    #   同名 id=4 的串行节点点亮，造成「该走组件却亮了串行」的错觉（已修：编辑器忽略 None 路径）。
     annotate_step(ctx, node, "component", note=f"进入组件 {os.path.basename(path)}")
     ctx.log(f"[Component] {node.id[:6]} 执行子蓝图 {os.path.basename(path)}", "INFO")
 
@@ -3310,19 +3579,27 @@ def execute_Component(ctx: ExecutionContext, node: Node, inputs: Dict[str, Any])
             ctx.variables[f"__arg_{i}"] = inputs.get(f"in_{i}")
 
         # ---------- 执行子蓝图 Start 节点，把入参输出到 param_0... 端口（供子图内连线取用）----------
-        # Start 无 in_exec，这里手动执行一次，让它的 param_0... 输出写入 last_outputs（带前缀）
+        # Start 无 in_exec，这里手动执行一次，让它的 param_0... 输出写入 last_outputs（带前缀）。
+        # （Start 自身不在 entry_ids 里，所以不会被执行两次）
         try:
             start_outputs, _, _ = execute_Start(ctx, start_node, {})
             ctx.set_outputs(f"{node.id}::{start_node.id}", start_outputs or {})
         except Exception as e:
             ctx.log(f"[Component] 执行子蓝图 Start 异常: {e}", "WARN")
 
-        ctrl = _run_subgraph_until_control(ctx, sub, runner, entry_id)
-        # 组件内不应有 Continue/Break（那是循环体专用），若出现按正常结束处理
-        if ctrl in ("break", "continue"):
-            ctrl = "end"
-        if ctrl == "stop":
+        sig, ok, reason = _run_subgraph_until_control(ctx, sub, runner, entry_ids)
+        if not ctx.is_running:
             return {}, [], "运行被停止"
+        if sig is not None:
+            # 退出类 / 循环控制节点只能用在**同一张蓝图的**容器子画布里：
+            # 组件是「另一张蓝图」，它的退出信号不应该影响调用方的容器，这里只提醒一句、不上抛。
+            ctx.log(f"[Component] 组件内出现了「{sig.source or sig.kind}」节点"
+                    f"（它们只能用在容器子画布里），按正常结束处理、不上抛", "WARN")
+        if not ok:
+            # ⚠ 组件节点**没有**「失败」出口（用户只要求 Loop / Sequence / Parallel 三个加），
+            #   所以这里只把问题明确报出来、不改出口 —— 总比静默当「正常跑完」强。
+            ctx.log(f"[Component] {node.id[:6]} 子蓝图执行出错：{reason}", "WARN")
+            annotate_step(ctx, node, "component", note=f"⚠执行出错: {str(reason)[:40]}")
         annotate_step(ctx, node, "component", note=f"组件完成 {os.path.basename(path)}")
 
         # ---------- 回传：ctx 变量 __ret_0... → 输出端口 out_0... ----------
@@ -3820,6 +4097,8 @@ EXECUTORS = {
     "Loop": execute_Loop,
     "Continue": execute_Continue,
     "Break": execute_Break,
+    "ExitSequence": execute_ExitSequence,
+    "ExitParallel": execute_ExitParallel,
     "Sequence": execute_Sequence,
     "Component": execute_Component,
     "Wait": execute_Wait,
@@ -4153,8 +4432,18 @@ EXECUTORS["Branch"] = execute_Branch
 # 辅助：暂停等待（is_paused=True 时循环 sleep，直到恢复或被停止）
 # ============================================================
 def wait_if_paused(ctx: ExecutionContext, tick_s: float = 0.05):
-    """若 ctx.is_paused，每 tick_s 秒检查一次，直到暂停解除或 ctx.is_running=False（停止）。"""
-    while bool(getattr(ctx, "is_paused", False)) and bool(getattr(ctx, "is_running", True)):
+    """若 ctx.is_paused，每 tick_s 秒检查一次，直到暂停解除或 ctx.is_running=False（停止）。
+
+    例外（「调试主线程」）：暂停来自并行体主线程分支的断点/单步（ctx 带 _main_debug_pause
+    标记）时，**非主线程分支的线程不跟停**——守护/保活分支照常运行。walker 边界与
+    各执行器内部的等待都走这里，所以跳过判定放在循环条件里（每拍重判，防止分支线程
+    恰好在打标前进圈后被卡住）。
+    """
+    while (bool(getattr(ctx, "is_paused", False))
+           and bool(getattr(ctx, "is_running", True))
+           and not (getattr(_par_branch_tls, "in_branch", False)
+                    and not getattr(_par_branch_tls, "is_main", False)
+                    and _main_debug_pause_active(ctx))):
         time.sleep(tick_s)
 
 
@@ -4162,6 +4451,29 @@ def wait_if_paused(ctx: ExecutionContext, tick_s: float = 0.05):
 # 辅助：断点命中（Step 模式 OR 手动 breakpoint=True）→ 进入节点开头立即暂停
 # ============================================================
 def _hit_node_breakpoint(ctx: ExecutionContext, node: Node, runner: "BlueprintRunner"):
+    """断点命中入口（根图 / 子图 walker / 并行主线程分支统一走这里）。
+
+    若本线程是并行体的「主线程分支」（_par_branch_tls），暂停期间会在 ctx 上打
+    「_main_debug_pause」标记 → 同一并行体的其它分支在 wait_if_paused 处不跟停
+    （守护线程照跑）。其余语义见 _hit_node_breakpoint_impl。
+    """
+    in_main = (getattr(_par_branch_tls, "in_branch", False)
+               and getattr(_par_branch_tls, "is_main", False))
+    if not in_main:
+        return _hit_node_breakpoint_impl(ctx, node, runner)
+    with _parallel_ctx_lock():
+        ctx.runtime_attrs["_main_debug_pause"] = True
+    try:
+        return _hit_node_breakpoint_impl(ctx, node, runner)
+    finally:
+        with _parallel_ctx_lock():
+            try:
+                ctx.runtime_attrs.pop("_main_debug_pause", None)
+            except Exception:
+                pass
+
+
+def _hit_node_breakpoint_impl(ctx: ExecutionContext, node: Node, runner: "BlueprintRunner"):
     """
     统一在 EXECUTORS 执行前调用（进入节点开头先停住，和 IDE 调试一致）。
     有两种停住的情况（前者优先级高，都不生效则不停，直接返回）：
@@ -4333,6 +4645,20 @@ class BlueprintRunner(QThread):
             return None
         val = getattr(self._ctx, "current_node_id", None)
         return val if isinstance(val, str) and len(val) > 0 else None
+
+    @property
+    def current_node_path(self) -> Optional[list]:
+        """当前执行节点的「容器链」（与 highlight_node 信号第二个参数同源）：
+
+        - []            → 根图（可导航）
+        - [LoopId, ...] → 某容器子画布内部（可导航）
+        - None          → 组件子蓝图内部（不可导航 —— 组件是另一张图，
+                          它的节点 id 会与调用方画布同名，UI 不能按裸 id 定位/高亮）
+        """
+        if self._ctx is None:
+            return None
+        p = getattr(self._ctx, "current_node_path", None)
+        return list(p) if isinstance(p, list) else None
 
     @property
     def current_node_type(self) -> Optional[str]:
@@ -4508,6 +4834,8 @@ class BlueprintRunner(QThread):
         self.progress_step.emit(ctx.step_counter + 1, node.type)
         try:
             ctx.current_node_id = node.id
+            # 根图：容器链为空列表（可导航），见子图 walker 的 current_node_path 注释
+            ctx.current_node_path = []
             self.current_node_changed.emit(node.id, node.type)
         except Exception:
             pass
@@ -4539,6 +4867,12 @@ class BlueprintRunner(QThread):
 
         if not ctx.is_running:
             return
+
+        # 4.5 吃掉本节点执行期间产生的控制信号。
+        # 根图**没有**消费这些信号的地方（「退出类节点」是给容器子画布用的），
+        # 留着不管会残留到后面的 walk —— 容器 walker 一进来就 _ctl_reset()，本身不会串味，
+        # 但显式清掉更稳，也顺手处理「容器把信号一路穿透到根图」的情况。
+        _ctl_reset()
 
         # 5. 根据 next_ports 入队下游 exec
         for pname in next_ports:

@@ -223,13 +223,21 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         type="Loop",
         category=CATEGORY_LOGIC,
         title="循环",
-        description="循环跑圈儿~要么到了设定的最大次数就退出，要么勾上「无限循环」就一直跑（只能暂停/停止），每轮之间还能等一小会儿再跑下一圈哟。",
+        description=("循环跑圈儿~要么到了设定的最大次数就退出，要么勾上「无限循环」就一直跑"
+                     "（只能暂停/停止），两轮之间还能等一小会儿（「每轮间隔」，第一轮不等、"
+                     "最后一轮跑完也不等）。\n\n"
+                     "循环体里**不需要**接「结束」节点 —— 每轮从「开始」往下跑到最后一个节点，"
+                     "这一轮就算跑完了（末尾没接东西也是正常收尾）。只有某一轮里节点执行报错，"
+                     "才记一次失败。全部轮次跑完后，只要有过失败就走「失败」出口，否则走「退出」。\n\n"
+                     "循环体里放「**跳出循环**」节点可提前结束整个循环；它默认按「退出」走，"
+                     "把它的「标记为失败」勾上则按「失败」走（**此时以该参数为准**，"
+                     "前面轮次记下的报错不再影响出口）。"),
         color="#8250DF",
         accent="#A371F7",
         inputs=[_exec_in()],
         outputs=[
-            _exec_out("loop_body", label="循环体"),
             _exec_out("out_exit", label="退出"),
+            _exec_out("err", label="失败"),
         ],
         params=[
             ParamDef(name="loop_body", editor=EDITOR_MULTILINE, default="", label="循环体子图(只读)",
@@ -241,7 +249,7 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
                      help="硬约束：防止死循环。无限循环模式下此项不生效"),
             ParamDef(name="interval_sec", editor=EDITOR_FLOAT, default=1.0, label="每轮间隔(s)",
                      min=0.0, max=60.0, step=0.05,
-                     help="每轮循环体执行完后的等待时间（秒）"),
+                     help="两轮之间等多久（秒）。第一轮开始前不等，最后一轮跑完也不再等。"),
         ],
         type_short_name="loop",
     ),
@@ -262,13 +270,60 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         type="Break",
         category=CATEGORY_LOGIC,
         title="跳出循环",
-        description="只出现在循环体子画布内~跑到咱这里就立即结束整个循环，跳到循环节点的「退出」出口。",
+        description="只出现在循环体子画布内~跑到咱这里就立即结束整个循环，跳到循环节点的「退出」出口，"
+                    "后续轮次不再执行。\n\n"
+                    "默认按「完成」处理（走 out_exit）；把参数「标记为失败」勾上，就按「失败」处理（走 err）。\n\n"
+                    "咱只认「循环」这一层：如果夹在中间的其它容器（如顺序体）挡路，咱会**一路穿透过去**"
+                    "找到最近的循环。外面没有循环时咱就无效（想退出并行请用「退出并行」）。",
         color="#DA3633",
         accent="#FF7B72",
         inputs=[_exec_in("in_exec", label="▶")],
         outputs=[],
-        params=[],
+        params=[
+            ParamDef(name="as_failure", editor=EDITOR_BOOL, default=False, label="标记为失败",
+                     help="勾上：跳出后走循环的「失败」出口（err）。\n不勾（默认）：走「退出」出口（out_exit）。"),
+        ],
         type_short_name="break",
+        hidden_in_palette=True,
+    ),
+    "ExitSequence": NodeMeta(
+        type="ExitSequence",
+        category=CATEGORY_LOGIC,
+        title="退出串行",
+        description="只出现在顺序体子画布内~跑到咱这里就立即结束整个顺序执行，跳到顺序执行节点的出口，"
+                    "后面的节点不再执行。\n\n"
+                    "默认按「完成」处理（走 out_done）；把参数「标记为失败」勾上，就按「失败」处理（走 err）。\n\n"
+                    "咱只认「顺序执行」这一层：夹在中间的其它容器会**穿透**放行，"
+                    "咱一路找到最近的那层顺序体才动手，不会被内层容器吃掉。",
+        color="#B35900",
+        accent="#F0883E",
+        inputs=[_exec_in("in_exec", label="▶")],
+        outputs=[],
+        params=[
+            ParamDef(name="as_failure", editor=EDITOR_BOOL, default=False, label="标记为失败",
+                     help="勾上：退出后走顺序执行的「失败」出口（err）。\n不勾（默认）：走「完成」出口（out_done）。"),
+        ],
+        type_short_name="exit_seq",
+        hidden_in_palette=True,
+    ),
+    "ExitParallel": NodeMeta(
+        type="ExitParallel",
+        category=CATEGORY_LOGIC,
+        title="退出并行",
+        description="只出现在并行体子画布内~跑到咱这里就立即中止整个并行结构：其它分支跑完手上那个节点后退出，"
+                    "整体跳到并行执行节点的出口，剩下的分支内容不再往下跑。\n\n"
+                    "默认按「完成」处理（走 out_done）；把参数「标记为失败」勾上，就按「失败」处理（走 err）。\n\n"
+                    "咱只认「并行执行」这一层：即使咱被放在某条分支里的顺序体/循环里，"
+                    "也会**穿透**出来中止整个并行（不会被内层容器吃掉）。",
+        color="#6639BA",
+        accent="#A371F7",
+        inputs=[_exec_in("in_exec", label="▶")],
+        outputs=[],
+        params=[
+            ParamDef(name="as_failure", editor=EDITOR_BOOL, default=False, label="标记为失败",
+                     help="勾上：退出后走并行执行的「失败」出口（err）。\n不勾（默认）：走「完成」出口（out_done）。"),
+        ],
+        type_short_name="exit_par",
         hidden_in_palette=True,
     ),
     "Branch": NodeMeta(
@@ -280,7 +335,12 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         accent="#2DD4BF",
         inputs=[],
         outputs=[_exec_out("out_exec", label="▶")],
-        params=[],
+        params=[
+            ParamDef(name="is_main", editor=EDITOR_BOOL, default=False, label="主线程分支",
+                     help="勾选后这条分支就是并行体的「主线程」（有且只能有一个，都不勾时默认第一个分支入口）。"
+                          "宿主并行节点开启「调试主线程」后，断点/单步/运行高亮只作用在这条分支上，"
+                          "其它分支不受调试暂停影响、照常运行（适合一个分支跑主逻辑、一个分支跑守护/保活的场景）。"),
+        ],
         type_short_name="branch",
         hidden_in_palette=True,
     ),
@@ -399,11 +459,19 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         type="Sequence",
         category=CATEGORY_LOGIC,
         title="顺序执行",
-        description="纯串行队列~把要顺序执行的一串动作都塞进咱的子画布里，从上到下一条条跑，不做任何条件判断。双击咱进入子画布编辑，跑完就继续往下走。",
+        description=("纯串行队列~把要顺序执行的一串动作都塞进咱的子画布里，从上到下一条条跑，"
+                     "不做任何条件判断。双击咱进入子画布编辑。\n\n"
+                     "正常跑完就走「完成」——**不需要接「结束」节点**，末尾没接东西也算正常收尾。"
+                     "只有子画布里有节点执行报错（异常 / 死循环）才走「失败」出口。\n\n"
+                     "想中途提前结束？在子画布里放一个「**退出串行**」节点 —— 跑到它就立即收工。"
+                     "它默认按「完成」走，把它的「标记为失败」勾上则按「失败」走。"),
         color="#57606A",
         accent="#58A6FF",
         inputs=[_exec_in()],
-        outputs=[_exec_out("out_done", label="完成")],
+        outputs=[
+            _exec_out("out_done", label="完成"),
+            _exec_out("err", label="失败"),
+        ],
         params=[
             ParamDef(name="seq_body", editor=EDITOR_MULTILINE, default="", label="顺序体子图(只读)",
                      help="内部字段，保存顺序执行的子画布内容。双击本节点进入子画布编辑，无需手填。"),
@@ -414,7 +482,20 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         type="Parallel",
         category=CATEGORY_LOGIC,
         title="并行执行",
-        description="并行跑~把多条分支都塞进咱的子画布里，每条分支用线程同时跑，各跑各的互不等待。全部跑完走「完成」，任意一条出错走「失败」（但不打断其它分支）。双击咱进入子画布编辑。",
+        description=("并行跑~把多条分支都塞进咱的子画布里，每条分支用线程同时跑，各跑各的互不等待。"
+                     "双击咱进入子画布编辑。\n\n"
+                     "分支正常跑完就走「完成」——**不需要接「结束」节点**，末尾没接东西也算正常收尾。"
+                     "有分支执行报错（异常 / 死循环）才走「失败」，且不打断其它分支。\n\n"
+                     "想让整个并行提前收工？在某条分支里放一个「**退出并行**」节点 —— "
+                     "它会中止整个并行结构（其它分支跑完手上那个节点就退）。"
+                     "它默认按「完成」走，把它的「标记为失败」勾上则按「失败」走。\n\n"
+                     "⚠ 调试默认「黑盒」：断点 / 单步 / 运行高亮只停在**并行节点本身**，不进入并行体内部。\n"
+                     "典型场景「一个分支跑主逻辑 + 其它分支跑守护/保活」：勾上参数「**调试主线程**」，"
+                     "断点 / 单步 / 运行高亮就会进入主线程分支（默认第一个分支入口，"
+                     "在分支入口节点上勾「主线程分支」可更换，有且只能有一个），"
+                     "其它分支不受调试暂停影响、照常运行。"
+                     "分支共享鼠标键盘剪贴板容易互相打架，**能用串行就别用并行**，"
+                     "只把真正需要同时等待的操作（静止 / 找图 / 延时 / 网络）放进来。"),
         color="#0E6B5C",
         accent="#2DD4BF",
         inputs=[_exec_in()],
@@ -425,6 +506,11 @@ NODE_LIBRARY: Dict[str, NodeMeta] = {
         params=[
             ParamDef(name="par_body", editor=EDITOR_MULTILINE, default="", label="并行体子图(只读)",
                      help="内部字段，保存并行执行的子画布内容。双击本节点进入子画布编辑，无需手填。"),
+            ParamDef(name="debug_main", editor=EDITOR_BOOL, default=False, label="调试主线程",
+                     help="开启后允许调试并行体：断点/单步/运行高亮只作用在「主线程分支」上"
+                          "（默认第一个分支入口；在分支入口节点上勾「主线程分支」可更换，有且只能有一个），"
+                          "**其它分支不受调试暂停影响、照常运行**（守护/保活分支不会因为调试主逻辑而停摆）。"
+                          "不勾（默认）= 调试黑盒：断点/单步/高亮只停在并行节点本身。"),
         ],
         type_short_name="parallel",
         # 分支数量由子画布里「分支入口(Branch)」节点数量决定，运行时只认 Branch，

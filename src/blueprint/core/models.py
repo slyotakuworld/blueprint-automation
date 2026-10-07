@@ -257,6 +257,9 @@ class BlueprintGraph:
     bp_type: str = "blueprint"
     # 运行时：下一个要分配的节点id（1,2,3…自增，每张蓝图独立计数，不序列化）
     _next_node_id: int = 1
+    # 运行时：from_dict 加载时被**丢弃**的悬空连线（端点节点不存在 / 端口已不存在）。
+    # 不序列化，只用于把「静默丢线」报出来（validator 的 DANGLING_LINK / 子画布加载日志）。
+    dropped_links: List[Dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self):
         if not self.created_at:
@@ -345,15 +348,30 @@ class BlueprintGraph:
 
         # 过滤悬空连线：端口在（迁移后的）节点上不存在的连线直接丢弃，
         # 避免旧版端口（如旧 Sequence 的 out_1/out_2/out_3）被清理后留下坏连线。
+        # ⚠ 丢弃**不再静默**：丢掉的连线记进 dropped_links，由 validator / 子画布加载日志报出来。
+        #   否则「子画布里断了一根线」在加载时就无声消失，排查时看不到任何痕迹。
         valid_edges: Dict[str, Edge] = {}
+        dropped_links: List[Dict[str, Any]] = []
         for eid, e in edges.items():
             fn = nodes.get(e.from_node)
             tn = nodes.get(e.to_node)
             if fn is None or tn is None:
+                dropped_links.append({
+                    "from_node": e.from_node, "from_port": e.from_port,
+                    "to_node": e.to_node, "to_port": e.to_port, "reason": "端点节点不存在",
+                })
                 continue
             if e.from_port not in {pp.name for pp in fn.outputs}:
+                dropped_links.append({
+                    "from_node": e.from_node, "from_port": e.from_port,
+                    "to_node": e.to_node, "to_port": e.to_port, "reason": "输出端口不存在",
+                })
                 continue
             if e.to_port not in {pp.name for pp in tn.inputs}:
+                dropped_links.append({
+                    "from_node": e.from_node, "from_port": e.from_port,
+                    "to_node": e.to_node, "to_port": e.to_port, "reason": "输入端口不存在",
+                })
                 continue
             valid_edges[eid] = e
         edges = valid_edges
@@ -367,6 +385,7 @@ class BlueprintGraph:
         g = BlueprintGraph(name=str(name_val))
         g.nodes = nodes
         g.edges = edges
+        g.dropped_links = dropped_links
         g.version = str(meta.get("version") or d.get("version") or "2.0")
         g.dev_scale_x = float(meta.get("dev_scale_x", 1.0))
         g.dev_scale_y = float(meta.get("dev_scale_y", 1.0))
@@ -418,7 +437,6 @@ class ExecutionContext:
     is_running: bool = True
     is_paused: bool = False
     variables: Dict[str, Any] = field(default_factory=dict)
-    loop_counters: Dict[str, int] = field(default_factory=dict)
     last_outputs: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     log_fn: Callable[[str, str], None] = (
         lambda msg, level="INFO": None

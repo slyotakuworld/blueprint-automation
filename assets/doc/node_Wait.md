@@ -105,9 +105,8 @@ Mouse(点A) → Wait(random 0.2~0.6) → Mouse(点B) → Wait(random 0.2~0.6) �
 
 ### 3. 等通知读秒（简单节拍器）
 ```
-Loop(infinite)
-  loop_body → 日常任务链路
-  Wait(fixed 30)  ← 每 30 秒跑一圈日常
+Loop(infinite)   ← 双击进入循环体子画布（循环体不需要接「结束」）
+  日常任务链路 → Wait(fixed 30)
 ```
 → 每 30 秒检查一次。
 

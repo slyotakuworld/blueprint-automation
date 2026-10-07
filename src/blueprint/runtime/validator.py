@@ -135,6 +135,26 @@ def validate_graph(graph: BlueprintGraph, project_root: Optional[str] = None) ->
         for n in nodes:
             if n.type == "Component":
                 _check_component_ports(n, project_root, issues)
+
+    # 9. 加载时被丢弃的悬空连线
+    #
+    # BlueprintGraph.from_dict 对「端点节点不存在 / 端口已不存在」的连线是**丢弃**处理
+    # （为了兼容旧版被清理掉的端口，如旧 Sequence 的 out_1/out_2/out_3）。
+    # 以前是纯静默的：子画布里断了一根线，加载后就无声消失，排查时看不到任何痕迹。
+    # 现在 from_dict 把丢掉的连线记在 graph.dropped_links 上，这里报出来。
+    for link in (getattr(graph, "dropped_links", None) or []):
+        issues.append(ValidationIssue(
+            "WARN", "DANGLING_LINK",
+            f"有一条连线被丢弃（{link.get('reason', '端口或节点不存在')}）："
+            f"{link.get('from_node', '?')}.{link.get('from_port', '?')}"
+            f" → {link.get('to_node', '?')}.{link.get('to_port', '?')}。它不会参与执行。",
+        ))
+
+    # 注：曾经有过第 10 条「容器子画布里必须有「结束(End)」节点」的校验（CONTAINER_NO_END），
+    #     随「必须走到 End 才算完成」这条口径一起**作废**：
+    #     现在三个容器（Loop / Sequence / Parallel）都**不要求接「结束」节点**，
+    #     判定口径是「只有节点执行异常 / 死循环才失败」，对缺 End 的蓝图报警属于误报。
+    #     （2026-10-06 用户定案）
     return issues
 
 

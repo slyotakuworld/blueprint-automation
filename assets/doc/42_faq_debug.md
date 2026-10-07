@@ -138,8 +138,9 @@ PressKey 参数：
 ### 症状 5.1：Loop infinite 永远停不下来。
 
 **正确用法**：
-- infinite 模式必须有某个分支连到 `Loop.break_in ▶`（通常是 VarSwitch 满足条件 → break）
-- 忘了连 break → 永远循环
+- 无限循环（`infinite`）必须留一条退出路径：在**循环体子画布**里放一个「跳出循环(Break)」节点
+  （通常由 VarSwitch / IfImageDetect 满足条件后连到它）
+- 忘了放 Break → 永远循环
 - 临时停的话，工具栏点 ■ 停止按钮
 
 ### 症状 5.2：VarSwitch 条件明明满足了，但走的分支不对。
