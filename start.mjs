@@ -35,6 +35,8 @@ const REQUIREMENTS = path.join(ROOT, 'requirements.txt');
 
 const NEED_NODE_MAJOR = 18; // 本项目引导脚本需要 Node 18+
 const NEED_PY = [3, 10];    // 编辑器需要 Python 3.10+
+// PySide6==6.9.3（requirements 钉版）仅提供 <3.14 的 wheel；3.14+ 只能装 6.10+，会触发已知 QGraphics 崩溃。
+const MAX_PY_EXCLUSIVE = [3, 14];
 
 const c = {
   reset: '\x1b[0m', bold: '\x1b[1m', dim: '\x1b[2m',
@@ -84,23 +86,60 @@ function probePython(cmd, preArgs = []) {
   return { cmd, args: preArgs, major: Number(m[1]), minor: Number(m[2]) };
 }
 
+function versionTooNew(v) {
+  const [maj, min] = MAX_PY_EXCLUSIVE;
+  return v.major > maj || (v.major === maj && v.minor >= min);
+}
+
 function versionOk(v) {
+  if (versionTooNew(v)) return false;
   return v.major > NEED_PY[0] || (v.major === NEED_PY[0] && v.minor >= NEED_PY[1]);
+}
+
+/** Windows 上 uv 自带的 CPython（未注册到 py 启动器时仍可用） */
+function findUvPythonCmds() {
+  if (!IS_WIN) return [];
+  const base = path.join(process.env.APPDATA || '', 'uv', 'python');
+  if (!fs.existsSync(base)) return [];
+  const cmds = [];
+  for (const name of fs.readdirSync(base)) {
+    if (!name.startsWith('cpython-')) continue;
+    const py = path.join(base, name, 'python.exe');
+    if (fs.existsSync(py)) cmds.push([py, []]);
+  }
+  cmds.sort((a, b) => (a[0] < b[0] ? 1 : -1));
+  return cmds;
 }
 
 /** 找一个系统 Python（用于创建 venv） */
 function findSystemPython() {
-  const candidates = IS_WIN
-    ? [['py', ['-3']], ['python', []], ['python3', []]]
+  const tries = IS_WIN
+    ? [
+        ['py', ['-3.13']],
+        ['py', ['-3.12']],
+        ['py', ['-3.11']],
+        ['py', ['-3.10']],
+        ['py', ['-3']],
+        ['python', []],
+        ['python3', []],
+        ...findUvPythonCmds(),
+      ]
     : [['python3', []], ['python', []]];
-  const found = [];
-  for (const [cmd, pre] of candidates) {
+  const seen = new Set();
+  let newestRejected = null;
+  for (const [cmd, pre] of tries) {
+    const key = `${cmd}\0${pre.join('\0')}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
     const v = probePython(cmd, pre);
-    if (v) found.push(v);
+    if (!v) continue;
+    if (versionOk(v)) return v;
+    if (!newestRejected || v.major > newestRejected.major
+      || (v.major === newestRejected.major && v.minor > newestRejected.minor)) {
+      newestRejected = v;
+    }
   }
-  if (!found.length) return null;
-  const good = found.find(versionOk);
-  return good || found[0];
+  return newestRejected;
 }
 
 /** 确保 .venv 存在，返回可用的解释器路径 */
@@ -111,19 +150,34 @@ async function ensureVenv() {
       ok(`虚拟环境已就绪：.venv（Python ${v.major}.${v.minor}）`);
       return VENV_PY;
     }
-    warn('.venv 存在但解释器不可用或版本过低，将重建。');
+    if (v && versionTooNew(v)) {
+      warn(`.venv 使用 Python ${v.major}.${v.minor}，与钉版 PySide6==6.9.3 不兼容（需要 < ${MAX_PY_EXCLUSIVE.join('.')}），将重建。`);
+    } else {
+      warn('.venv 存在但解释器不可用或版本过低，将重建。');
+    }
+    try {
+      fs.rmSync(VENV_DIR, { recursive: true, force: true });
+    } catch {
+      fail('无法删除旧 .venv，请手动删除该目录后重试。');
+      return null;
+    }
   }
 
   const sysPy = findSystemPython();
   if (!sysPy) {
-    fail('未找到 Python。本项目需要 Python 3.10+。');
-    log('  安装方式：https://www.python.org/downloads/ （安装时勾选 “Add Python to PATH”）');
-    log('  装好后重开终端再运行 start.cmd。');
+    fail('未找到可用的 Python。本项目需要 Python 3.10 且 < 3.14（与 requirements.txt 中 PySide6==6.9.3 一致）。');
+    log('  若机器上只有 Python 3.14+，请额外安装 3.12 或 3.13：https://www.python.org/downloads/');
+    log('  安装时勾选 “Add Python to PATH”；或用 uv 安装后重试 start.cmd。');
     return null;
   }
   if (!versionOk(sysPy)) {
-    fail(`系统 Python 版本过低（当前 ${sysPy.major}.${sysPy.minor}），需要 ${NEED_PY.join('.')}+。`);
-    log('  请升级 Python 后重试：https://www.python.org/downloads/');
+    if (versionTooNew(sysPy)) {
+      fail(`系统 Python ${sysPy.major}.${sysPy.minor} 过新：PySide6==6.9.3 无对应 wheel，pip 会失败。`);
+      log(`  请安装 Python 3.12 / 3.13（< ${MAX_PY_EXCLUSIVE.join('.')}），不要只用 3.14 作为唯一解释器。`);
+    } else {
+      fail(`系统 Python 版本过低（当前 ${sysPy.major}.${sysPy.minor}），需要 ${NEED_PY.join('.')}+。`);
+      log('  请升级 Python 后重试：https://www.python.org/downloads/');
+    }
     return null;
   }
 
